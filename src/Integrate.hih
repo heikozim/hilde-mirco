@@ -1,0 +1,49 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Integrates sampled values by the trapezoid and the Simpson rule, and a function by adaptive Simpson quadrature.
+
+- The rules over samples take time linear in their count.
+- simpson is exact for a polynomial up to degree three, for an odd and an even count of samples.
+- integrate halves an interval at most 50 times; the error estimate decides where.
+
+    let area: Float64 := trapezoid(&samples, 0.1);
+"""
+import Mirco.Array (NdArray, count);
+import Mirco.Math (isFinite);
+
+module Mirco.Integrate is
+    """
+    The integral of the samples y taken dx apart, by the trapezoid rule; zero for one sample.
+    """
+    generic [R: Region]
+    function trapezoid(y: &[NdArray[Float64], R], dx: Float64): Float64
+        requires (count(y) > 0) and (dx > 0.0);
+
+    """
+    The integral of the samples y at the points x, by the trapezoid rule; zero for one sample.
+    """
+    generic [R: Region, S: Region]
+    function trapezoidOver(y: &[NdArray[Float64], R], x: &[NdArray[Float64], S]): Float64
+        requires (count(y) > 0) and (count(y) = count(x));
+
+    """
+    The integral of the samples y taken dx apart, by Simpson's rule; for an even count the last three
+    intervals take the rule of three eighths, and two samples the trapezoid.
+    """
+    generic [R: Region]
+    function simpson(y: &[NdArray[Float64], R], dx: Float64): Float64
+        requires (count(y) >= 2) and (dx > 0.0);
+
+    """
+    The integral of f from a to b, to about tolerance, by adaptive Simpson quadrature.
+    The bounds are finite and a lies below b, so that a NaN or an infinity does not halve the interval to the last depth.
+    """
+    function integrate(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Float64
+        requires isFinite(a) and isFinite(b) and (a < b) and (tolerance > 0.0);
+end module.

@@ -1,0 +1,40 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Finds a root of a function of one variable in an interval and the smallest value of a function in an interval.
+
+- A root is searched only between two points where the function has opposite signs.
+- The bounds of every search are finite and the first lies below the second.
+- Each search stops after at most 200 steps, or when the interval is narrower than the tolerance.
+- The minimum is the one of a function with a single minimum in the interval, by the golden section.
+
+    let root: Option[Float64] := brentRoot(f, 0.0, 2.0, 0.000000000001);
+"""
+import Mirco.Math (isFinite);
+
+module Mirco.Optimize is
+    """
+    A root of f between a and b by bisection; none when f at a and f at b have the same sign.
+    """
+    function bisect(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Option[Float64]
+        requires isFinite(a) and isFinite(b) and (a < b) and (tolerance > 0.0);
+
+    """
+    A root of f between a and b by the method of Brent: bisection, secant and inverse quadratic
+    interpolation; none when f at a and f at b have the same sign.
+    """
+    function brentRoot(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Option[Float64]
+        requires isFinite(a) and isFinite(b) and (a < b) and (tolerance > 0.0);
+
+    """
+    The point between a and b where f is smallest, for f with a single minimum there.
+    """
+    function minimizeGolden(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Float64
+        requires isFinite(a) and isFinite(b) and (a < b) and (tolerance > 0.0)
+        ensures (result >= a) and (result <= b);
+end module.

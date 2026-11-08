@@ -1,0 +1,38 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds strtod and snprintf of the C library, the conversions of a binary64 number from and to decimal text.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.Text is the safe module built on it, and the one a programme imports.
+- Text is read and written in the C locale; a programme of Hilde does not change the locale.
+
+    let x: Float64 := parseChecked(span);
+"""
+import Standard.String (String, length);
+
+module Mirco.Bindings.Number is
+    """
+    The number strtod reads from text, which the caller has checked to be a decimal number in full, so never
+    empty; the body copies text with a closing zero byte, so any bytes are safe for memory. Its callers hold the
+    rest: Mirco.Text.parseFloat64 passes only the text kindOf accepted as a decimal number, with a digit at
+    least, and gives None otherwise, and Mirco.Text.formatFloat64 passes only text formatWith wrote.
+    """
+    generic [R: Region]
+    function parseChecked(text: Span[Nat8, R]): Float64
+        requires spanLength(text) > 0;
+
+    """
+    The text snprintf writes for value with the format %.*g and precision significant digits, 1 to 17: the
+    most a binary64 number needs, and what the 40 bytes of room hold; at most 24 bytes, a sign, 17 digits, a
+    point and an exponent of five.
+    """
+    function formatWith(value: Float64, precision: Int32): String
+        requires (precision >= 1) and (precision <= 17)
+        ensures (length(&result) > 0) and (length(&result) <= 24);
+end module.

@@ -1,0 +1,232 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, nthMut, swapIndex, lengthMut, wholeSpan);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, count, flatGet, zeros, flatGetMut, flatSet);
+import Standard.Bits (float64FromBits);
+import Mirco.Math (squareRoot, floor);
+
+module body Mirco.Stats is
+    -- The bits of the quiet NaN of binary64.
+    constant nan_bits: Nat64 := 9221120237041090560;
+
+    function nan(): Float64 is
+        return float64FromBits(nan_bits);
+    end;
+
+    function wide(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as w: Float64) do
+                return w;
+            when None do
+                abort("Mirco.Stats: a count that is no Float64");
+        end case;
+    end;
+
+    generic [R: Region]
+    function meanOf(values: &[NdArray[Float64], R]): Float64 is
+        let n: Index := count(values);
+        var total: Float64 := 0.0;
+        var at: Index := 0;
+        while at < n do
+            total := total + flatGet(values, at);
+            at := at + 1;
+        end while;
+        return total / wide(n);
+    end;
+
+    generic [R: Region, S: Region]
+    function covariance(x: &[NdArray[Float64], R], y: &[NdArray[Float64], S], ddof: Index): Float64 is
+        let n: Index := count(x);
+        let mx: Float64 := meanOf(x);
+        let my: Float64 := meanOf(y);
+        var total: Float64 := 0.0;
+        var at: Index := 0;
+        while at < n do
+            total := total + ((flatGet(x, at) - mx) * (flatGet(y, at) - my));
+            at := at + 1;
+        end while;
+        return total / wide(n - ddof);
+    end;
+
+    generic [R: Region]
+    function variance(values: &[NdArray[Float64], R], ddof: Index): Float64 is
+        return covariance(values, values, ddof);
+    end;
+
+    generic [R: Region]
+    function standardDeviation(values: &[NdArray[Float64], R], ddof: Index): Float64 is
+        let v: Float64 := variance(values, ddof);
+        if v /= v then
+            return v;
+        end if;
+        return squareRoot(v);
+    end;
+
+    -- A deviation of zero would divide by zero, which stops the programme;
+    -- NumPy gives a NaN there, and so does this.
+    generic [R: Region, S: Region]
+    function correlation(x: &[NdArray[Float64], R], y: &[NdArray[Float64], S]): Float64 is
+        let sxy: Float64 := covariance(x, y, 0);
+        let sxx: Float64 := covariance(x, x, 0);
+        let syy: Float64 := covariance(y, y, 0);
+        if (sxy /= sxy) or (sxx /= sxx) or (syy /= syy) then
+            return nan();
+        end if;
+        if (sxx = 0.0) or (syy = 0.0) then
+            return nan();
+        end if;
+        var r: Float64 := sxy / squareRoot(sxx * syy);
+        if r > 1.0 then
+            r := 1.0;
+        end if;
+        if r < -1.0 then
+            r := -1.0;
+        end if;
+        return r;
+    end;
+
+    -- The elements in a buffer, sorted by a heap sort; none when one is a NaN.
+    generic [R: Region]
+    function sortedCopy(values: &[NdArray[Float64], R]): Option[Buffer[Float64]] is
+        let n: Index := count(values);
+        var sorted: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < n do
+            let v: Float64 := flatGet(values, at);
+            if v /= v then
+                destroyFree(sorted);
+                return None();
+            end if;
+            insertBack(&!sorted, v);
+            at := at + 1;
+        end while;
+        heapSort(&!sorted);
+        return Some(value => sorted);
+    end;
+
+    -- Moves the element at root down the heap of the first size elements.
+    generic [R: Region]
+    function siftDown(heap: &![Buffer[Float64], R], root: Index, size: Index): Unit is
+        var at: Index := root;
+        while ((2 * at) + 1) < size do
+            let left: Index := (2 * at) + 1;
+            var larger: Index := left;
+            if (left + 1) < size then
+                let right: Float64 := nthMut(&~heap, left + 1);
+                let left_value: Float64 := nthMut(&~heap, left);
+                if right > left_value then
+                    larger := left + 1;
+                end if;
+            end if;
+            let child: Float64 := nthMut(&~heap, larger);
+            let parent: Float64 := nthMut(&~heap, at);
+            if child <= parent then
+                return nil;
+            end if;
+            swapIndex(&~heap, at, larger);
+            at := larger;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function heapSort(heap: &![Buffer[Float64], R]): Unit is
+        let n: Index := lengthMut(&~heap);
+        var start: Index := n / 2;
+        while start > 0 do
+            start := start - 1;
+            siftDown(&~heap, start, n);
+        end while;
+        var size: Index := n;
+        while size > 1 do
+            size := size - 1;
+            swapIndex(&~heap, 0, size);
+            siftDown(&~heap, 0, size);
+        end while;
+        return nil;
+    end;
+
+    -- The element at the position p from 0 to n - 1 of the sorted
+    -- elements, interpolated between the two around it.
+    generic [R: Region]
+    function interpolated(sorted: &![Buffer[Float64], R], p: Float64): Float64 is
+        let below: Float64 := floor(p);
+        var low_at: Index := 0;
+        case toIndex(below) of
+            when Some(value as i: Index) do
+                low_at := i;
+            when None do
+                abort("Mirco.Stats: a position that is no Index");
+        end case;
+        let n: Index := lengthMut(&~sorted);
+        let low: Float64 := nthMut(&~sorted, low_at);
+        if (low_at + 1) >= n then
+            return low;
+        end if;
+        let high: Float64 := nthMut(&~sorted, low_at + 1);
+        let fraction: Float64 := p - below;
+        if fraction = 0.0 then
+            return low;
+        end if;
+        return low + ((high - low) * fraction);
+    end;
+
+    generic [R: Region]
+    function percentile(values: &[NdArray[Float64], R], q: Float64): Float64 is
+        let n: Index := count(values);
+        case sortedCopy(values) of
+            when Some(value as sorted: Buffer[Float64]) do
+                var s: Buffer[Float64] := sorted;
+                let p: Float64 := (q / 100.0) * wide(n - 1);
+                let result: Float64 := interpolated(&!s, p);
+                destroyFree(s);
+                return result;
+            when None do
+                return nan();
+        end case;
+    end;
+
+    generic [R: Region]
+    function median(values: &[NdArray[Float64], R]): Float64 is
+        return percentile(values, 50.0);
+    end;
+
+    -- The bin of v is the part of its distance from low in widths; v = high
+    -- falls into the last bin.
+    generic [R: Region]
+    function histogram(values: &[NdArray[Float64], R], bins: Index, low: Float64, high: Float64): NdArray[Int64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, bins);
+        var made: NdArray[Int64] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        let width: Float64 := (high - low) / wide(bins);
+        let n: Index := count(values);
+        var at: Index := 0;
+        while at < n do
+            let v: Float64 := flatGet(values, at);
+            if (v >= low) and (v <= high) then
+                var bin: Index := bins - 1;
+                if v < high then
+                    case toIndex(floor((v - low) / width)) of
+                        when Some(value as b: Index) do
+                            if b < bins then
+                                bin := b;
+                            end if;
+                        when None do
+                            bin := bins - 1;
+                    end case;
+                end if;
+                let before: Int64 := flatGetMut(&!made, bin);
+                flatSet(&!made, bin, before + 1);
+            end if;
+            at := at + 1;
+        end while;
+        return made;
+    end;
+end module body.

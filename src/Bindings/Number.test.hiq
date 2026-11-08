@@ -1,0 +1,137 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The tests of the conversions alone: a decimal text read, the texts of 1
+-- and of 17 digits written, and the empty text and the precisions 0 and 18
+-- refused by the requires.
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Bindings.Number (parseChecked, formatWith);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Bindings.Number.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- True when formatWith writes value with precision digits as want.
+    function writes(value: Float64, precision: Int32, want: Span[Nat8, Static]): Bool is
+        let text: String := formatWith(value, precision);
+        let same: Bool := equal(asSpan(&text), want);
+        destroyString(text);
+        return same;
+    end;
+
+    function testConversions(): Unit is
+        assertTrue(parseChecked("-2.5e3") = -2500.0, "a sign, a point and an exponent");
+        assertTrue(parseChecked("7") = 7.0, "one digit");
+        assertTrue(writes(0.1, 1, "0.1"), "one digit");
+        assertTrue(writes(-2.2250738585072014e-308, 17, "-2.2250738585072014e-308"), "the 24 bytes of the ensures");
+        return nil;
+    end;
+
+    -- Each call in a child of its own: the empty text is refused by the
+    -- requires of parseChecked, the precisions 0 and 18 by that of
+    -- formatWith; one digit and the precisions 1 and 17 are taken.
+    function testRefusals(): Unit is
+        if asChild("emptyText") then
+            let x: Float64 := parseChecked("");
+            return nil;
+        end if;
+        if asChild("precisionZero") then
+            let text: String := formatWith(1.0, 0);
+            destroyString(text);
+            return nil;
+        end if;
+        if asChild("precisionEighteen") then
+            let text: String := formatWith(1.0, 18);
+            destroyString(text);
+            return nil;
+        end if;
+        if asChild("fits") then
+            let x: Float64 := parseChecked("1");
+            let one: String := formatWith(1.0, 1);
+            let seventeen: String := formatWith(1.0, 17);
+            destroyString(one);
+            destroyString(seventeen);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "emptyText", "contract violated: the requires"), "an empty text is refused by the requires of parseChecked");
+        assertTrue(refusedInChild("testRefusals", "precisionZero", "contract violated: the requires"), "a precision of 0 is refused by the requires of formatWith");
+        assertTrue(refusedInChild("testRefusals", "precisionEighteen", "contract violated: the requires"), "a precision of 18 is refused by the requires of formatWith");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "one digit and the precisions 1 and 17 break no contract");
+        return nil;
+    end;
+end module body.

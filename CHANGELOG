@@ -1,0 +1,33 @@
+mirco (0.1.1) unstable; urgency=medium
+
+  * Mirco.Hdf5 and Mirco.NetCdf check the dimensions a file announces before they make the array: a dimension of 0, and a count of elements that does not fit an Index or goes above readElementLimit() (2^32 elements), come back as BadShape or BadDimensions, and a read no longer stops the programme over a contract of Mirco.Array; tests craft such files of both formats.
+  * tools/HostileDims.hiq, run through tools/mirco-run, makes a file that announces a shape without the elements to back it for each of the four readers and prints what comes back: before this release the cases zero, huge and many ended the programme, now each is a fault.
+  * scripts/gate.sh checks in a checkout of git only the Markdown files git counts as the package's, and refuses a name with a byte other than letters, digits and / . _ -.
+  * Tests for Mirco.Element and Mirco.Numeric; an integer overflow and a division by zero stop, also for Float64.
+  * The long forms of MIRCO in Mirco.Array and of SPERLI in Mirco.Sperli.
+  * The module tables name Mirco.Xxh3, Mirco.Notebook and Mirco.Cell.
+  * hilde.toml names the capability ffi, which hilde guard asks of a module with pragma Foreign_Library.
+  * scripts/gate.sh and tools/mirco-run pass --modules of HILDE (standard/src, bindings/generated) to hilde guard, test, compile and check, and abort when HILDE is unset; tools/mirco-run.test.sh checks it.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Sun, 08 Nov 2026 09:13:03 +0100
+
+mirco (0.1.0) unstable; urgency=medium
+
+  * The array type NdArray, its views, broadcasting and its wire format.
+  * The compute layer in Hilde: elementwise operations, reductions, gemv, gemm.
+  * Reductions along an axis: sum, product, minimum, maximum, mean; combine joins partial results.
+  * Mirco.Sperli: encode, decode, elementType, shape and combine for Sperli.
+  * The C backend: dot, matvec, gemv and gemm by dgemm of BLIS; licences of BLIS, LAPACK, OpenBLAS, pocketfft.
+  * Random numbers, statistics, FFT, integration, interpolation, optimization.
+  * Linear algebra in Hilde: LU, solve, inverse, Cholesky, QR, lstsq, eigen, SVD.
+  * Numbers as text, matrices in CSV.
+  * The container of ROOT files: header, keys, directories; zlib, LZ4, xz and Zstandard.
+  * YOMPI: lines, points, histograms and heatmaps as SVG and PNG.
+  * Schlucki: tables of columns, missing values, CSV and SQLite.
+  * Schlucki in SQLite or DuckDB, the backend named; DuckDB with external access off.
+  * writeRows of DuckDB through the Appender of its C interface.
+  * A library for C and Python, a runner of single scripts.
+  * Units in the type system.
+  * Notebooks: cells run with hilde run or as a job of Sperli, state in files, a manifest.
+
+ -- Heiko Zimmermann <code@heiko-zimmermann.com>  Tue, 27 Oct 2026 02:11:14 +0100

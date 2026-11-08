@@ -1,0 +1,120 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The functions of elementary mathematics on Float64: roots, powers, logarithms and angles.
+
+- Each result is the one of the C mathematics library of the system, rounded as it rounds.
+- A NaN given is a NaN returned; only a value outside the domain a requires asks for stops the programme.
+- A logarithm and a square root ask for a value in their domain.
+
+    let hypotenuse: Float64 := squareRoot((3.0 * 3.0) + (4.0 * 4.0));
+"""
+module Mirco.Math is
+    """
+    The number pi, the ratio of a circle's circumference to its diameter.
+    """
+    function pi(): Float64
+        ensures (result > 3.14159) and (result < 3.1416);
+
+    """
+    Euler's number e, the base of the natural logarithm.
+    """
+    function euler(): Float64
+        ensures (result > 2.71828) and (result < 2.71829);
+
+    """
+    True when x is neither infinite nor a NaN: x - x is 0 for a finite x and a NaN for the others.
+    """
+    function isFinite(x: Float64): Bool
+        ensures result = ((x - x) = 0.0);
+
+    """
+    True when x is a NaN.
+    """
+    function isNaN(x: Float64): Bool
+        ensures result = (x /= x);
+
+    """
+    The square root of x, at least zero; a NaN for a NaN.
+    """
+    function squareRoot(x: Float64): Float64
+        requires (x /= x) or (x >= 0.0)
+        ensures (result /= result) or (result >= 0.0);
+
+    """
+    e to the power of x, at least zero; a NaN for a NaN.
+    """
+    function exponential(x: Float64): Float64
+        ensures (x /= x) or (result >= 0.0);
+
+    """
+    The natural logarithm of x, for x above zero or a NaN.
+    """
+    function logarithm(x: Float64): Float64
+        requires (x /= x) or (x > 0.0);
+
+    """
+    The natural logarithm of 1 + x, exact for an x near zero, for x above -1 or a NaN.
+    """
+    function logarithmOnePlus(x: Float64): Float64
+        requires (x /= x) or (x > -1.0);
+
+    """
+    The logarithm of x to base 10, for x above zero or a NaN.
+    """
+    function logarithm10(x: Float64): Float64
+        requires (x /= x) or (x > 0.0);
+
+    """
+    base to the power of exponent; a NaN where the power has no real value.
+    No contract: no precondition, since every pair of Float64 is allowed, and every Float64 is a possible result.
+    """
+    function power(base: Float64, exponent: Float64): Float64;
+
+    """
+    The sine of an angle in radians, from -1 to 1; a NaN for an infinite angle.
+    """
+    function sine(x: Float64): Float64
+        ensures (result /= result) or ((result >= -1.0) and (result <= 1.0));
+
+    """
+    The cosine of an angle in radians, from -1 to 1; a NaN for an infinite angle.
+    """
+    function cosine(x: Float64): Float64
+        ensures (result /= result) or ((result >= -1.0) and (result <= 1.0));
+
+    """
+    The tangent of an angle in radians.
+    No contract: no precondition, since every Float64 is allowed, and every Float64 is a possible result.
+    """
+    function tangent(x: Float64): Float64;
+
+    """
+    The angle of the point x, y in radians, from -pi to pi.
+    """
+    function arcTangent2(y: Float64, x: Float64): Float64
+        ensures (result /= result) or ((result >= -3.1416) and (result <= 3.1416));
+
+    """
+    The largest whole number not above x, at most 1 below it (x - result rounds to 1 for an x just below 0); an infinity for an infinity.
+    """
+    function floor(x: Float64): Float64
+        ensures (result /= result) or ((result <= x) and ((result = x) or ((x - result) <= 1.0)));
+
+    """
+    The smallest whole number not below x, at most 1 above it (result - x rounds to 1 for an x just above 0); an infinity for an infinity.
+    """
+    function ceiling(x: Float64): Float64
+        ensures (result /= result) or ((result >= x) and ((result = x) or ((result - x) <= 1.0)));
+
+    """
+    The absolute value of x, at least zero: x or 0 - x.
+    """
+    function absolute(x: Float64): Float64
+        ensures (result /= result) or ((result >= 0.0) and ((result = x) or (result = (0.0 - x))));
+end module.

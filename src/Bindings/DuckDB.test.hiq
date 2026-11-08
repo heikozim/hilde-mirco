@@ -1,0 +1,523 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The tests of the binding alone: they import nothing but the binding, so
+-- that they run wherever libduckdb is, and a failed check stops the test
+-- with its words.  Each attack on the host is followed by a statement that
+-- must run, so that a refusal is not a connection that is broken.  The
+-- test of concurrency asks a second process, testdata/duckdb_open.py, to
+-- open the file too: its exit code is 0 when DuckDB refused it for the
+-- lock, 1 when it opened the file.  The files of a third party are made by
+-- testdata/duckdb_hostile.py, without the safe layer.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, wholeSpan, destroyFree);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    openRead,
+    openWrite,
+    writeAll,
+    createDirectory,
+    removeDirectory,
+    closeFile,
+    removeFileIfThere
+);
+import Mirco.Bindings.DuckDB (
+    Opened,
+    Appending,
+    openDone,
+    fileHeld,
+    definitionRefused,
+    refusedByLayer,
+    openSafe,
+    closeSafe,
+    libraryFits,
+    run,
+    query,
+    resultFailure,
+    resultColumns,
+    isIntColumn,
+    isFloatColumn,
+    isTextColumn,
+    isBoolColumn,
+    nextChunk,
+    chunkRows,
+    cellValid,
+    cellInt,
+    cellFloat,
+    cellBool,
+    cellTextLength,
+    prepare,
+    parameterCount,
+    bindFloat,
+    bindInt,
+    bindBool,
+    bindText,
+    bindNull,
+    executePrepared,
+    changedRows,
+    outcomeError,
+    destroyPrepared,
+    destroyChunk,
+    destroyResult,
+    appendDone,
+    insertRefused,
+    appenderRefused,
+    insertColumns,
+    openAppender,
+    appendFloat,
+    appendInt,
+    appendBool,
+    appendText,
+    appendNull,
+    endRow,
+    flushAppender,
+    dropAppender
+);
+
+module body Mirco.Bindings.DuckDB.Test is
+    function check(holds: Bool, what: Span[Nat8, Static]): Unit is
+        if not holds then
+            abort(what);
+        end if;
+        return nil;
+    end;
+
+    -- The one bigint of a query of one row.
+    function single(connection: Nat64, sql: Span[Nat8, Static]): Int64 is
+        let result: Nat64 := query(connection, sql);
+        check(resultFailure(result) = 0, "the query runs");
+        check((resultColumns(result) = 1) and isIntColumn(result, 0), "one column of BIGINT");
+        let chunk: Nat64 := nextChunk(result);
+        check(chunkRows(chunk) = 1, "one row");
+        check(cellValid(result, chunk, 0, 0), "the value is there");
+        let value: Int64 := cellInt(result, chunk, 0, 0);
+        destroyChunk(chunk);
+        destroyResult(result);
+        return value;
+    end;
+
+    function testVersion(): Unit is
+        check(libraryFits(), "libduckdb is at least 1.5.6");
+        return nil;
+    end;
+
+    function testLayerRefusesTheHost(): Unit is
+        let opened: Opened := openSafe(":memory:", false);
+        check(opened.failure = openDone(), "a database in memory opens");
+        let c: Nat64 := opened.connection;
+        check(run(c, "CREATE TABLE t AS SELECT 1 AS a") = 0, "a table in the database is made");
+        check(run(c, "SELECT * FROM read_csv('hilde.toml')") /= 0, "read_csv of a file of the package refused");
+        check(run(c, "SELECT * FROM read_csv('/etc/passwd')") /= 0, "read_csv of /etc/passwd refused");
+        check(run(c, "SELECT * FROM read_text('/etc/passwd')") /= 0, "read_text of /etc/passwd refused");
+        check(run(c, "SELECT * FROM read_blob('/etc/passwd')") /= 0, "read_blob of /etc/passwd refused");
+        check(run(c, "SELECT * FROM '/etc/passwd'") /= 0, "a path read as a table refused");
+        check(run(c, "SELECT * FROM glob('/etc/*')") /= 0, "glob of the host refused");
+        check(run(c, "EXPORT DATABASE 'mirco-duckdb-export'") /= 0, "EXPORT DATABASE refused");
+        check(run(c, "COPY t TO 'mirco-duckdb-copy.csv'") /= 0, "COPY TO a file refused");
+        check(run(c, "COPY t FROM 'hilde.toml'") /= 0, "COPY FROM a file refused");
+        check(run(c, "ATTACH 'mirco-duckdb-attach.duckdb' AS other") /= 0, "ATTACH of a file refused");
+        check(run(c, "SET enable_external_access = true") /= 0, "SET enable_external_access refused");
+        check(run(c, "RESET enable_external_access") /= 0, "RESET enable_external_access refused");
+        check(run(c, "SET GLOBAL enable_external_access = true") /= 0, "SET GLOBAL enable_external_access refused");
+        check(run(c, "PRAGMA enable_external_access = true") /= 0, "PRAGMA enable_external_access refused");
+        check(run(c, "SET allowed_directories = ['/']") /= 0, "SET allowed_directories refused");
+        check(run(c, "SET autoload_known_extensions = true") /= 0, "SET autoload_known_extensions refused");
+        check(run(c, "RESET autoinstall_known_extensions") /= 0, "RESET autoinstall_known_extensions refused");
+        check(run(c, "SET lock_configuration = false") /= 0, "SET lock_configuration refused");
+        check(run(c, "RESET lock_configuration") /= 0, "RESET lock_configuration refused");
+        check(run(c, "INSTALL httpfs") /= 0, "INSTALL refused");
+        check(run(c, "LOAD httpfs") /= 0, "LOAD refused");
+        check(run(c, "PRAGMA enable_profiling") /= 0, "PRAGMA enable_profiling refused");
+        check(run(c, "PRAGMA disable_optimizer") /= 0, "PRAGMA disable_optimizer refused");
+        check(run(c, "CALL enable_logging(storage = 'stdout')") /= 0, "enable_logging to the standard output refused");
+        check(run(c, "CALL \"ENABLE_LOGGING\"()") /= 0, "enable_logging quoted in capitals refused");
+        check(run(c, "SELECT * FROM system.main.enable_logging()") /= 0, "enable_logging named with its catalog refused");
+        check(run(c, "CALL enable_logging(storage = 'file', storage_path = 'mirco-duckdb-logs')") /= 0, "enable_logging into a file refused");
+        check(run(c, "CALL enable_profiling(save_location = 'mirco-duckdb-profile.json', format = 'json')") /= 0, "enable_profiling into a file refused");
+        check(run(c, "CALL enable_peg_parser()") /= 0, "enable_peg_parser refused");
+        check(run(c, "SELECT * FROM query('SELECT * FROM enable_' || 'logging()')") /= 0, "SQL made from a string refused");
+        check(run(c, "CREATE VIEW logged AS SELECT * FROM enable_logging()") /= 0, "a view that calls enable_logging refused");
+        check(prepare(c, "CALL enable_logging()") = 0, "enable_logging is not prepared");
+        check(single(c, "SELECT CAST(count(*) AS BIGINT) FROM t") = 1, "the connection still runs statements");
+        -- The names of the two settings are split, since refusedByLayer finds
+        -- a function's name inside a string as well.
+        check(single(c, "SELECT CAST(count(*) AS BIGINT) FROM system.main.duckdb_settings() WHERE (name = 'enable_' || 'logging' AND value = '0') OR (name = 'enable_' || 'profiling' AND value IS NULL) OR (name = 'logging_storage' AND value = 'memory')") = 3, "logging and profiling are as they were");
+        check(not there("mirco-duckdb-profile.json"), "no profile was written");
+        check(single(c, "SELECT CAST(CAST(current_setting('enable_external_access') AS VARCHAR) = 'false' AND CAST(current_setting('lock_configuration') AS VARCHAR) = 'true' AS BIGINT)") = 1, "the layer still holds");
+        closeSafe(opened.database, c);
+        return nil;
+    end;
+
+    -- Appends every byte of text to buf, so a check can hold a byte that no
+    -- source writes as a letter, such as the two of a no-break space.
+    generic [R: Region]
+    function appendSpan(buf: &![Buffer[Nat8], R], text: Span[Nat8, Static]): Unit is
+        var k: Index := 0;
+        while k < spanLength(text) do
+            insertBack(&~buf, text[k]);
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    -- What refusedByLayer finds, however it is written, and the names it
+    -- leaves alone.
+    function testRefusedByLayer(): Unit is
+        check(refusedByLayer("PRAGMA enable_profiling") and refusedByLayer("pragma version"), "a pragma in any case");
+        check(refusedByLayer("CALL enable_logging(storage = 'stdout')"), "enable_logging");
+        check(refusedByLayer("CALL \"ENABLE_LOGGING\"()"), "a quoted name in capitals");
+        check(refusedByLayer("CALL system.main.enable_logging()"), "a name with its catalog");
+        check(refusedByLayer("SELECT * FROM enable_logging /* a /* b */ c */ ()"), "a name before a comment");
+        check(refusedByLayer("SELECT 1; CALL disable_logging()"), "a name in a second statement");
+        check(refusedByLayer("CALL truncate_duckdb_logs()"), "truncate_duckdb_logs");
+        check(refusedByLayer("CALL enable_profiling()") and refusedByLayer("CALL disable_profiling()"), "the profiler");
+        check(refusedByLayer("CALL enable_peg_parser()") and refusedByLayer("CALL disable_peg_parser()"), "the parser");
+        check(refusedByLayer("SELECT * FROM query_table('t')"), "query_table");
+        check(refusedByLayer("SELECT * FROM json_execute_serialized_sql('{}')"), "json_execute_serialized_sql");
+        check(refusedByLayer("SELECT * FROM query('SELECT 1')"), "query and its parenthesis");
+        check(refusedByLayer("SELECT * FROM \"query\" ('SELECT 1')"), "query quoted, then a blank");
+        check(refusedByLayer("SELECT * FROM QUERY -- a\n('SELECT 1')"), "query, a comment and a line end");
+        check(refusedByLayer("SELECT * FROM query--a\r('SELECT 1')"), "query, a comment and a carriage return");
+        check(refusedByLayer("SELECT * FROM query/* a /* b */ c */('SELECT 1')"), "query and a nested comment");
+        check(refusedByLayer("SELECT 1pragma"), "a name after digits");
+        check(refusedByLayer("SELECT 'enable_logging'"), "a name inside a string");
+        check(not refusedByLayer("SELECT query, count(*) FROM searches GROUP BY query"), "a column named query");
+        check(not refusedByLayer("SELECT * FROM pragma_table_info('t')"), "pragma_table_info");
+        check(not refusedByLayer("SELECT query_count, xenable_logging, enable_loggingx FROM t"), "names that only hold a refused one");
+        check(not refusedByLayer("SELECT system.main.current_setting('lock_configuration')"), "current_setting");
+        check(not refusedByLayer(""), "no text");
+        -- DuckDB's reader takes the no-break space U+00A0 (194, 160) for a
+        -- blank between a name and its parenthesis, so query with one before
+        -- the parenthesis is query with its parenthesis, and refused.
+        var nbsp: Buffer[Nat8] := allocateEmpty();
+        appendSpan(&!nbsp, "SELECT * FROM query");
+        insertBack(&!nbsp, 194);
+        insertBack(&!nbsp, 160);
+        appendSpan(&!nbsp, "('SELECT ' || 'x')");
+        check(refusedByLayer(wholeSpan(&nbsp)), "query, a no-break space and a parenthesis");
+        destroyFree(nbsp);
+        return nil;
+    end;
+
+    -- By default DuckDB takes .tmp of the working directory for the
+    -- temporary files of a database in memory, and lets SQL read and write
+    -- in it although external access is off; with the layer there is no
+    -- such directory, so a file of the host put there stays out of reach.
+    function testNoTemporaryDirectory(): Unit is
+        let made: Bool := createDirectory(".tmp");
+        case openWrite(".tmp/mirco-duckdb-host.txt") of
+            when Some(value as file: FileDescriptor) do
+                var f: FileDescriptor := file;
+                let written: Bool := writeAll(&!f, "a file of the host\n");
+                let closed: Bool := closeFile(f);
+                check(written, "a file of the host is written into .tmp");
+            when None do
+                abort("a file of the host is written into .tmp");
+        end case;
+        let opened: Opened := openSafe(":memory:", false);
+        check(opened.failure = openDone(), "a database in memory opens");
+        let c: Nat64 := opened.connection;
+        check(run(c, "CREATE TABLE t AS SELECT 1 AS a") = 0, "a table in the database is made");
+        check(run(c, "SELECT * FROM read_text('.tmp/mirco-duckdb-host.txt')") /= 0, "a file of the host in .tmp is not read");
+        check(run(c, "COPY t TO '.tmp/mirco-duckdb-copy.csv'") /= 0, "COPY into .tmp refused");
+        check(single(c, "SELECT CAST(CAST(system.main.current_setting('temp_directory') AS VARCHAR) = '' AS BIGINT)") = 1, "no directory for temporary files");
+        closeSafe(opened.database, c);
+        let copied: Bool := there(".tmp/mirco-duckdb-copy.csv");
+        let copy_gone: Bool := removeFileIfThere(".tmp/mirco-duckdb-copy.csv");
+        let host_gone: Bool := removeFileIfThere(".tmp/mirco-duckdb-host.txt");
+        if made then
+            let removed: Bool := removeDirectory(".tmp");
+        end if;
+        check(not copied, "COPY wrote no file into .tmp");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        let opened: Opened := openSafe(":memory:", false);
+        check(opened.failure = openDone(), "a database in memory opens");
+        check(run(opened.connection, "SELEC 1") /= 0, "a statement that is no SQL is refused");
+        let missing: Opened := openSafe("mirco-duckdb-not-there.duckdb", true);
+        check(missing.failure /= openDone(), "a reader of a file that is not there is refused");
+        check((missing.database = 0) and (missing.connection = 0), "a refused open gives no handle");
+        closeSafe(opened.database, opened.connection);
+        return nil;
+    end;
+
+    function testPreparedAndCells(): Unit is
+        let opened: Opened := openSafe(":memory:", false);
+        check(opened.failure = openDone(), "a database in memory opens");
+        let c: Nat64 := opened.connection;
+        check(run(c, "CREATE TABLE p (x DOUBLE, n BIGINT PRIMARY KEY, s VARCHAR, b BOOLEAN, i INTEGER)") = 0, "the table is made");
+        let statement: Nat64 := prepare(c, "INSERT INTO p VALUES (?, ?, ?, ?, ?)");
+        check(statement /= 0, "the insert is prepared");
+        check(parameterCount(statement) = 5, "five question marks");
+        check((bindFloat(statement, 1, 2.5) = 0) and (bindInt(statement, 2, 7) = 0) and (bindText(statement, 3, "koeln") = 0), "three values bound");
+        check((bindBool(statement, 4, true) = 0) and (bindInt(statement, 5, -3) = 0), "five values bound");
+        check(bindInt(statement, 6, 1) /= 0, "a sixth question mark refused");
+        check(bindInt(statement, 0, 1) /= 0, "question mark 0 refused");
+        check(changedRows(executePrepared(statement)) = 1, "one row written");
+        check((bindNull(statement, 1) = 0) and (bindInt(statement, 2, 8) = 0) and (bindNull(statement, 3) = 0), "nulls bound");
+        check((bindNull(statement, 4) = 0) and (bindNull(statement, 5) = 0), "more nulls bound");
+        check(changedRows(executePrepared(statement)) = 1, "a row of nulls written");
+        let twice: Int64 := executePrepared(statement);
+        check((twice < 0) and (changedRows(twice) = 0) and (outcomeError(twice) >= 0), "a key written twice fails");
+        destroyPrepared(statement);
+        check(prepare(c, "INSERT INTO nowhere VALUES (?)") = 0, "a statement on no table is refused");
+        let result: Nat64 := query(c, "SELECT x, n, s, b, i FROM p ORDER BY n");
+        check((resultFailure(result) = 0) and (resultColumns(result) = 5), "five columns read");
+        check(isFloatColumn(result, 0) and isIntColumn(result, 1) and isTextColumn(result, 2) and isBoolColumn(result, 3) and isIntColumn(result, 4), "the types of the columns");
+        check((not isIntColumn(result, 0)) and (not isTextColumn(result, 3)) and (not isBoolColumn(result, 5)), "no other types");
+        let chunk: Nat64 := nextChunk(result);
+        check(chunkRows(chunk) = 2, "two rows");
+        check(cellFloat(result, chunk, 0, 0) = 2.5, "the Float64");
+        check(cellInt(result, chunk, 1, 0) = 7, "the BIGINT");
+        check(cellTextLength(result, chunk, 2, 0) = 5, "the length of the text");
+        check(cellBool(result, chunk, 3, 0), "the BOOLEAN");
+        check(cellInt(result, chunk, 4, 0) = -3, "the INTEGER as an Int64");
+        check((not cellValid(result, chunk, 0, 1)) and cellValid(result, chunk, 1, 1) and (not cellValid(result, chunk, 2, 1)), "the nulls of row 2");
+        destroyChunk(chunk);
+        check(nextChunk(result) = 0, "no chunk after the last");
+        destroyResult(result);
+        closeSafe(opened.database, c);
+        return nil;
+    end;
+
+    -- Only the one form of insert is taken; every other text, among them
+    -- one that goes on after the insert, gives 0.
+    function testInsertColumns(): Unit is
+        check(insertColumns("INSERT INTO p (x, n, s) VALUES (?, ?, ?)") = 3, "three columns");
+        check(insertColumns("  insert into P(x,n)values(?,?) ;  ") = 2, "any case, spaces and a semicolon");
+        check(insertColumns("INSERT\tINTO\n_p_1 (x_2) VALUES (?)") = 1, "tabs, line ends and underscores");
+        check(insertColumns("") = 0, "no text");
+        check(insertColumns("INSERT INTO p VALUES (?, ?)") = 0, "no list of columns");
+        check(insertColumns("INSERT INTO p (x, n) VALUES (?)") = 0, "fewer question marks than columns");
+        check(insertColumns("INSERT INTO p (x) VALUES (?, ?)") = 0, "more question marks than columns");
+        check(insertColumns("INSERT INTO \"p\" (x) VALUES (?)") = 0, "a quoted table");
+        check(insertColumns("INSERT INTO main.p (x) VALUES (?)") = 0, "a schema");
+        check(insertColumns("INSERT INTO p (1x) VALUES (?)") = 0, "a name that begins with a digit");
+        check(insertColumns("INSERT INTO p (x) VALUES ($1)") = 0, "a numbered parameter");
+        check(insertColumns("INSERT INTO p (x) VALUES (lower(?))") = 0, "an expression");
+        check(insertColumns("INSERT INTO p (x) VALUES (?), (?)") = 0, "a second row");
+        check(insertColumns("INSERT INTO p (x) VALUES (?); DROP TABLE p") = 0, "a second statement");
+        check(insertColumns("INSERT INTO p (x) SELECT * FROM read_csv('/etc/passwd')") = 0, "a select");
+        check(insertColumns("INSERTINTO p (x) VALUES (?)") = 0, "two words as one");
+        check(insertColumns("INSERT INTO p (x) VALUES (?) -- ") = 0, "a comment");
+        return nil;
+    end;
+
+    function testAppenderWrites(): Unit is
+        let opened: Opened := openSafe(":memory:", false);
+        check(opened.failure = openDone(), "a database in memory opens");
+        let c: Nat64 := opened.connection;
+        check(run(c, "CREATE TABLE a (x DOUBLE, n BIGINT PRIMARY KEY, s VARCHAR, b BOOLEAN, d INTEGER DEFAULT 5)") = 0, "the table is made");
+        check(run(c, "BEGIN TRANSACTION") = 0, "a transaction begins");
+        let appending: Appending := openAppender(c, "INSERT INTO A (s, n, x, b) VALUES (?, ?, ?, ?)");
+        check((appending.failure = appendDone()) and (appending.appender /= 0) and (appending.columns = 4), "the appender of four columns");
+        let w: Nat64 := appending.appender;
+        check((appendText(w, "bonn") = 0) and (appendInt(w, 1) = 0) and (appendFloat(w, 1.5) = 0) and (appendBool(w, true) = 0), "a row appended");
+        check(endRow(w) = 0, "the row ends");
+        check((appendNull(w) = 0) and (appendInt(w, 2) = 0) and (appendNull(w) = 0) and (appendNull(w) = 0), "a row of nulls appended");
+        check(endRow(w) = 0, "the second row ends");
+        check(appendText(w, "") = 0, "an empty text appended");
+        check(endRow(w) /= 0, "a row of one value of four is refused");
+        dropAppender(w);
+        check(run(c, "COMMIT") = 0, "the transaction commits");
+        check(single(c, "SELECT CAST(count(*) AS BIGINT) FROM a") = 0, "an appender dropped writes nothing it was not told to flush");
+        let again: Appending := openAppender(c, "INSERT INTO a (s, n, x, b) VALUES (?, ?, ?, ?)");
+        check(again.failure = appendDone(), "a second appender");
+        let v: Nat64 := again.appender;
+        check((appendText(v, "bonn") = 0) and (appendInt(v, 1) = 0) and (appendFloat(v, 1.5) = 0) and (appendBool(v, true) = 0), "a row appended");
+        check(endRow(v) = 0, "the row ends");
+        check((appendNull(v) = 0) and (appendInt(v, 2) = 0) and (appendNull(v) = 0) and (appendNull(v) = 0), "a row of nulls appended");
+        check(endRow(v) = 0, "the second row ends");
+        check(flushAppender(v) = 0, "the rows are written");
+        dropAppender(v);
+        let result: Nat64 := query(c, "SELECT x, n, s, b, d FROM a ORDER BY n");
+        check((resultFailure(result) = 0) and (resultColumns(result) = 5), "five columns read");
+        let chunk: Nat64 := nextChunk(result);
+        check(chunkRows(chunk) = 2, "two rows");
+        check(cellFloat(result, chunk, 0, 0) = 1.5, "the Float64");
+        check(cellInt(result, chunk, 1, 0) = 1, "the BIGINT");
+        check(cellTextLength(result, chunk, 2, 0) = 4, "the text");
+        check(cellBool(result, chunk, 3, 0), "the BOOLEAN");
+        check(cellInt(result, chunk, 4, 0) = 5, "a column not named takes its default");
+        check((not cellValid(result, chunk, 0, 1)) and (not cellValid(result, chunk, 2, 1)) and (not cellValid(result, chunk, 3, 1)), "the nulls of row 2");
+        destroyChunk(chunk);
+        destroyResult(result);
+        closeSafe(opened.database, c);
+        return nil;
+    end;
+
+    -- A duplicate key fails the flush, and the rollback keeps none of the
+    -- rows; a table, a column or a text that DuckDB refuses writes nothing.
+    function testAppenderRefusals(): Unit is
+        let opened: Opened := openSafe(":memory:", false);
+        check(opened.failure = openDone(), "a database in memory opens");
+        let c: Nat64 := opened.connection;
+        check(run(c, "CREATE TABLE k (n BIGINT PRIMARY KEY, s VARCHAR)") = 0, "the table is made");
+        check(run(c, "BEGIN TRANSACTION") = 0, "a transaction begins");
+        let appending: Appending := openAppender(c, "INSERT INTO k (n) VALUES (?)");
+        check(appending.failure = appendDone(), "the appender");
+        let w: Nat64 := appending.appender;
+        check((appendInt(w, 1) = 0) and (endRow(w) = 0) and (appendInt(w, 2) = 0) and (endRow(w) = 0), "two keys");
+        check((appendInt(w, 1) = 0) and (endRow(w) = 0), "the first key again");
+        check(appendInt(w, 3) = 0, "a value of a row");
+        check(appendInt(w, 4) /= 0, "a second value of a row of one column is refused");
+        check(endRow(w) = 0, "the row ends");
+        check(flushAppender(w) = 19, "the duplicate key fails the flush as a constraint");
+        dropAppender(w);
+        check(run(c, "ROLLBACK") = 0, "the transaction is rolled back");
+        check(single(c, "SELECT CAST(count(*) AS BIGINT) FROM k") = 0, "no row of the failed write is kept");
+        let shape: Appending := openAppender(c, "INSERT INTO k (n) VALUES (?); DROP TABLE k");
+        check((shape.failure = insertRefused()) and (shape.appender = 0), "a second statement is refused before DuckDB sees it");
+        let table: Appending := openAppender(c, "INSERT INTO nowhere (n) VALUES (?)");
+        check((table.failure = appenderRefused()) and (table.appender = 0), "a table that is not there");
+        let reader: Appending := openAppender(c, "INSERT INTO read_csv (n) VALUES (?)");
+        check(reader.failure = appenderRefused(), "the name of a function is no table");
+        let column: Appending := openAppender(c, "INSERT INTO k (n, nope) VALUES (?, ?)");
+        check((column.failure = appenderRefused()) and (column.appender = 0), "a column that is not there");
+        let twice: Appending := openAppender(c, "INSERT INTO k (n, N) VALUES (?, ?)");
+        check(twice.failure = appenderRefused(), "a column named twice");
+        let text: Appending := openAppender(c, "INSERT INTO k (n, s) VALUES (?, ?)");
+        check(text.failure = appendDone(), "the appender of two columns");
+        let t: Nat64 := text.appender;
+        var bytes: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!bytes, 255);
+        insertBack(&!bytes, 254);
+        check((appendInt(t, 9) = 0) and (appendText(t, wholeSpan(&bytes)) = 0) and (endRow(t) = 0), "a text that is no UTF-8 is held");
+        check(flushAppender(t) /= 0, "and refused when it is written");
+        dropAppender(t);
+        destroyFree(bytes);
+        check(single(c, "SELECT CAST(count(*) AS BIGINT) FROM k") = 0, "still no row");
+        check(single(c, "SELECT CAST(CAST(current_setting('enable_external_access') AS VARCHAR) = 'false' AND CAST(current_setting('lock_configuration') AS VARCHAR) = 'true' AS BIGINT)") = 1, "the layer still holds");
+        closeSafe(opened.database, c);
+        return nil;
+    end;
+
+    -- The exit code of the shell running script with path and word as its
+    -- two arguments, -1 when it did not run to its end.
+    function childExit(script: Span[Nat8, Static], path: Span[Nat8, Static], word: Span[Nat8, Static]): Int32 is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), script), path), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status);
+            when None do
+                return -1;
+        end case;
+    end;
+
+    -- The exit code of testdata/duckdb_open.py opening path in mode.
+    function childOpens(path: Span[Nat8, Static], mode: Span[Nat8, Static]): Int32 is
+        return childExit("PATH=\"$PATH:/usr/local/bin\" exec python3 -I testdata/duckdb_open.py \"$0\" \"$1\"", path, mode);
+    end;
+
+    -- The exit code of testdata/duckdb_hostile.py making the file at path
+    -- of the kind named.
+    function makeFile(path: Span[Nat8, Static], kind: Span[Nat8, Static]): Int32 is
+        return childExit("PATH=\"$PATH:/usr/local/bin\" exec python3 -I testdata/duckdb_hostile.py \"$0\" \"$1\"", path, kind);
+    end;
+
+    -- Whether a file of the name can be opened for reading.
+    function there(path: Span[Nat8, Static]): Bool is
+        case openRead(path) of
+            when Some(value as file: FileDescriptor) do
+                let closed: Bool := closeFile(file);
+                return true;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function removeLockFile(): Unit is
+        let gone: Bool := removeFileIfThere("mirco-duckdb-lock.duckdb");
+        let wal_gone: Bool := removeFileIfThere("mirco-duckdb-lock.duckdb.wal");
+        return nil;
+    end;
+
+    -- One writing programme for each file, and no reading one beside it;
+    -- readers beside each other.  Within the programme a second writer
+    -- shares the database, and a reader beside it is refused.
+    function testOneWriterPerFile(): Unit is
+        removeLockFile();
+        let writer: Opened := openSafe("mirco-duckdb-lock.duckdb", false);
+        check(writer.failure = openDone(), "the file is opened for writing");
+        check(run(writer.connection, "CREATE TABLE w (n BIGINT)") = 0, "the writer writes");
+        check(childOpens("mirco-duckdb-lock.duckdb", "READ_WRITE") = 0, "a second process cannot write");
+        check(childOpens("mirco-duckdb-lock.duckdb", "READ_ONLY") = 0, "a second process cannot read beside the writer");
+        let reader: Opened := openSafe("mirco-duckdb-lock.duckdb", true);
+        check(reader.failure = fileHeld(), "a reader of the programme beside its writer is held off");
+        let second: Opened := openSafe("mirco-duckdb-lock.duckdb", false);
+        check(second.failure = openDone(), "a second writer of the programme shares the database");
+        check(single(second.connection, "SELECT CAST(count(*) AS BIGINT) FROM w") = 0, "and sees the table of the first");
+        closeSafe(second.database, second.connection);
+        closeSafe(writer.database, writer.connection);
+        check(childOpens("mirco-duckdb-lock.duckdb", "READ_WRITE") = 1, "a second process writes once the writer closed");
+        let read_only: Opened := openSafe("mirco-duckdb-lock.duckdb", true);
+        check(read_only.failure = openDone(), "the file is opened for reading");
+        check(run(read_only.connection, "INSERT INTO w VALUES (1)") /= 0, "a reader does not write");
+        check(childOpens("mirco-duckdb-lock.duckdb", "READ_ONLY") = 1, "a second process reads beside a reader");
+        check(childOpens("mirco-duckdb-lock.duckdb", "READ_WRITE") = 0, "a second process cannot write beside a reader");
+        let writer_beside: Opened := openSafe("mirco-duckdb-lock.duckdb", false);
+        check(writer_beside.failure = fileHeld(), "a writer of the programme beside its reader is held off");
+        let reader_beside: Opened := openSafe("mirco-duckdb-lock.duckdb", true);
+        check(reader_beside.failure = openDone(), "a second reader of the programme shares the database");
+        closeSafe(reader_beside.database, reader_beside.connection);
+        closeSafe(read_only.database, read_only.connection);
+        check(childOpens("mirco-duckdb-lock.duckdb", "READ_ONLY") = 1, "a second process reads once the readers closed");
+        removeLockFile();
+        return nil;
+    end;
+
+    function removeMadeFiles(): Unit is
+        let plain: Bool := removeFileIfThere("mirco-duckdb-plain.duckdb");
+        let view: Bool := removeFileIfThere("mirco-duckdb-view.duckdb");
+        let macro: Bool := removeFileIfThere("mirco-duckdb-macro.duckdb");
+        let shadow: Bool := removeFileIfThere("mirco-duckdb-shadow.duckdb");
+        return nil;
+    end;
+
+    -- Files of a third party: views and macros that call no refused function
+    -- are taken, and a view or a macro that calls enable_logging keeps the
+    -- file closed, for writing and for reading, also when the file holds
+    -- macros named as the functions of the catalog that the check reads.
+    function testDefinitionsOfAFile(): Unit is
+        removeMadeFiles();
+        check(makeFile("mirco-duckdb-plain.duckdb", "plain") = 0, "a file with a view and macros of its own is made");
+        let plain: Opened := openSafe("mirco-duckdb-plain.duckdb", true);
+        check(plain.failure = openDone(), "a view and macros that call nothing refused are taken");
+        check(single(plain.connection, "SELECT CAST(sum(a) AS BIGINT) FROM v") = 1, "and the view is read");
+        check(single(plain.connection, "SELECT CAST(count(*) AS BIGINT) FROM facts_of()") = 1, "and the table macro");
+        closeSafe(plain.database, plain.connection);
+        check(makeFile("mirco-duckdb-view.duckdb", "view") = 0, "a file with a view that calls enable_logging is made");
+        let view_read: Opened := openSafe("mirco-duckdb-view.duckdb", true);
+        check((view_read.failure = definitionRefused()) and (view_read.database = 0) and (view_read.connection = 0), "a view that calls enable_logging keeps a reader out");
+        let view_write: Opened := openSafe("mirco-duckdb-view.duckdb", false);
+        check(view_write.failure = definitionRefused(), "and a writer");
+        check(makeFile("mirco-duckdb-macro.duckdb", "macro") = 0, "a file with a macro that calls enable_logging is made");
+        let macro_read: Opened := openSafe("mirco-duckdb-macro.duckdb", true);
+        check(macro_read.failure = definitionRefused(), "a table macro that calls enable_logging keeps the file closed");
+        check(makeFile("mirco-duckdb-shadow.duckdb", "shadow") = 0, "a file with macros named as the catalog is made");
+        let shadow_read: Opened := openSafe("mirco-duckdb-shadow.duckdb", true);
+        check(shadow_read.failure = definitionRefused(), "macros named duckdb_views, duckdb_functions and current_setting hide nothing");
+        removeMadeFiles();
+        return nil;
+    end;
+end module body.

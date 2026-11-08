@@ -1,0 +1,75 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Describes the elements of a Float64 array: spread, middle, quantiles, histograms and the relation of two arrays.
+
+- Every function reads all elements, whatever the shape; time linear in the count, a median and a percentile n log n.
+- A NaN among the elements gives a NaN, as NumPy gives one.
+- A percentile interpolates linearly between the two neighbouring elements, as NumPy does by default.
+
+    let spread: Float64 := standardDeviation(&values, 1);
+"""
+import Mirco.Array (NdArray, count);
+import Mirco.Math (isFinite);
+
+module Mirco.Stats is
+    """
+    The variance: the sum of the squared distances from the mean, divided by count minus ddof.
+    """
+    generic [R: Region]
+    function variance(values: &[NdArray[Float64], R], ddof: Index): Float64
+        requires count(values) > ddof
+        ensures (result /= result) or (result >= 0.0);
+
+    """
+    The standard deviation, the square root of the variance with ddof.
+    """
+    generic [R: Region]
+    function standardDeviation(values: &[NdArray[Float64], R], ddof: Index): Float64
+        requires count(values) > ddof
+        ensures (result /= result) or (result >= 0.0);
+
+    """
+    The middle element of the sorted elements, or the mean of the two in the middle.
+    """
+    generic [R: Region]
+    function median(values: &[NdArray[Float64], R]): Float64
+        requires count(values) > 0;
+
+    """
+    The element below which q percent of the elements lie, q from 0 to 100.
+    """
+    generic [R: Region]
+    function percentile(values: &[NdArray[Float64], R], q: Float64): Float64
+        requires (count(values) > 0) and (q >= 0.0) and (q <= 100.0);
+
+    """
+    The counts of the elements in bins of equal width from low to high; the last bin holds high as well.
+    Elements outside low to high and a NaN are not counted; low and high are finite, as NumPy asks of a range.
+    """
+    generic [R: Region]
+    function histogram(values: &[NdArray[Float64], R], bins: Index, low: Float64, high: Float64): NdArray[Int64]
+        requires (bins > 0) and (bins <= 1000000) and isFinite(low) and isFinite(high) and (low < high)
+        ensures count(&result) = bins;
+
+    """
+    The covariance of two arrays of the same count, divided by count minus ddof.
+    """
+    generic [R: Region, S: Region]
+    function covariance(x: &[NdArray[Float64], R], y: &[NdArray[Float64], S], ddof: Index): Float64
+        requires (count(x) = count(y)) and (count(x) > ddof);
+
+    """
+    The correlation coefficient of Pearson of two arrays of the same count, from -1 to 1.
+    A NaN when one of them does not vary.
+    """
+    generic [R: Region, S: Region]
+    function correlation(x: &[NdArray[Float64], R], y: &[NdArray[Float64], S]): Float64
+        requires (count(x) = count(y)) and (count(x) > 1)
+        ensures (result /= result) or ((result >= -1.0000001) and (result <= 1.0000001));
+end module.

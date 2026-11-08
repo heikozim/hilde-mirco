@@ -1,0 +1,88 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal);
+import Standard.Bits (float64Bits);
+import Mirco.Text (isNumber, parseFloat64, formatFloat64);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Text.Test is
+    -- The number text holds, or 12345.0 when it holds none.
+    generic [R: Region]
+    function read(text: Span[Nat8, R]): Float64 is
+        case parseFloat64(text) of
+            when Some(value as x: Float64) do
+                return x;
+            when None do
+                return 12345.0;
+        end case;
+    end;
+
+    -- True when value is written as want.
+    function writes(value: Float64, want: Span[Nat8, Static]): Bool is
+        let text: String := formatFloat64(value);
+        let same: Bool := equal(asSpan(&text), want);
+        destroyString(text);
+        return same;
+    end;
+
+    -- True when value is written and read back with the same bits.
+    function roundTrips(value: Float64): Bool is
+        let text: String := formatFloat64(value);
+        let back: Float64 := read(asSpan(&text));
+        destroyString(text);
+        return float64Bits(back) = float64Bits(value);
+    end;
+
+    function testReading(): Unit is
+        assertTrue(read("1.5") = 1.5, "a fraction");
+        assertTrue(read(" -2e3 ") = -2000.0, "a sign, an exponent and blanks");
+        assertTrue(read(".5") = 0.5, "no digit before the point");
+        assertTrue(read("5.") = 5.0, "no digit after the point");
+        assertTrue(read("1E-2") = 0.01, "a capital E");
+        let nan: Float64 := read("NaN");
+        assertTrue(nan /= nan, "NaN in any case");
+        assertTrue(read("-inf") < -1000000.0, "minus infinity");
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        assertTrue(not isNumber("abc"), "letters");
+        assertTrue(not isNumber("1e"), "an exponent without digits");
+        assertTrue(not isNumber(""), "nothing");
+        assertTrue(not isNumber("   "), "blanks alone");
+        assertTrue(not isNumber("1.2.3"), "two points");
+        assertTrue(not isNumber("0x10"), "hex, which strtod would take");
+        assertTrue(not isNumber("1 2"), "a blank inside");
+        assertTrue(isNumber("+7"), "a plus sign");
+        assertTrue(read("12abc") = 12345.0, "no number, no value");
+        return nil;
+    end;
+
+    function testWriting(): Unit is
+        assertTrue(writes(0.1, "0.1"), "0.1 is not 0.10000000000000001");
+        assertTrue(writes(100.0, "100"), "a whole number");
+        assertTrue(writes(1.0 / 3.0, "0.3333333333333333"), "sixteen digits suffice");
+        assertTrue(writes(-2.5, "-2.5"), "a negative number");
+        assertTrue(writes(read("1e300"), "1e+300"), "an exponent");
+        assertTrue(writes(read("-inf"), "-inf"), "minus infinity");
+        assertTrue(roundTrips(0.1 + 0.2) and roundTrips(1.0 / 7.0) and roundTrips(read("5e-324")), "every number reads back");
+        return nil;
+    end;
+
+    -- The longest texts formatFloat64 writes, each checked by its ensures
+    -- of at most 24 bytes: 17 digits with a sign and an exponent of five,
+    -- 17 digits after -0.000, and 17 digits of a whole number.
+    function testLongestTexts(): Unit is
+        assertTrue(writes(read("-2.2250738585072014e-308"), "-2.2250738585072014e-308"), "the smallest normal number, negated, in 24 bytes");
+        assertTrue(writes(read("-0.00012345678901234567"), "-0.00012345678901234567"), "a small number in fixed notation, in 23 bytes");
+        assertTrue(writes(read("-12345678901234568"), "-12345678901234568"), "a whole number of 17 digits");
+        assertTrue(roundTrips(read("-1.7976931348623157e308")), "the largest number, negated");
+        return nil;
+    end;
+end module body.

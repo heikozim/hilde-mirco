@@ -1,0 +1,185 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reads .root files, the format of the data framework of Cern: the header of a file, the keys of its directories and the bytes of the objects they hold.
+
+- Small files with 32 bit offsets and large ones with 64 bit offsets are read.
+- Compressed objects of zlib, LZ4, xz and Zstandard are unpacked up to a limit the caller names; the other kinds are refused.
+- Every offset and length is checked against the bytes before it is used; nothing aborts on a malformed file.
+- A refusal says what was wrong and the byte where it was found.
+
+    case readHeader(bytes) of
+        when Right(right as header: RootHeader) do
+            skip;
+        when Left(left as error: RootError) do
+            skip;
+    end case;
+"""
+import Standard.Buffer (Buffer);
+import Standard.String (String);
+
+module Mirco.Root is
+    """
+    What was wrong with a file the reader refused.
+    """
+    union RootFault: Free is
+        """
+        The file does not begin with the four bytes root.
+        """
+        case NotRoot;
+        """
+        A field, a key or an object reaches beyond the end of the bytes.
+        """
+        case Truncated;
+        """
+        An offset or a length that cannot be one: negative, or before the first key.
+        """
+        case BadOffset;
+        """
+        A string whose length leaves the bytes.
+        """
+        case BadString;
+        """
+        A compressed block whose header, stream or lengths do not agree.
+        """
+        case BadCompression;
+        """
+        A block compressed by a kind this reader does not know, such as the old one of version 5 of the framework.
+        """
+        case UnknownCompression;
+        """
+        An object larger than the limit the caller named.
+        """
+        case TooLarge;
+        """
+        An object of another class than the one asked for, or one whose bytes do not follow its class.
+        """
+        case BadObject;
+        """
+        An object of a class version this reader does not know the layout of.
+        """
+        case UnknownVersion;
+        """
+        An envelope or a page whose checksum is not the one of its bytes, or a checksum of the header that does not match.
+        """
+        case BadChecksum;
+    end;
+
+    """
+    A refusal: what was wrong and the byte of the file, counting from 0, where it was found.
+    """
+    record RootError: Free is
+        fault: RootFault;
+        at: Index;
+    end;
+
+    """
+    The header of a file: its version, where its first key begins and its data ends, the compression it
+    names, where its streamer information and the keys of its top directory are, and whether its offsets
+    are of 64 bits.
+    """
+    record RootHeader: Free is
+        version: Int64;
+        begin: Index;
+        finish: Index;
+        compression: Int64;
+        seekInfo: Index;
+        nbytesInfo: Index;
+        seekKeys: Index;
+        large: Bool;
+    end;
+
+    """
+    A key: the lengths of the whole record, of the object unpacked and of the key itself, its cycle and
+    where the record and its directory are, and where in the file its class, name and title lie.
+    """
+    record RootKey: Free is
+        nbytes: Index;
+        objectLength: Index;
+        keyLength: Index;
+        cycle: Int64;
+        seekKey: Index;
+        seekDirectory: Index;
+        classAt: Index;
+        classLength: Index;
+        nameAt: Index;
+        nameLength: Index;
+        titleAt: Index;
+        titleLength: Index;
+    end;
+
+    """
+    The header of the file bytes.
+    No contract: no precondition, since bytes that are no file give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readHeader(bytes: Span[Nat8, R]): Either[RootError, RootHeader];
+
+    """
+    The keys of the top directory of the file.
+    No contract: no precondition, since a header or bytes that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readKeys(bytes: Span[Nat8, R], header: RootHeader): Either[RootError, Buffer[RootKey]];
+
+    """
+    The keys of the directory a key of the class TDirectory or TDirectoryFile holds.
+    No contract: no precondition, since a key or bytes that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readDirectoryKeys(bytes: Span[Nat8, R], header: RootHeader, key: RootKey): Either[RootError, Buffer[RootKey]];
+
+    """
+    The class name of the key, as it lies in the file.
+    The class lies inside bytes; the bound is written without a sum, so a key of a start near the largest
+    Index is refused by the requires and does not stop the programme with an Overflow.
+    """
+    generic [R: Region]
+    function className(bytes: Span[Nat8, R], key: RootKey): Span[Nat8, R]
+        requires (key.classLength <= spanLength(bytes)) and (key.classAt <= (spanLength(bytes) - key.classLength))
+        ensures spanLength(result) = key.classLength;
+
+    """
+    The name of the key, as it lies in the file.
+    The name lies inside bytes, the bound written without a sum as for className.
+    """
+    generic [R: Region]
+    function keyName(bytes: Span[Nat8, R], key: RootKey): Span[Nat8, R]
+        requires (key.nameLength <= spanLength(bytes)) and (key.nameAt <= (spanLength(bytes) - key.nameLength))
+        ensures spanLength(result) = key.nameLength;
+
+    """
+    The bytes of the object of the key, unpacked when they are compressed; refused above limit bytes.
+    No contract: no precondition, since a key, bytes or a limit that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function objectBytes(bytes: Span[Nat8, R], key: RootKey, limit: Index): Either[RootError, String];
+
+    """
+    The key whose header lies at at, as the seek of a basket or of an anchor names it.
+    No contract: no precondition, since an at or bytes that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readKeyAt(bytes: Span[Nat8, R], at: Index): Either[RootError, RootKey];
+
+    """
+    The stored bytes of the file from start, stored of them, as unpacked bytes of length unpacked: the
+    bytes themselves when stored equals unpacked, else the compressed blocks they hold; refused above
+    limit bytes.
+    No contract: no precondition, since a region, bytes or a limit that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function regionBytes(bytes: Span[Nat8, R], start: Index, stored: Index, unpacked: Index, limit: Index): Either[RootError, String];
+
+    """
+    The text of an object of the class TObjString, from the bytes objectBytes gave.
+    No contract: no precondition, since bytes that are no TObjString give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function objString(object: Span[Nat8, R]): Either[RootError, String];
+end module.

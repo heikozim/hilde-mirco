@@ -1,0 +1,736 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A notebook keeps a copy of its text and ten numbers for each cell, all
+-- positions in that copy: the name, the hosts and the module as a start
+-- and a length each, the count of ranks, the line of the cell and its
+-- text as a start and a length.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, length as bufferLength, nth, storeNth, wholeSpan);
+import Standard.String (String, length);
+import Standard.StringBuilder (StringBuilder, makeStringBuilder, writeByte, writeString, finalize);
+import Standard.Text (equal, startsWith, endsWith);
+import Mirco.Schlucki (
+    Table,
+    TableError,
+    Rows,
+    columnCount,
+    rowCount,
+    columnKind,
+    textAt,
+    intAt,
+    readCsv,
+    rowsFor,
+    putText,
+    putInt,
+    finishRows
+);
+
+module body Mirco.Notebook is
+    record Notebook: Linear is
+        text: Buffer[Nat8];
+        cells: Buffer[Index];
+    end;
+
+    -- The numbers of a cell and where each lies among them.
+    constant stride: Index := 10;
+    constant at_name: Index := 0;
+    constant at_hosts: Index := 2;
+    constant at_module: Index := 4;
+    constant at_ranks: Index := 6;
+    constant at_line: Index := 7;
+    constant at_body: Index := 8;
+
+    function noCell(): Int32 is
+        return 1;
+    end;
+
+    function badHeader(): Int32 is
+        return 2;
+    end;
+
+    function badName(): Int32 is
+        return 3;
+    end;
+
+    function nameTaken(): Int32 is
+        return 4;
+    end;
+
+    function badRanks(): Int32 is
+        return 5;
+    end;
+
+    function badHosts(): Int32 is
+        return 6;
+    end;
+
+    function noModule(): Int32 is
+        return 7;
+    end;
+
+    function tooManyCells(): Int32 is
+        return 8;
+    end;
+
+    function zeroByte(): Int32 is
+        return 9;
+    end;
+
+    function cellLimit(): Index is
+        return 1000;
+    end;
+
+    function rankLimit(): Index is
+        return 4096;
+    end;
+
+    function smallOrDigit(b: Nat8): Bool is
+        return ((b >= 97) and (b <= 122)) or ((b >= 48) and (b <= 57));
+    end;
+
+    function letter(b: Nat8): Bool is
+        return ((b >= 97) and (b <= 122)) or ((b >= 65) and (b <= 90));
+    end;
+
+    function fileByte(b: Nat8): Bool is
+        return letter(b) or ((b >= 48) and (b <= 57)) or (b = 46) or (b = 95) or (b = 45);
+    end;
+
+    generic [R: Region]
+    function isCellName(name: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(name);
+        if (n = 0) or (n > 48) then
+            return false;
+        end if;
+        if (name[0] < 97) or (name[0] > 122) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < n do
+            if not (smallOrDigit(name[i]) or (name[i] = 45)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isHostsName(file: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(file);
+        if (n = 0) or (n > 128) then
+            return false;
+        end if;
+        if (file[0] = 46) or (file[0] = 45) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < n do
+            if not fileByte(file[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function refused(code: Int32, line: Index): Either[NotebookError, Notebook] is
+        let e: Either[NotebookError, Notebook] := Left(left => NotebookError(code => code, line => line));
+        return e;
+    end;
+
+    -- Whether the line from at to stop begins a cell.
+    generic [R: Region]
+    function isHeader(text: Span[Nat8, R], at: Index, stop: Index): Bool is
+        return startsWith(spanPart(text, at, stop - at), "--- cell ") or equal(spanPart(text, at, stop - at), "--- cell");
+    end;
+
+    -- The count of ranks a word gives, 1 to rankLimit; 0 for any other word.
+    generic [R: Region]
+    function rankNumber(word: Span[Nat8, R]): Index is
+        let n: Index := spanLength(word);
+        if (n = 0) or (n > 4) or (word[0] = 48) then
+            return 0;
+        end if;
+        var v: Index := 0;
+        var i: Index := 0;
+        while i < n do
+            let b: Nat8 := word[i];
+            if (b < 48) or (b > 57) then
+                return 0;
+            end if;
+            case toInt64(b) of
+                when Some(value as d: Int64) do
+                    case toIndex(d - 48) of
+                        when Some(value as digit: Index) do
+                            v := (v * 10) + digit;
+                        when None do
+                            return 0;
+                    end case;
+                when None do
+                    return 0;
+            end case;
+            i := i + 1;
+        end while;
+        if v > rankLimit() then
+            return 0;
+        end if;
+        return v;
+    end;
+
+    -- The words of the line from first to stop, a start and a length each,
+    -- split at blanks.
+    generic [R: Region]
+    function wordsOf(text: Span[Nat8, R], first: Index, stop: Index): Buffer[Index] is
+        var words: Buffer[Index] := allocateEmpty();
+        var i: Index := first;
+        while i < stop do
+            if text[i] = 32 then
+                i := i + 1;
+            else
+                let start: Index := i;
+                while (i < stop) and (text[i] /= 32) do
+                    i := i + 1;
+                end while;
+                insertBack(&!words, start);
+                insertBack(&!words, i - start);
+            end if;
+        end while;
+        return words;
+    end;
+
+    generic [R: Region, S: Region]
+    function wordAt(text: Span[Nat8, R], words: &[Buffer[Index], S], k: Index): Span[Nat8, R] is
+        return spanPart(text, nth(words, 2 * k), nth(words, (2 * k) + 1));
+    end;
+
+    -- Checks the header from at to stop on line and adds the numbers of its
+    -- cell, the text beginning at content; 0, or the code of the refusal.
+    generic [R: Region, S: Region]
+    function addHeader(cells: &![Buffer[Index], R], text: Span[Nat8, S], at: Index, stop: Index, line: Index, content: Index): Int32 is
+        let words: Buffer[Index] := wordsOf(text, at, stop);
+        let count: Index := bufferLength(&words) / 2;
+        if ((count /= 3) and (count /= 6)) or (not equal(wordAt(text, &words, 0), "---")) or (not equal(wordAt(text, &words, 1), "cell")) then
+            destroyFree(words);
+            return badHeader();
+        end if;
+        if not isCellName(wordAt(text, &words, 2)) then
+            destroyFree(words);
+            return badName();
+        end if;
+        var ranks: Index := 0;
+        var hosts_at: Index := 0;
+        var hosts_length: Index := 0;
+        if count = 6 then
+            if not equal(wordAt(text, &words, 3), "sperli") then
+                destroyFree(words);
+                return badHeader();
+            end if;
+            ranks := rankNumber(wordAt(text, &words, 4));
+            if ranks = 0 then
+                destroyFree(words);
+                return badRanks();
+            end if;
+            if not isHostsName(wordAt(text, &words, 5)) then
+                destroyFree(words);
+                return badHosts();
+            end if;
+            hosts_at := nth(&words, 10);
+            hosts_length := nth(&words, 11);
+        end if;
+        let name_at: Index := nth(&words, 4);
+        let name_length: Index := nth(&words, 5);
+        destroyFree(words);
+        let zero: Index := 0;
+        insertBack(&~cells, name_at);
+        insertBack(&~cells, name_length);
+        insertBack(&~cells, hosts_at);
+        insertBack(&~cells, hosts_length);
+        insertBack(&~cells, zero);
+        insertBack(&~cells, zero);
+        insertBack(&~cells, ranks);
+        insertBack(&~cells, line);
+        insertBack(&~cells, content);
+        insertBack(&~cells, zero);
+        return 0;
+    end;
+
+    -- Whether the name of the last cell is the name of one before it.
+    generic [R: Region, S: Region]
+    function lastNameTaken(cells: &[Buffer[Index], R], text: Span[Nat8, S]): Bool is
+        let last: Index := (bufferLength(cells) / stride) - 1;
+        let name: Span[Nat8, S] := spanPart(text, nth(cells, last * stride), nth(cells, (last * stride) + 1));
+        var c: Index := 0;
+        while c < last do
+            if equal(spanPart(text, nth(cells, c * stride), nth(cells, (c * stride) + 1)), name) then
+                return true;
+            end if;
+            c := c + 1;
+        end while;
+        return false;
+    end;
+
+    function blank(b: Nat8): Bool is
+        return (b = 32) or (b = 9);
+    end;
+
+    function nameByte(b: Nat8): Bool is
+        return letter(b) or ((b >= 48) and (b <= 57)) or (b = 46);
+    end;
+
+    -- Where the name of the line "module body Name is" from at to stop
+    -- begins; stop when the line is no such line.
+    generic [R: Region]
+    function moduleStart(text: Span[Nat8, R], at: Index, stop: Index): Index is
+        var i: Index := at;
+        while (i < stop) and blank(text[i]) do
+            i := i + 1;
+        end while;
+        if not startsWith(spanPart(text, i, stop - i), "module body ") then
+            return stop;
+        end if;
+        i := i + 12;
+        if (i >= stop) or (not letter(text[i])) then
+            return stop;
+        end if;
+        let start: Index := i;
+        while (i < stop) and nameByte(text[i]) do
+            i := i + 1;
+        end while;
+        if not startsWith(spanPart(text, i, stop - i), " is") then
+            return stop;
+        end if;
+        i := i + 3;
+        while (i < stop) and blank(text[i]) do
+            i := i + 1;
+        end while;
+        if i /= stop then
+            return stop;
+        end if;
+        return start;
+    end;
+
+    generic [R: Region]
+    function moduleLength(text: Span[Nat8, R], start: Index, stop: Index): Index is
+        var i: Index := start;
+        while (i < stop) and nameByte(text[i]) do
+            i := i + 1;
+        end while;
+        return i - start;
+    end;
+
+    generic [R: Region]
+    function lastCell(cells: &![Buffer[Index], R]): Index is
+        return (bufferLength(&cells) / stride) - 1;
+    end;
+
+    generic [R: Region]
+    function hasModule(cells: &[Buffer[Index], R]): Bool is
+        let last: Index := (bufferLength(cells) / stride) - 1;
+        return nth(cells, (last * stride) + at_module + 1) > 0;
+    end;
+
+    generic [R: Region]
+    function lastLine(cells: &[Buffer[Index], R]): Index is
+        let last: Index := (bufferLength(cells) / stride) - 1;
+        return nth(cells, (last * stride) + at_line);
+    end;
+
+    -- Ends the text of the last cell before stop.
+    generic [R: Region]
+    function closeBody(cells: &![Buffer[Index], R], stop: Index): Unit is
+        let base: Index := (bufferLength(&cells) / stride) - 1;
+        let at: Index := (base * stride) + at_body;
+        let content: Index := nth(&cells, at);
+        storeNth(&~cells, at + 1, stop - content);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function setModule(cells: &![Buffer[Index], R], start: Index, n: Index): Unit is
+        let base: Index := (bufferLength(&cells) / stride) - 1;
+        storeNth(&~cells, (base * stride) + at_module, start);
+        storeNth(&~cells, (base * stride) + at_module + 1, n);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function copyText(text: Span[Nat8, R]): Buffer[Nat8] is
+        var copy: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < spanLength(text) do
+            insertBack(&!copy, text[i]);
+            i := i + 1;
+        end while;
+        return copy;
+    end;
+
+    generic [R: Region]
+    function parseNotebook(text: Span[Nat8, R]): Either[NotebookError, Notebook] is
+        let n: Index := spanLength(text);
+        var cells: Buffer[Index] := allocateEmpty();
+        var at: Index := 0;
+        var line: Index := 1;
+        while at < n do
+            var e: Index := at;
+            while (e < n) and (text[e] /= 10) do
+                if text[e] = 0 then
+                    destroyFree(cells);
+                    return refused(zeroByte(), line);
+                end if;
+                e := e + 1;
+            end while;
+            var stop: Index := e;
+            if (stop > at) and (text[stop - 1] = 13) then
+                stop := stop - 1;
+            end if;
+            var next: Index := e;
+            if e < n then
+                next := e + 1;
+            end if;
+            if isHeader(text, at, stop) then
+                if bufferLength(&cells) > 0 then
+                    if not hasModule(&cells) then
+                        let missing: Index := lastLine(&cells);
+                        destroyFree(cells);
+                        return refused(noModule(), missing);
+                    end if;
+                    closeBody(&!cells, at);
+                end if;
+                if (bufferLength(&cells) / stride) >= cellLimit() then
+                    destroyFree(cells);
+                    return refused(tooManyCells(), line);
+                end if;
+                let code: Int32 := addHeader(&!cells, text, at, stop, line, next);
+                if code /= 0 then
+                    destroyFree(cells);
+                    return refused(code, line);
+                end if;
+                if lastNameTaken(&cells, text) then
+                    destroyFree(cells);
+                    return refused(nameTaken(), line);
+                end if;
+            else
+                if (bufferLength(&cells) > 0) and (not hasModule(&cells)) then
+                    let start: Index := moduleStart(text, at, stop);
+                    if start < stop then
+                        setModule(&!cells, start, moduleLength(text, start, stop));
+                    end if;
+                end if;
+            end if;
+            at := next;
+            line := line + 1;
+        end while;
+        if bufferLength(&cells) = 0 then
+            destroyFree(cells);
+            return refused(noCell(), line);
+        end if;
+        if not hasModule(&cells) then
+            let missing: Index := lastLine(&cells);
+            destroyFree(cells);
+            return refused(noModule(), missing);
+        end if;
+        closeBody(&!cells, n);
+        let good: Either[NotebookError, Notebook] := Right(right => Notebook(text => copyText(text), cells => cells));
+        return good;
+    end;
+
+    function destroyNotebook(nb: Notebook): Unit is
+        let { text: Buffer[Nat8], cells: Buffer[Index] } := nb;
+        destroyFree(text);
+        destroyFree(cells);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function cellCount(nb: &[Notebook, R]): Index is
+        return bufferLength(&(nb->cells)) / stride;
+    end;
+
+    generic [R: Region]
+    function number(nb: &[Notebook, R], i: Index, k: Index): Index is
+        return nth(&(nb->cells), (i * stride) + k);
+    end;
+
+    generic [R: Region]
+    function part(nb: &[Notebook, R], i: Index, k: Index): Span[Nat8, R] is
+        return spanPart(wholeSpan(&(nb->text)), number(nb, i, k), number(nb, i, k + 1));
+    end;
+
+    generic [R: Region]
+    function cellName(nb: &[Notebook, R], i: Index): Span[Nat8, R] is
+        return part(nb, i, at_name);
+    end;
+
+    generic [R: Region]
+    function cellRanks(nb: &[Notebook, R], i: Index): Index is
+        return number(nb, i, at_ranks);
+    end;
+
+    generic [R: Region]
+    function cellHosts(nb: &[Notebook, R], i: Index): Span[Nat8, R] is
+        return part(nb, i, at_hosts);
+    end;
+
+    generic [R: Region]
+    function cellModule(nb: &[Notebook, R], i: Index): Span[Nat8, R] is
+        return part(nb, i, at_module);
+    end;
+
+    generic [R: Region]
+    function cellLine(nb: &[Notebook, R], i: Index): Index is
+        return number(nb, i, at_line);
+    end;
+
+    generic [R: Region, S: Region]
+    function cellIndex(nb: &[Notebook, R], name: Span[Nat8, S]): Option[Index] is
+        var i: Index := 0;
+        while i < cellCount(nb) do
+            if equal(cellName(nb, i), name) then
+                return Some(value => i);
+            end if;
+            i := i + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function cellSource(nb: &[Notebook, R], i: Index): String is
+        var b: StringBuilder := makeStringBuilder();
+        var k: Index := 0;
+        while k < cellLine(nb, i) do
+            writeString(&!b, "--\n");
+            k := k + 1;
+        end while;
+        writeString(&!b, part(nb, i, at_body));
+        return finalize(b);
+    end;
+
+    function outputText(): Nat8 is
+        return 1;
+    end;
+
+    function outputTable(): Nat8 is
+        return 2;
+    end;
+
+    function outputArray(): Nat8 is
+        return 3;
+    end;
+
+    function outputSvg(): Nat8 is
+        return 4;
+    end;
+
+    function outputPng(): Nat8 is
+        return 5;
+    end;
+
+    function outputOther(): Nat8 is
+        return 6;
+    end;
+
+    generic [R: Region]
+    function outputKind(file: Span[Nat8, R]): Nat8 is
+        if endsWith(file, ".txt") then
+            return 1;
+        end if;
+        if endsWith(file, ".csv") then
+            return 2;
+        end if;
+        if endsWith(file, ".mirc") then
+            return 3;
+        end if;
+        if endsWith(file, ".svg") then
+            return 4;
+        end if;
+        if endsWith(file, ".png") then
+            return 5;
+        end if;
+        return 6;
+    end;
+
+    function outputWord(kind: Nat8): Span[Nat8, Static] is
+        if kind = 1 then
+            return "text";
+        end if;
+        if kind = 2 then
+            return "table";
+        end if;
+        if kind = 3 then
+            return "array";
+        end if;
+        if kind = 4 then
+            return "svg";
+        end if;
+        if kind = 5 then
+            return "png";
+        end if;
+        return "file";
+    end;
+
+    generic [R: Region]
+    function isRecordedFile(file: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(file);
+        if startsWith(file, "state/") then
+            return isHostsName(spanPart(file, 6, n - 6));
+        end if;
+        if startsWith(file, "out/") then
+            return isHostsName(spanPart(file, 4, n - 4));
+        end if;
+        return false;
+    end;
+
+    generic [R: Region]
+    function isManifest(t: &[Table, R]): Bool is
+        if columnCount(t) /= 4 then
+            return false;
+        end if;
+        return (columnKind(t, 0) = 3) and (columnKind(t, 1) = 3) and (columnKind(t, 2) = 3) and (columnKind(t, 3) = 2);
+    end;
+
+    generic [R: Region]
+    function isWritten(t: &[Table, R]): Bool is
+        if columnCount(t) /= 3 then
+            return false;
+        end if;
+        return (columnKind(t, 0) = 3) and (columnKind(t, 1) = 3) and (columnKind(t, 2) = 2);
+    end;
+
+    function manifestKinds(): Buffer[Nat8] is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 2);
+        return kinds;
+    end;
+
+    function emptyManifest(): Table is
+        let kinds: Buffer[Nat8] := manifestKinds();
+        let rows: Rows := rowsFor(wholeSpan(&kinds));
+        destroyFree(kinds);
+        return finishRows(rows, "cell,file,kind,bytes");
+    end;
+
+    generic [R: Region]
+    function readManifest(text: Span[Nat8, R]): Either[TableError, Table] is
+        let kinds: Buffer[Nat8] := manifestKinds();
+        let read: Either[TableError, Table] := readCsv(text, wholeSpan(&kinds));
+        destroyFree(kinds);
+        return read;
+    end;
+
+    generic [R: Region]
+    function readWritten(text: Span[Nat8, R]): Either[TableError, Table] is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 2);
+        let read: Either[TableError, Table] := readCsv(text, wholeSpan(&kinds));
+        destroyFree(kinds);
+        return read;
+    end;
+
+    -- Whether cell is one of the names of ran, joined by commas.
+    generic [R: Region, S: Region]
+    function listed(ran: Span[Nat8, R], cell: Span[Nat8, S]): Bool is
+        var start: Index := 0;
+        var i: Index := 0;
+        while i <= spanLength(ran) do
+            if (i = spanLength(ran)) or (ran[i] = 44) then
+                if equal(spanPart(ran, start, i - start), cell) then
+                    return true;
+                end if;
+                start := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return false;
+    end;
+
+    -- Whether row r of the manifest t belongs to a cell of ran.
+    generic [R: Region, S: Region]
+    function ofRan(t: &[Table, R], r: Index, ran: Span[Nat8, S]): Bool is
+        case textAt(t, 0, r) of
+            when Some(value as cell: Span[Nat8, R]) do
+                return listed(ran, cell);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether row r of written is to be recorded: its cell in ran, its file
+    -- one isRecordedFile takes.
+    generic [R: Region, S: Region]
+    function takes(t: &[Table, R], r: Index, ran: Span[Nat8, S]): Bool is
+        if not ofRan(t, r, ran) then
+            return false;
+        end if;
+        case textAt(t, 1, r) of
+            when Some(value as file: Span[Nat8, R]) do
+                return isRecordedFile(file);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function putKind(rows: &![Rows, R], t: &[Table, S], r: Index): Unit is
+        case textAt(t, 1, r) of
+            when Some(value as file: Span[Nat8, S]) do
+                let word: Option[Span[Nat8, Static]] := Some(value => outputWord(outputKind(file)));
+                putText(&~rows, word);
+            when None do
+                let none: Option[Span[Nat8, Static]] := None();
+                putText(&~rows, none);
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function recordCells(old: &[Table, R], ran: Span[Nat8, S], written: &[Table, Q]): Table is
+        if not (isManifest(old) and isWritten(written)) then
+            abort("Mirco.Notebook: recordCells over a table that is no manifest or no list of written files");
+        end if;
+        let kinds: Buffer[Nat8] := manifestKinds();
+        var rows: Rows := rowsFor(wholeSpan(&kinds));
+        destroyFree(kinds);
+        var r: Index := 0;
+        while r < rowCount(old) do
+            if (not ofRan(old, r, ran)) and (not missingCell(old, r)) then
+                putText(&!rows, textAt(old, 0, r));
+                putText(&!rows, textAt(old, 1, r));
+                putText(&!rows, textAt(old, 2, r));
+                putInt(&!rows, intAt(old, 3, r));
+            end if;
+            r := r + 1;
+        end while;
+        r := 0;
+        while r < rowCount(written) do
+            if takes(written, r, ran) then
+                putText(&!rows, textAt(written, 0, r));
+                putText(&!rows, textAt(written, 1, r));
+                putKind(&!rows, written, r);
+                putInt(&!rows, intAt(written, 2, r));
+            end if;
+            r := r + 1;
+        end while;
+        return finishRows(rows, "cell,file,kind,bytes");
+    end;
+
+    -- Whether row r of t has no cell, a row a manifest drops.
+    generic [R: Region]
+    function missingCell(t: &[Table, R], r: Index): Bool is
+        case textAt(t, 0, r) of
+            when Some(value as cell: Span[Nat8, R]) do
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+end module body.

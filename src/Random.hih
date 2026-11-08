@@ -1,0 +1,128 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Draws reproducible pseudo random numbers with the permuted congruential generators PCG64 and PCG64DXSM.
+
+- The same seed and stream give the same numbers on every system.
+- The state has 128 bits; the period is 2 to the 128 for every stream.
+- A float is drawn from the top 53 bits and lies in the range from 0 up to but not including 1.
+- Not for keys or tokens: the numbers can be predicted from a few outputs.
+
+    var g: Pcg64 := defaultGenerator(42, 54);
+    let first: Nat64 := nextNat64(&!g);
+"""
+import Mirco.Array (NdArray, rank, validShape);
+
+module Mirco.Random is
+    """
+    The state of a generator, its 128 bits and its stream.
+    """
+    type Pcg64: Free;
+
+    """
+    The default generator: PCG64DXSM with seed and stream; another stream gives an independent sequence.
+    No contract: no precondition, since every seed and every stream gives a generator, and the state has no function a condition could read it by.
+    """
+    function defaultGenerator(seed: Nat64, stream: Nat64): Pcg64;
+
+    """
+    A PCG64 generator whose output is the xor of the halves rotated by the top six bits, seeded as the reference implementation seeds it.
+    No contract: no precondition, since every seed and every stream gives a generator, and the state has no function a condition could read it by.
+    """
+    function pcg64(seed: Nat64, stream: Nat64): Pcg64;
+
+    """
+    A PCG64 generator from a seed and a stream of 128 bits each, given in halves.
+    No contract: no precondition, since all four halves may take every Nat64, and the state has no function a condition could read it by.
+    """
+    function pcg64Wide(seed_high: Nat64, seed_low: Nat64, stream_high: Nat64, stream_low: Nat64): Pcg64;
+
+    """
+    The generator of NumPy's default_rng(seed): PCG64 whose seed and stream come from NumPy's SeedSequence
+    of the seed, so that it gives the numbers NumPy gives for the same seed.
+    No contract: no precondition, since every seed gives a generator, and the state has no function a condition could read it by.
+    """
+    function defaultRng(seed: Nat64): Pcg64;
+
+    """
+    A PCG64DXSM generator: the cheap multiplier and the output double xor shift multiply.
+    No contract: no precondition, since every seed and every stream gives a generator, and the state has no function a condition could read it by.
+    """
+    function pcg64Dxsm(seed: Nat64, stream: Nat64): Pcg64;
+
+    """
+    The next 64 bits of the generator.
+    No contract: every generator can step, and every Nat64 is a possible result.
+    """
+    generic [R: Region]
+    function nextNat64(generator: &![Pcg64, R]): Nat64;
+
+    """
+    A number from 0 up to but not including bound, every one as likely as any other.
+    """
+    generic [R: Region]
+    function nextBelow(generator: &![Pcg64, R], bound: Nat64): Nat64
+        requires bound > 0
+        ensures result < bound;
+
+    """
+    A number from 0 up to but not including 1, in steps of 2 to the -53.
+    """
+    generic [R: Region]
+    function nextFloat64(generator: &![Pcg64, R]): Float64
+        ensures (result >= 0.0) and (result < 1.0);
+
+    """
+    A number of the standard normal distribution, mean 0 and deviation 1, by the method of Box and Muller.
+    The first uniform number is at least 2 to the -53, so that the result lies within the square root of 106 times the logarithm of 2, below 8.58.
+    """
+    generic [R: Region]
+    function nextNormal(generator: &![Pcg64, R]): Float64
+        ensures (result > -9.0) and (result < 9.0);
+
+    """
+    A number of the standard normal distribution drawn as NumPy's standard_normal draws it, by the
+    ziggurat of 256 layers; with defaultRng it gives the numbers of NumPy for the same seed.
+    A layer gives less than 3.92 and the tail at most r plus 53 times the logarithm of 2 over r, below 13.71.
+    """
+    generic [R: Region]
+    function nextStandardNormal(generator: &![Pcg64, R]): Float64
+        ensures (result > -14.0) and (result < 14.0);
+
+    """
+    An array of the shape, each element drawn by nextStandardNormal, in order.
+    """
+    generic [R: Region, S: Region]
+    function standardNormal(generator: &![Pcg64, R], shape: Span[Index, S]): NdArray[Float64]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape)
+        ensures rank(&result) = spanLength(shape);
+
+    """
+    A new array of shape whose elements are drawn from 0 up to but not including 1.
+    """
+    generic [R: Region, S: Region]
+    function uniform(generator: &![Pcg64, R], shape: Span[Index, S]): NdArray[Float64]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape)
+        ensures rank(&result) = spanLength(shape);
+
+    """
+    A new array of shape whose elements are drawn from the normal distribution of mean and deviation.
+    """
+    generic [R: Region, S: Region]
+    function normal(generator: &![Pcg64, R], shape: Span[Index, S], mean: Float64, deviation: Float64): NdArray[Float64]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape) and (deviation >= 0.0)
+        ensures rank(&result) = spanLength(shape);
+
+    """
+    A new array of shape whose elements are drawn from low up to but not including high.
+    """
+    generic [R: Region, S: Region]
+    function integers(generator: &![Pcg64, R], shape: Span[Index, S], low: Int64, high: Int64): NdArray[Int64]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape) and (low < high)
+        ensures rank(&result) = spanLength(shape);
+end module.

@@ -1,0 +1,42 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The transforms of Mirco.Fft computed by pocketfft in C, the backend a programme selects by importing this module.
+
+- The library mircoblis of the package mirco-blis must be built; pkg-config finds it through PKG_CONFIG_PATH.
+- Each function has the name, the arguments and the result of the one in Mirco.Fft, within rounding.
+- Time n log n for every length, by the codelets of pocketfft and Bluestein's method for large prime factors.
+
+    let spectrum: Signal := fft(&samples);
+"""
+import Mirco.Array (NdArray, count);
+import Mirco.Fft (Signal, signalLength);
+
+module Mirco.Pocketfft is
+    """
+    The discrete Fourier transform of s, X at k the sum of x at j times e to the -2 pi i j k / n.
+    """
+    generic [R: Region]
+    function fft(s: &[Signal, R]): Signal
+        ensures signalLength(&result) = signalLength(s);
+
+    """
+    The inverse transform: the sum with e to the +2 pi i j k / n, divided by n.
+    """
+    generic [R: Region]
+    function inverseFft(s: &[Signal, R]): Signal
+        ensures signalLength(&result) = signalLength(s);
+
+    """
+    The first n / 2 + 1 values of the transform of a real vector; the others are their conjugates.
+    """
+    generic [R: Region]
+    function realFft(real: &[NdArray[Float64], R]): Signal
+        requires count(real) > 0
+        ensures signalLength(&result) = ((count(real) / 2) + 1);
+end module.

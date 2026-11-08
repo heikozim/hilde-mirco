@@ -1,0 +1,118 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Draws figures of lines, points, histograms and heatmaps, as svg text or as a PNG image.
+
+Yompi stands for Your Own Math and Plotting Interface.
+
+- A figure has one pair of axes; their ranges hold every series, with ticks at steps of 1, 2 or 5 times a power of 10.
+- Both carry the title, the labels of the axes and the numbers of the ticks; PNG draws them in a pixel font of 5 by 7.
+- A NaN in a series is left out; a figure without data draws its axes over the range 0 to 1.
+- The same figure gives the same bytes, in svg as in PNG.
+
+    var f: Figure := figure(640, 480);
+    addLine(&!f, &x, &y, 2062260);
+    let svg: String := renderSvg(&f);
+"""
+import Standard.String (String, length);
+import Mirco.Array (NdArray, rank, count);
+
+module Mirco.Yompi is
+    """
+    A figure being drawn: its size, its texts and its series.
+    """
+    type Figure: Linear;
+
+    """
+    A new figure of width by height pixels, without series.
+    """
+    function figure(width: Index, height: Index): Figure
+        requires (width >= 100) and (width <= 10000) and (height >= 100) and (height <= 10000)
+        ensures seriesCount(&result) = 0;
+
+    """
+    Gives the figure back.
+    No contract: a destroy function.
+    """
+    function destroyFigure(f: Figure): Unit;
+
+    """
+    The count of series added, a heatmap counted as one.
+    """
+    generic [R: Region]
+    function seriesCount(f: &[Figure, R]): Index
+        ensures result <= 1000000;
+
+    """
+    The title above the plot.
+    No contract: no precondition, since any text is taken; the svg escapes it and the PNG draws it from the glyphs of Mirco.Font.
+    """
+    generic [R: Region, S: Region]
+    function setTitle(f: &![Figure, R], text: Span[Nat8, S]): Unit;
+
+    """
+    The label below the axis of x.
+    No contract: no precondition, since any text is taken; the svg escapes it and the PNG draws it from the glyphs of Mirco.Font.
+    """
+    generic [R: Region, S: Region]
+    function setXLabel(f: &![Figure, R], text: Span[Nat8, S]): Unit;
+
+    """
+    The label beside the axis of y.
+    No contract: no precondition, since any text is taken; the svg escapes it and the PNG draws it from the glyphs of Mirco.Font.
+    """
+    generic [R: Region, S: Region]
+    function setYLabel(f: &![Figure, R], text: Span[Nat8, S]): Unit;
+
+    """
+    A line through the points x, y in their order, in the colour 0xRRGGBB.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function addLine(f: &![Figure, R], x: &[NdArray[Float64], S], y: &[NdArray[Float64], Q], color: Nat32): Unit
+        requires (count(x) = count(y)) and (count(x) > 0) and (color <= 16777215)
+        ensures (seriesCount(&f) = (old(seriesCount(&f)) + 1)) or (seriesCount(&f) = 1000000);
+
+    """
+    A point at each x, y, in the colour 0xRRGGBB.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function addScatter(f: &![Figure, R], x: &[NdArray[Float64], S], y: &[NdArray[Float64], Q], color: Nat32): Unit
+        requires (count(x) = count(y)) and (count(x) > 0) and (color <= 16777215)
+        ensures (seriesCount(&f) = (old(seriesCount(&f)) + 1)) or (seriesCount(&f) = 1000000);
+
+    """
+    A histogram of the values in bins of equal width from their smallest to their largest, as bars.
+    """
+    generic [R: Region, S: Region]
+    function addHistogram(f: &![Figure, R], values: &[NdArray[Float64], S], bins: Index, color: Nat32): Unit
+        requires (count(values) > 0) and (bins > 0) and (bins <= 10000) and (color <= 16777215)
+        ensures (seriesCount(&f) = (old(seriesCount(&f)) + 1)) or (seriesCount(&f) = 1000000);
+
+    """
+    A heatmap of a matrix, row 0 at the top and column 0 at the left, from dark blue for the smallest value
+    to yellow for the largest; the axes count the columns and the rows.
+    """
+    generic [R: Region, S: Region]
+    function setHeatmap(f: &![Figure, R], matrix: &[NdArray[Float64], S]): Unit
+        requires rank(matrix) = 2
+        ensures seriesCount(&f) >= 1;
+
+    """
+    The figure as an svg document.
+    """
+    generic [R: Region]
+    function renderSvg(f: &[Figure, R]): String
+        ensures length(&result) > 0;
+
+    """
+    The figure as a PNG image of 8 bits for red, green and blue.
+    """
+    generic [R: Region]
+    function renderPng(f: &[Figure, R]): String
+        ensures length(&result) > 0;
+end module.

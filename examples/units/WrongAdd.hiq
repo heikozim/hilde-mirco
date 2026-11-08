@@ -1,0 +1,17 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A length added to a time: the compiler must refuse it.  The gate checks
+-- that hilde check fails on this file.
+import Mirco.Units (Meter, Second, Quantity, add, meters, seconds);
+
+module body Example.WrongAdd is
+    function main(): ExitCode is
+        let sum: Quantity[Meter] := add(meters(1.0), seconds(2.0));
+        return ExitSuccess();
+    end;
+end module body.

@@ -1,0 +1,1429 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, removeLast, lengthMut, nthMut, storeNth, destroyEmpty, destroyFree, nth, getSpan, length as bufferLength);
+import Standard.String (String, fromSpan, fromByteBuffer, asSpan, nthByte, destroyString, length as stringLength);
+import Standard.Text (equal, contains);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    openRead,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, destroyNdArray, rank, dimension, count, flatGet);
+import Mirco.Root (RootFault, RootError, RootHeader, RootKey, readHeader, readKeys, className, keyName);
+import Mirco.RootTree (
+    Streamers,
+    readStreamers,
+    destroyStreamers,
+    classCount,
+    classNameOf,
+    classVersion,
+    memberCount,
+    memberName,
+    memberTypeName,
+    memberType,
+    Tree,
+    readTree,
+    readTreeWith,
+    destroyTree,
+    treeEntries,
+    branchCount,
+    branchName,
+    leafKind,
+    leafLength,
+    leafUnsigned,
+    branchInt64,
+    branchFloat64,
+    branchFloat32,
+    branchOffsets,
+    branchStrings,
+    destroyBranchStrings,
+    narrowEntries,
+    treeClusterCount,
+    treeClusterFirst,
+    narrowTreeClusters,
+    treeClustersAligned
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.RootTree.Test is
+    constant limit: Index := 16777216;
+
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The bytes of a file of testdata/uproot, or an empty string.
+    function load(path: Span[Nat8, Static]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as text: String) do
+                        return text;
+                    when None do
+                        return fromNothing();
+                end case;
+            when None do
+                return fromNothing();
+        end case;
+    end;
+
+    function fromNothing(): String is
+        return fromSpan("");
+    end;
+
+    -- The class at i of the streamer information is named name.
+    generic [R: Region]
+    function classIs(s: &[Streamers, R], i: Index, name: Span[Nat8, Static]): Bool is
+        let found: String := classNameOf(s, i);
+        let same: Bool := equal(asSpan(&found), name);
+        destroyString(found);
+        return same;
+    end;
+
+    function testStreamers(): Unit is
+        let file: String := load("testdata/uproot/uproot-sample-6.20.04-uncompressed.root");
+        assertTrue(stringLength(&file) = 80766, "the file is read");
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readStreamers(asSpan(&file), header, limit) of
+                    when Right(right as s: Streamers) do
+                        assertTrue(classCount(&s) = 24, "24 classes: the list holds 25 entries, one of them no TStreamerInfo");
+                        var tree: Index := classCount(&s);
+                        var branch: Index := classCount(&s);
+                        var i: Index := 0;
+                        while i < classCount(&s) do
+                            if classIs(&s, i, "TTree") then
+                                tree := i;
+                            end if;
+                            if classIs(&s, i, "TBranch") then
+                                branch := i;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        assertTrue(tree < classCount(&s), "TTree is described");
+                        assertTrue((classVersion(&s, tree) = 20) and (memberCount(&s, tree) = 33), "TTree of version 20 with 33 members");
+                        let fifth: String := memberName(&s, tree, 4);
+                        let kind: String := memberTypeName(&s, tree, 4);
+                        assertTrue(equal(asSpan(&fifth), "fEntries") and equal(asSpan(&kind), "Long64_t"), "fEntries is a Long64_t");
+                        assertTrue(memberType(&s, tree, 4) = 16, "of the type code 16");
+                        destroyString(fifth);
+                        destroyString(kind);
+                        assertTrue((branch < classCount(&s)) and (classVersion(&s, branch) = 13), "TBranch of version 13");
+                        assertTrue(memberCount(&s, branch) = 22, "with 22 members");
+                        destroyStreamers(s);
+                    when Left(left as e: RootError) do
+                        assertTrue(false, "the streamer information is read");
+                end case;
+            when Left(left as e: RootError) do
+                assertTrue(false, "the header is read");
+        end case;
+        destroyString(file);
+        return nil;
+    end;
+
+    -- The index of the branch named name, or the count when there is none.
+    generic [R: Region]
+    function branchOf(t: &[Tree, R], name: Span[Nat8, Static]): Index is
+        var i: Index := 0;
+        while i < branchCount(t) do
+            let found: String := branchName(t, i);
+            let same: Bool := equal(asSpan(&found), name);
+            destroyString(found);
+            if same then
+                return i;
+            end if;
+            i := i + 1;
+        end while;
+        return branchCount(t);
+    end;
+
+    -- One file of the sample: the tree, i4, f4, the fixed array ai4, u8, the
+    -- counted branch Ai4 and the refusal of floats read as integers.
+    function sampleHolds(path: Span[Nat8, Static]): Bool is
+        let file: String := load(path);
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readKeys(asSpan(&file), header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        ok := treeHolds(asSpan(&file), &keys);
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    generic [R: Region, S: Region]
+    function treeHolds(bytes: Span[Nat8, R], keys: &[Buffer[RootKey], S]): Bool is
+        var k: Index := 0;
+        while k < bufferLength(keys) do
+            let key: RootKey := nth(keys, k);
+            if equal(className(bytes, key), "TTree") and equal(keyName(bytes, key), "sample") then
+                case readTree(bytes, key, limit) of
+                    when Right(right as t: Tree) do
+                        let held: Bool := branchesHold(bytes, &t);
+                        destroyTree(t);
+                        return held;
+                    when Left(left as e: RootError) do
+                        return false;
+                end case;
+            end if;
+            k := k + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region, S: Region]
+    function branchesHold(bytes: Span[Nat8, R], t: &[Tree, S]): Bool is
+        var ok: Bool := (treeEntries(t) = 30) and (branchCount(t) = 35);
+        let i4: Index := branchOf(t, "i4");
+        ok := ok and ((i4 < branchCount(t)) and ((leafKind(t, i4) = 73) and (leafLength(t, i4) = 1)));
+        case branchInt64(bytes, t, i4, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                var good: Bool := (rank(&v) = 1) and (count(&v) = 30);
+                var j: Index := 0;
+                while good and (j < 30) do
+                    case toInt64(j) of
+                        when Some(value as w: Int64) do
+                            good := flatGet(&v, j) = (w - 15);
+                        when None do
+                            good := false;
+                    end case;
+                    j := j + 1;
+                end while;
+                ok := ok and good;
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        let f4: Index := branchOf(t, "f4");
+        case branchFloat32(bytes, t, f4, limit) of
+            when Right(right as v: NdArray[Float32]) do
+                case toFloat64(flatGet(&v, 0)) of
+                    when Some(value as x: Float64) do
+                        ok := ok and (x = -14.899999618530273);
+                    when None do
+                        ok := false;
+                end case;
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        case branchInt64(bytes, t, f4, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                ok := false;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        let ai4: Index := branchOf(t, "ai4");
+        case branchInt64(bytes, t, ai4, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                ok := ok and ((rank(&v) = 2) and ((dimension(&v, 0) = 30) and (dimension(&v, 1) = 3)));
+                ok := ok and ((flatGet(&v, 0) = -14) and ((flatGet(&v, 2) = -12) and (flatGet(&v, 89) = 17)));
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        let af8: Index := branchOf(t, "af8");
+        case branchFloat64(bytes, t, af8, limit) of
+            when Right(right as v: NdArray[Float64]) do
+                ok := ok and ((flatGet(&v, 0) = -13.9) and (flatGet(&v, 89) = 17.1));
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        let u8: Index := branchOf(t, "u8");
+        ok := ok and leafUnsigned(t, u8);
+        case branchInt64(bytes, t, u8, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                ok := ok and (flatGet(&v, 29) = 29);
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        ok := ok and countedHolds(bytes, t);
+        ok := ok and textsHold(bytes, t);
+        return ok;
+    end;
+
+    -- The branch str of leaves of characters: 30 texts, hey-0 to hey-29.
+    generic [R: Region, S: Region]
+    function textsHold(bytes: Span[Nat8, R], t: &[Tree, S]): Bool is
+        let str: Index := branchOf(t, "str");
+        if str >= branchCount(t) then
+            return false;
+        end if;
+        case branchInt64(bytes, t, str, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                return false;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        case branchStrings(bytes, t, str, limit) of
+            when Right(right as texts: Buffer[String]) do
+                var ok: Bool := bufferLength(&texts) = 30;
+                if ok then
+                    ok := (textIs(&texts, 0, "hey-0") and textIs(&texts, 10, "hey-10")) and (textIs(&texts, 15, "hey-15") and textIs(&texts, 29, "hey-29"));
+                end if;
+                destroyBranchStrings(texts);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function textIs(texts: &[Buffer[String], R], at: Index, wanted: Span[Nat8, Static]): Bool is
+        let piece: Span[String, R] := getSpan(texts, at, at);
+        return equal(asSpan(&(piece[0])), wanted);
+    end;
+
+    -- The counted branch Ai4: its offsets step by the counts the branch n
+    -- holds for each entry, and its numbers are as many as the last offset.
+    generic [R: Region, S: Region]
+    function countedHolds(bytes: Span[Nat8, R], t: &[Tree, S]): Bool is
+        let counted: Index := branchOf(t, "Ai4");
+        let counter: Index := branchOf(t, "n");
+        var ok: Bool := (counted < branchCount(t)) and (counter < branchCount(t));
+        if not ok then
+            return false;
+        end if;
+        case branchInt64(bytes, t, counter, limit) of
+            when Right(right as counts: NdArray[Int64]) do
+                case branchOffsets(bytes, t, counted, limit) of
+                    when Right(right as offsets: NdArray[Int64]) do
+                        ok := (rank(&offsets) = 1) and ((count(&offsets) = 31) and (flatGet(&offsets, 0) = 0));
+                        var j: Index := 0;
+                        while ok and (j < 30) do
+                            ok := (flatGet(&offsets, j + 1) - flatGet(&offsets, j)) = flatGet(&counts, j);
+                            j := j + 1;
+                        end while;
+                        case branchInt64(bytes, t, counted, limit) of
+                            when Right(right as values: NdArray[Int64]) do
+                                case toInt64(count(&values)) of
+                                    when Some(value as n: Int64) do
+                                        ok := ok and ((rank(&values) = 1) and (n = flatGet(&offsets, 30)));
+                                        ok := ok and ((flatGet(&values, 0) = -15) and ((flatGet(&values, 2) = -13) and (flatGet(&values, 9) = -9)));
+                                        ok := ok and ((flatGet(&values, 10) = -10) and (flatGet(&offsets, 5) = 10));
+                                    when None do
+                                        ok := false;
+                                end case;
+                                destroyNdArray(values);
+                            when Left(left as e: RootError) do
+                                ok := false;
+                        end case;
+                        destroyNdArray(offsets);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+                destroyNdArray(counts);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    -- The same tree read from the file without compression and with zlib,
+    -- LZ4 and lzma.
+    function testSample(): Unit is
+        assertTrue(sampleHolds("testdata/uproot/uproot-sample-6.20.04-uncompressed.root"), "uncompressed");
+        assertTrue(sampleHolds("testdata/uproot/uproot-sample-6.20.04-zlib.root"), "zlib");
+        assertTrue(sampleHolds("testdata/uproot/uproot-sample-6.20.04-lz4.root"), "LZ4");
+        assertTrue(sampleHolds("testdata/uproot/uproot-sample-6.20.04-lzma.root"), "LZMA");
+        return nil;
+    end;
+
+    -- The tree of an object split into its members: a TTree of version 19
+    -- whose branches are TBranchElements with their members below them.
+    function splitHolds(check: Int32): Bool is
+        let file: String := load("testdata/uproot/uproot-small-evnt-tree-fullsplit.root");
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readKeys(asSpan(&file), header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        var k: Index := 0;
+                        while k < bufferLength(&keys) do
+                            let key: RootKey := nth(&keys, k);
+                            if equal(className(asSpan(&file), key), "TTree") and equal(keyName(asSpan(&file), key), "tree") then
+                                case readTree(asSpan(&file), key, limit) of
+                                    when Right(right as t: Tree) do
+                                        ok := splitChecked(&t, check);
+                                        destroyTree(t);
+                                    when Left(left as e: RootError) do
+                                        ok := false;
+                                end case;
+                            end if;
+                            k := k + 1;
+                        end while;
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    generic [R: Region]
+    function splitChecked(t: &[Tree, R], check: Int32): Bool is
+        if check = 1 then
+            return treeEntries(t) = 100;
+        end if;
+        if check = 2 then
+            return (branchOf(t, "I32") < branchCount(t)) and ((branchOf(t, "StlVecI32") < branchCount(t)) and (branchOf(t, "P3.Px") < branchCount(t)));
+        end if;
+        return branchCount(t) >= 41;
+    end;
+
+    -- The members of the split object, typed by the streamer information of
+    -- the file. Entry i holds i in I32, ten times i in ArrayI32, and i mod 10
+    -- times i in SliceI32, StlVecI32 and StlVecU16; StdStr is std-00i.
+    function typedHolds(check: Int32): Bool is
+        let file: String := load("testdata/uproot/uproot-small-evnt-tree-fullsplit.root");
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readStreamers(asSpan(&file), header, limit) of
+                    when Right(right as s: Streamers) do
+                        case readKeys(asSpan(&file), header) of
+                            when Right(right as keys: Buffer[RootKey]) do
+                                var k: Index := 0;
+                                while k < bufferLength(&keys) do
+                                    let key: RootKey := nth(&keys, k);
+                                    if equal(className(asSpan(&file), key), "TTree") and equal(keyName(asSpan(&file), key), "tree") then
+                                        case readTreeWith(asSpan(&file), key, &s, limit) of
+                                            when Right(right as t: Tree) do
+                                                if check = 6 then
+                                                    ok := typedCut(asSpan(&file), &t, key, &s);
+                                                else
+                                                    ok := typedChecked(asSpan(&file), &t, check);
+                                                end if;
+                                                destroyTree(t);
+                                            when Left(left as e: RootError) do
+                                                ok := false;
+                                        end case;
+                                    end if;
+                                    k := k + 1;
+                                end while;
+                                destroyFree(keys);
+                            when Left(left as e: RootError) do
+                                ok := false;
+                        end case;
+                        destroyStreamers(s);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    -- The members of the split object read a second time and cut to the
+    -- entries 30 to 49 agree with the whole tree: numbers, a fixed array,
+    -- a counted array, a std::vector and a std::string.
+    generic [R: Region, S: Region, Q: Region]
+    function typedCut(bytes: Span[Nat8, R], full: &[Tree, S], key: RootKey, s: &[Streamers, Q]): Bool is
+        case readTreeWith(bytes, key, s, limit) of
+            when Right(right as other: Tree) do
+                let cut: Tree := narrowEntries(other, 30, 20);
+                var ok: Bool := treeEntries(&cut) = 20;
+                ok := ok and cutAgrees(bytes, full, &cut, "I32", 30, 20);
+                ok := ok and cutAgrees(bytes, full, &cut, "ArrayI32[10]", 30, 20);
+                ok := ok and cutAgrees(bytes, full, &cut, "SliceI32", 30, 20);
+                ok := ok and cutAgrees(bytes, full, &cut, "StlVecI32", 30, 20);
+                ok := ok and stringsAgree(bytes, full, &cut, "StdStr", 30, 20);
+                destroyTree(cut);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The texts of the branch name of the cut tree are those of the whole
+    -- tree for its entries first to first + span.
+    generic [R: Region, S: Region, T: Region]
+    function stringsAgree(bytes: Span[Nat8, R], full: &[Tree, S], cut: &[Tree, T], name: Span[Nat8, Static], first: Index, span: Index): Bool is
+        let i: Index := branchOf(full, name);
+        if (i >= branchCount(full)) or (branchOf(cut, name) /= i) then
+            return false;
+        end if;
+        case branchStrings(bytes, full, i, limit) of
+            when Right(right as whole: Buffer[String]) do
+                var ok: Bool := false;
+                case branchStrings(bytes, cut, i, limit) of
+                    when Right(right as part: Buffer[String]) do
+                        ok := (bufferLength(&part) = span) and (bufferLength(&whole) >= (first + span));
+                        var k: Index := 0;
+                        while ok and (k < span) do
+                            ok := sameTexts(&part, k, &whole, first + k);
+                            k := k + 1;
+                        end while;
+                        destroyBranchStrings(part);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+                destroyBranchStrings(whole);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameTexts(a: &[Buffer[String], R], i: Index, b: &[Buffer[String], S], j: Index): Bool is
+        let p: Span[String, R] := getSpan(a, i, i);
+        let q: Span[String, S] := getSpan(b, j, j);
+        return equal(asSpan(&(p[0])), asSpan(&(q[0])));
+    end;
+
+    -- Whether the numbers of a counted branch are i mod 10 times i for each
+    -- entry i of the 100.
+    generic [R: Region, S: Region]
+    function repeatsHold(bytes: Span[Nat8, R], t: &[Tree, S], name: Span[Nat8, Static]): Bool is
+        let b: Index := branchOf(t, name);
+        if b >= branchCount(t) then
+            return false;
+        end if;
+        var ok: Bool := false;
+        case branchOffsets(bytes, t, b, limit) of
+            when Right(right as offsets: NdArray[Int64]) do
+                case branchInt64(bytes, t, b, limit) of
+                    when Right(right as values: NdArray[Int64]) do
+                        ok := count(&offsets) = 101;
+                        var e: Index := 0;
+                        while ok and (e < 100) do
+                            case toInt64(e) of
+                                when Some(value as wanted: Int64) do
+                                    let since: Int64 := flatGet(&offsets, e);
+                                    let upto: Int64 := flatGet(&offsets, e + 1);
+                                    ok := (upto - since) = rem(wanted, 10);
+                                    var v: Int64 := since;
+                                    while ok and (v < upto) do
+                                        case toIndex(v) of
+                                            when Some(value as at: Index) do
+                                                ok := flatGet(&values, at) = wanted;
+                                            when None do
+                                                ok := false;
+                                        end case;
+                                        v := v + 1;
+                                    end while;
+                                when None do
+                                    ok := false;
+                            end case;
+                            e := e + 1;
+                        end while;
+                        destroyNdArray(values);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+                destroyNdArray(offsets);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    generic [R: Region, S: Region]
+    function typedChecked(bytes: Span[Nat8, R], t: &[Tree, S], check: Int32): Bool is
+        if check = 1 then
+            let i32: Index := branchOf(t, "I32");
+            case branchInt64(bytes, t, i32, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    let ok: Bool := (count(&v) = 100) and ((flatGet(&v, 0) = 0) and ((flatGet(&v, 1) = 1) and (flatGet(&v, 99) = 99)));
+                    destroyNdArray(v);
+                    return ok;
+                when Left(left as e: RootError) do
+                    return false;
+            end case;
+        end if;
+        if check = 2 then
+            let array: Index := branchOf(t, "ArrayI32[10]");
+            case branchInt64(bytes, t, array, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    let ok: Bool := (rank(&v) = 2) and ((dimension(&v, 1) = 10) and ((flatGet(&v, 9) = 0) and ((flatGet(&v, 10) = 1) and (flatGet(&v, 999) = 99))));
+                    destroyNdArray(v);
+                    return ok;
+                when Left(left as e: RootError) do
+                    return false;
+            end case;
+        end if;
+        if check = 3 then
+            return repeatsHold(bytes, t, "SliceI32");
+        end if;
+        if check = 4 then
+            return repeatsHold(bytes, t, "StlVecI32") and repeatsHold(bytes, t, "StlVecU16");
+        end if;
+        let str: Index := branchOf(t, "StdStr");
+        case branchStrings(bytes, t, str, limit) of
+            when Right(right as texts: Buffer[String]) do
+                let ok: Bool := (bufferLength(&texts) = 100) and (textIs(&texts, 0, "std-000") and textIs(&texts, 99, "std-099"));
+                destroyBranchStrings(texts);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    function testTyped(): Unit is
+        assertTrue(typedHolds(1), "I32 is 0 to 99");
+        assertTrue(typedHolds(2), "ArrayI32[10] is ten times the entry");
+        assertTrue(typedHolds(3), "SliceI32 is the entry i mod 10 times");
+        assertTrue(typedHolds(4), "StlVecI32 and StlVecU16 are the entry i mod 10 times");
+        assertTrue(typedHolds(5), "StdStr is std-000 to std-099");
+        assertTrue(typedHolds(6), "the members of the entries 30 to 49 alone agree with the whole tree");
+        return nil;
+    end;
+
+    function testSplit(): Unit is
+        assertTrue(splitHolds(1), "100 entries");
+        assertTrue(splitHolds(2), "the members I32, StlVecI32 and P3.Px are branches");
+        assertTrue(splitHolds(3), "at least 41 branches");
+        return nil;
+    end;
+
+    -- The branch name of the cut tree holds the numbers the whole tree holds
+    -- for its entries first to first + count, with offsets from 0.
+    generic [R: Region, S: Region, T: Region]
+    function cutAgrees(bytes: Span[Nat8, R], full: &[Tree, S], cut: &[Tree, T], name: Span[Nat8, Static], first: Index, span: Index): Bool is
+        let i: Index := branchOf(full, name);
+        if (i >= branchCount(full)) or (branchOf(cut, name) /= i) then
+            return false;
+        end if;
+        var ok: Bool := false;
+        case branchOffsets(bytes, full, i, limit) of
+            when Right(right as whole: NdArray[Int64]) do
+                case branchOffsets(bytes, cut, i, limit) of
+                    when Right(right as part: NdArray[Int64]) do
+                        ok := (count(&part) = (span + 1)) and (count(&whole) > (first + span));
+                        let base: Int64 := flatGet(&whole, first);
+                        var p: Index := 0;
+                        while ok and (p <= span) do
+                            ok := flatGet(&part, p) = (flatGet(&whole, first + p) - base);
+                            p := p + 1;
+                        end while;
+                        if ok then
+                            ok := valuesAgree(bytes, full, cut, i, base, flatGet(&part, span));
+                        end if;
+                        destroyNdArray(part);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+                destroyNdArray(whole);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    -- The numbers of branch i of the cut tree, n of them, are those of the
+    -- whole tree from base on.
+    generic [R: Region, S: Region, T: Region]
+    function valuesAgree(bytes: Span[Nat8, R], full: &[Tree, S], cut: &[Tree, T], i: Index, base: Int64, n: Int64): Bool is
+        case branchInt64(bytes, full, i, limit) of
+            when Right(right as whole: NdArray[Int64]) do
+                var ok: Bool := false;
+                case branchInt64(bytes, cut, i, limit) of
+                    when Right(right as part: NdArray[Int64]) do
+                        case toIndex(base) of
+                            when Some(value as since: Index) do
+                                case toInt64(count(&part)) of
+                                    when Some(value as have: Int64) do
+                                        ok := have = n;
+                                    when None do
+                                        ok := false;
+                                end case;
+                                var k: Index := 0;
+                                while ok and (k < count(&part)) do
+                                    ok := flatGet(&part, k) = flatGet(&whole, since + k);
+                                    k := k + 1;
+                                end while;
+                            when None do
+                                ok := false;
+                        end case;
+                        destroyNdArray(part);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+                destroyNdArray(whole);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The texts of the cut tree are hey-first to hey-(first + count - 1).
+    generic [R: Region, S: Region]
+    function cutTexts(bytes: Span[Nat8, R], cut: &[Tree, S], first: Index, span: Index): Bool is
+        let str: Index := branchOf(cut, "str");
+        if str >= branchCount(cut) then
+            return false;
+        end if;
+        case branchStrings(bytes, cut, str, limit) of
+            when Right(right as texts: Buffer[String]) do
+                var ok: Bool := bufferLength(&texts) = span;
+                var k: Index := 0;
+                while ok and (k < span) do
+                    let wanted: String := heyOf(first + k);
+                    ok := textAt(&texts, k, asSpan(&wanted));
+                    destroyString(wanted);
+                    k := k + 1;
+                end while;
+                destroyBranchStrings(texts);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function textAt(texts: &[Buffer[String], R], at: Index, wanted: Span[Nat8, S]): Bool is
+        let piece: Span[String, R] := getSpan(texts, at, at);
+        return equal(asSpan(&(piece[0])), wanted);
+    end;
+
+    -- The text hey-k, as the sample writes it.
+    function heyOf(k: Index): String is
+        var digits: Buffer[Nat8] := allocateEmpty();
+        var rest: Index := k;
+        if rest = 0 then
+            let zero: Nat8 := 48;
+            insertBack(&!digits, zero);
+        end if;
+        while rest > 0 do
+            case toNat8(48 + rem(rest, 10)) of
+                when Some(value as d: Nat8) do
+                    insertBack(&!digits, d);
+                when None do
+                    skip;
+            end case;
+            rest := rest / 10;
+        end while;
+        var text: Buffer[Nat8] := allocateEmpty();
+        let h: Nat8 := 104;
+        let e: Nat8 := 101;
+        let y: Nat8 := 121;
+        let dash: Nat8 := 45;
+        insertBack(&!text, h);
+        insertBack(&!text, e);
+        insertBack(&!text, y);
+        insertBack(&!text, dash);
+        while lengthMut(&!digits) > 0 do
+            insertBack(&!text, removeLast(&!digits));
+        end while;
+        destroyEmpty(digits);
+        return fromByteBuffer(text);
+    end;
+
+    -- The sample of 30 entries read whole and cut to count entries from
+    -- first on, for again then cut a second time to again entries from 2 on:
+    -- i4, the fixed array ai4, the counted Ai4 with its counter n and the
+    -- texts str agree with the whole tree.
+    function cutHolds(path: Span[Nat8, Static], first: Index, span: Index, again: Index, entries: Index): Bool is
+        let file: String := load(path);
+        var ok: Bool := false;
+        case firstTree(asSpan(&file)) of
+            when Some(value as full: Tree) do
+                case firstTree(asSpan(&file)) of
+                    when Some(value as other: Tree) do
+                        var cut: Tree := narrowEntries(other, first, span);
+                        var since: Index := first;
+                        if again > 0 then
+                            cut := narrowEntries(cut, 2, again);
+                            since := first + 2;
+                        end if;
+                        ok := treeEntries(&cut) = entries;
+                        ok := ok and cutAgrees(asSpan(&file), &full, &cut, "i4", since, entries);
+                        ok := ok and cutAgrees(asSpan(&file), &full, &cut, "ai4", since, entries);
+                        ok := ok and cutAgrees(asSpan(&file), &full, &cut, "Ai4", since, entries);
+                        ok := ok and cutAgrees(asSpan(&file), &full, &cut, "n", since, entries);
+                        ok := ok and cutTexts(asSpan(&file), &cut, since, entries);
+                        destroyTree(cut);
+                    when None do
+                        ok := false;
+                end case;
+                destroyTree(full);
+            when None do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    -- The bytes of the uncompressed sample with the fAutoFlush of its tree
+    -- set to flush: the eight bytes before its fEstimate of 1000000, the
+    -- only such eight bytes in the file; unchanged when there are more.
+    function withFlush(flush: Nat8): String is
+        let file: String := load("testdata/uproot/uproot-sample-6.20.04-uncompressed.root");
+        let n: Index := stringLength(&file);
+        var copy: Buffer[Nat8] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!copy, nthByte(&file, k));
+            k := k + 1;
+        end while;
+        destroyString(file);
+        var hits: Index := 0;
+        var found: Index := 0;
+        var at: Index := 16;
+        while (at + 8) <= lengthMut(&!copy) do
+            if estimateAt(&!copy, at) then
+                hits := hits + 1;
+                found := at;
+            end if;
+            at := at + 1;
+        end while;
+        if hits = 1 then
+            let zero: Nat8 := 0;
+            var b: Index := found - 8;
+            while b < (found - 1) do
+                storeNth(&!copy, b, zero);
+                b := b + 1;
+            end while;
+            storeNth(&!copy, found - 1, flush);
+        end if;
+        return fromByteBuffer(copy);
+    end;
+
+    -- The eight bytes at at are 1000000, big endian.
+    generic [R: Region]
+    function estimateAt(bytes: &![Buffer[Nat8], R], at: Index): Bool is
+        var k: Index := 0;
+        while k < 8 do
+            var wanted: Nat8 := 0;
+            if k = 5 then
+                wanted := 15;
+            end if;
+            if k = 6 then
+                wanted := 66;
+            end if;
+            if k = 7 then
+                wanted := 64;
+            end if;
+            if nthMut(&~bytes, at + k) /= wanted then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    -- The sample with fAutoFlush set to flush has its clusters begin at
+    -- each multiple of flush; cut to count clusters from first on, it gives
+    -- the entries those clusters hold, as the whole sample does.
+    function flushedHolds(flush: Nat8, clusters: Index, first: Index, count: Index, since: Index, span: Index): Bool is
+        let bytes: String := withFlush(flush);
+        let whole: String := load("testdata/uproot/uproot-sample-6.20.04-uncompressed.root");
+        var ok: Bool := false;
+        case firstTree(asSpan(&bytes)) of
+            when Some(value as t: Tree) do
+                ok := treeClusterCount(&t) = clusters;
+                var c: Index := 0;
+                while ok and (c < clusters) do
+                    case toIndex(flush) of
+                        when Some(value as step: Index) do
+                            ok := treeClusterFirst(&t, c) = (c * step);
+                        when None do
+                            ok := false;
+                    end case;
+                    c := c + 1;
+                end while;
+                case firstTree(asSpan(&whole)) of
+                    when Some(value as full: Tree) do
+                        let cut: Tree := narrowTreeClusters(t, first, count);
+                        ok := ok and ((treeEntries(&cut) = span) and (treeClusterCount(&cut) <= count));
+                        ok := ok and cutAgrees(asSpan(&bytes), &full, &cut, "i4", since, span);
+                        ok := ok and cutAgrees(asSpan(&bytes), &full, &cut, "Ai4", since, span);
+                        ok := ok and cutTexts(asSpan(&bytes), &cut, since, span);
+                        destroyTree(cut);
+                        destroyTree(full);
+                    when None do
+                        ok := false;
+                        destroyTree(t);
+                end case;
+            when None do
+                ok := false;
+        end case;
+        destroyString(bytes);
+        destroyString(whole);
+        return ok;
+    end;
+
+    -- Whether the baskets of the sample, its fAutoFlush set to flush or
+    -- left as it is for 0, begin at its clusters.
+    function alignedIs(flush: Nat8, wanted: Bool): Bool is
+        var bytes: String := load("testdata/uproot/uproot-sample-6.20.04-uncompressed.root");
+        if flush > 0 then
+            destroyString(bytes);
+            bytes := withFlush(flush);
+        end if;
+        var ok: Bool := false;
+        case firstTree(asSpan(&bytes)) of
+            when Some(value as t: Tree) do
+                ok := treeClustersAligned(&t) = wanted;
+                destroyTree(t);
+            when None do
+                ok := false;
+        end case;
+        destroyString(bytes);
+        return ok;
+    end;
+
+    function testClustersAligned(): Unit is
+        assertTrue(alignedIs(0, true), "one cluster: every basket of the sample begins at it");
+        assertTrue(alignedIs(10, false), "clusters every 10 entries cut the basket of i4 that holds the entries 6 to 12");
+        return nil;
+    end;
+
+    function testClusterRanges(): Unit is
+        assertTrue(flushedHolds(10, 3, 1, 1, 10, 10), "fAutoFlush 10: clusters at 0, 10 and 20, the second alone");
+        assertTrue(flushedHolds(7, 5, 2, 2, 14, 14), "fAutoFlush 7: clusters at 0, 7, 14, 21 and 28, the third and fourth");
+        assertTrue(flushedHolds(7, 5, 3, 9, 21, 9), "a range past the last cluster cut at it");
+        return nil;
+    end;
+
+    function testEntryRanges(): Unit is
+        assertTrue(cutHolds("testdata/uproot/uproot-sample-6.20.04-uncompressed.root", 5, 10, 0, 10), "entries 5 to 14, cut inside baskets at both ends");
+        assertTrue(cutHolds("testdata/uproot/uproot-sample-6.20.04-zlib.root", 5, 10, 0, 10), "the same packed by zlib");
+        assertTrue(cutHolds("testdata/uproot/uproot-sample-6.20.04-uncompressed.root", 0, 30, 0, 30), "all entries");
+        assertTrue(cutHolds("testdata/uproot/uproot-sample-6.20.04-uncompressed.root", 25, 10, 0, 5), "a range past the end cut at the last entry");
+        assertTrue(cutHolds("testdata/uproot/uproot-sample-6.20.04-uncompressed.root", 3, 20, 10, 10), "a cut tree cut again");
+        return nil;
+    end;
+
+    -- The first tree among the keys of a file, or none.
+    generic [R: Region]
+    function firstTree(bytes: Span[Nat8, R]): Option[Tree] is
+        case readHeader(bytes) of
+            when Right(right as header: RootHeader) do
+                case readKeys(bytes, header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        let found: Option[Tree] := treeOfKeys(bytes, &keys);
+                        destroyFree(keys);
+                        return found;
+                    when Left(left as e: RootError) do
+                        let none: Option[Tree] := None();
+                        return none;
+                end case;
+            when Left(left as e: RootError) do
+                let none: Option[Tree] := None();
+                return none;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function treeOfKeys(bytes: Span[Nat8, R], keys: &[Buffer[RootKey], S]): Option[Tree] is
+        var k: Index := 0;
+        while k < bufferLength(keys) do
+            let key: RootKey := nth(keys, k);
+            if equal(className(bytes, key), "TTree") then
+                case readTree(bytes, key, limit) of
+                    when Right(right as t: Tree) do
+                        let found: Option[Tree] := Some(value => t);
+                        return found;
+                    when Left(left as e: RootError) do
+                        let none: Option[Tree] := None();
+                        return none;
+                end case;
+            end if;
+            k := k + 1;
+        end while;
+        let none: Option[Tree] := None();
+        return none;
+    end;
+
+    -- The branch i of the tree a and the branch j of the tree b hold the same
+    -- numbers of the type Float64.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function doublesAgree(ba: Span[Nat8, R], a: &[Tree, S], i: Index, bb: Span[Nat8, T], b: &[Tree, U], j: Index): Bool is
+        case branchFloat64(ba, a, i, limit) of
+            when Right(right as x: NdArray[Float64]) do
+                case branchFloat64(bb, b, j, limit) of
+                    when Right(right as y: NdArray[Float64]) do
+                        var ok: Bool := (count(&x) > 0) and (count(&x) = count(&y));
+                        var n: Index := 0;
+                        while ok and (n < count(&x)) do
+                            ok := flatGet(&x, n) = flatGet(&y, n);
+                            n := n + 1;
+                        end while;
+                        destroyNdArray(y);
+                        destroyNdArray(x);
+                        return ok;
+                    when Left(left as e: RootError) do
+                        destroyNdArray(x);
+                        return false;
+                end case;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The same for numbers of the type Float32.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function floatsAgree(ba: Span[Nat8, R], a: &[Tree, S], i: Index, bb: Span[Nat8, T], b: &[Tree, U], j: Index): Bool is
+        case branchFloat32(ba, a, i, limit) of
+            when Right(right as x: NdArray[Float32]) do
+                case branchFloat32(bb, b, j, limit) of
+                    when Right(right as y: NdArray[Float32]) do
+                        var ok: Bool := (count(&x) > 0) and (count(&x) = count(&y));
+                        var n: Index := 0;
+                        while ok and (n < count(&x)) do
+                            ok := flatGet(&x, n) = flatGet(&y, n);
+                            n := n + 1;
+                        end while;
+                        destroyNdArray(y);
+                        destroyNdArray(x);
+                        return ok;
+                    when Left(left as e: RootError) do
+                        destroyNdArray(x);
+                        return false;
+                end case;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The same for integers.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function integersAgree(ba: Span[Nat8, R], a: &[Tree, S], i: Index, bb: Span[Nat8, T], b: &[Tree, U], j: Index): Bool is
+        case branchInt64(ba, a, i, limit) of
+            when Right(right as x: NdArray[Int64]) do
+                case branchInt64(bb, b, j, limit) of
+                    when Right(right as y: NdArray[Int64]) do
+                        var ok: Bool := (count(&x) > 0) and (count(&x) = count(&y));
+                        var n: Index := 0;
+                        while ok and (n < count(&x)) do
+                            ok := flatGet(&x, n) = flatGet(&y, n);
+                            n := n + 1;
+                        end while;
+                        destroyNdArray(y);
+                        destroyNdArray(x);
+                        return ok;
+                    when Left(left as e: RootError) do
+                        destroyNdArray(x);
+                        return false;
+                end case;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The same for texts.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function textsAgree(ba: Span[Nat8, R], a: &[Tree, S], i: Index, bb: Span[Nat8, T], b: &[Tree, U], j: Index): Bool is
+        case branchStrings(ba, a, i, limit) of
+            when Right(right as x: Buffer[String]) do
+                case branchStrings(bb, b, j, limit) of
+                    when Right(right as y: Buffer[String]) do
+                        var ok: Bool := (bufferLength(&x) > 0) and (bufferLength(&x) = bufferLength(&y));
+                        var n: Index := 0;
+                        while ok and (n < bufferLength(&x)) do
+                            ok := sameText(&x, &y, n);
+                            n := n + 1;
+                        end while;
+                        destroyBranchStrings(y);
+                        destroyBranchStrings(x);
+                        return ok;
+                    when Left(left as e: RootError) do
+                        destroyBranchStrings(x);
+                        return false;
+                end case;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameText(x: &[Buffer[String], R], y: &[Buffer[String], S], at: Index): Bool is
+        let p: Span[String, R] := getSpan(x, at, at);
+        let q: Span[String, S] := getSpan(y, at, at);
+        return equal(asSpan(&(p[0])), asSpan(&(q[0])));
+    end;
+
+    -- The branch i of both trees holds the same values, read by the kind of
+    -- its leaf.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function branchesAgree(ba: Span[Nat8, R], a: &[Tree, S], bb: Span[Nat8, T], b: &[Tree, U], i: Index): Bool is
+        let first: String := branchName(a, i);
+        let second: String := branchName(b, i);
+        let named: Bool := equal(asSpan(&first), asSpan(&second));
+        destroyString(first);
+        destroyString(second);
+        if not named then
+            return false;
+        end if;
+        let kind: Nat8 := leafKind(a, i);
+        if kind /= leafKind(b, i) then
+            return false;
+        end if;
+        if kind = 68 then
+            return doublesAgree(ba, a, i, bb, b, i);
+        end if;
+        if kind = 70 then
+            return floatsAgree(ba, a, i, bb, b, i);
+        end if;
+        if kind = 67 then
+            return textsAgree(ba, a, i, bb, b, i);
+        end if;
+        return integersAgree(ba, a, i, bb, b, i);
+    end;
+
+    -- The count of branches whose values agree in both trees, or the count
+    -- plus one when the trees differ in entries or branches.
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function agreeing(ba: Span[Nat8, R], a: &[Tree, S], bb: Span[Nat8, T], b: &[Tree, U]): Index is
+        if (treeEntries(a) /= treeEntries(b)) or (branchCount(a) /= branchCount(b)) then
+            return branchCount(a) + 1;
+        end if;
+        var agreed: Index := 0;
+        var i: Index := 0;
+        while i < branchCount(a) do
+            if branchesAgree(ba, a, bb, b, i) then
+                agreed := agreed + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return agreed;
+    end;
+
+    -- The tree of uproot-Zmumu read from the file packed by Zstandard and
+    -- from the one packed by zlib. Check 1: the entries and branches; check 2:
+    -- every branch holds the same values in both; check 3: E1 of the one and
+    -- px1 of the other differ, so the comparison can fail.
+    function zmumuHolds(check: Int32): Bool is
+        let packed: String := load("testdata/uproot/uproot-Zmumu-zstd.root");
+        let plain: String := load("testdata/uproot/uproot-Zmumu.root");
+        var ok: Bool := false;
+        case firstTree(asSpan(&packed)) of
+            when Some(value as a: Tree) do
+                case firstTree(asSpan(&plain)) of
+                    when Some(value as b: Tree) do
+                        ok := zmumuChecked(asSpan(&packed), &a, asSpan(&plain), &b, check);
+                        destroyTree(b);
+                    when None do
+                        ok := false;
+                end case;
+                destroyTree(a);
+            when None do
+                ok := false;
+        end case;
+        destroyString(packed);
+        destroyString(plain);
+        return ok;
+    end;
+
+    generic [R: Region, S: Region, T: Region, U: Region]
+    function zmumuChecked(ba: Span[Nat8, R], a: &[Tree, S], bb: Span[Nat8, T], b: &[Tree, U], check: Int32): Bool is
+        if check = 1 then
+            return (treeEntries(a) = 2304) and (branchCount(a) = 20);
+        end if;
+        if check = 2 then
+            return agreeing(ba, a, bb, b) = branchCount(a);
+        end if;
+        let e1: Index := branchOf(a, "E1");
+        let px1: Index := branchOf(b, "px1");
+        if (e1 >= branchCount(a)) or (px1 >= branchCount(b)) then
+            return false;
+        end if;
+        return not doublesAgree(ba, a, e1, bb, b, px1);
+    end;
+
+    function testZstandard(): Unit is
+        assertTrue(zmumuHolds(1), "2304 entries and 20 branches");
+        assertTrue(zmumuHolds(2), "every branch agrees with the file packed by zlib");
+        assertTrue(zmumuHolds(3), "E1 and px1 differ");
+        return nil;
+    end;
+
+    -- The tree sample of the uncompressed file, read past its last branch
+    -- by the reader word names, or at its last branch for inside; false
+    -- when the tree is not read.
+    function pastBranch(word: Span[Nat8, Static]): Bool is
+        let file: String := load("testdata/uproot/uproot-sample-6.20.04-uncompressed.root");
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readKeys(asSpan(&file), header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        ok := pastBranchOf(asSpan(&file), &keys, word);
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    generic [R: Region, S: Region]
+    function pastBranchOf(bytes: Span[Nat8, R], keys: &[Buffer[RootKey], S], word: Span[Nat8, Static]): Bool is
+        var k: Index := 0;
+        while k < bufferLength(keys) do
+            let key: RootKey := nth(keys, k);
+            if equal(className(bytes, key), "TTree") and equal(keyName(bytes, key), "sample") then
+                case readTree(bytes, key, limit) of
+                    when Right(right as t: Tree) do
+                        readPast(bytes, &t, word);
+                        destroyTree(t);
+                        return true;
+                    when Left(left as e: RootError) do
+                        return false;
+                end case;
+            end if;
+            k := k + 1;
+        end while;
+        return false;
+    end;
+
+    -- Reads the branch at branchCount with the reader word names: int64,
+    -- float64, float32, offsets or strings; inside reads the last branch
+    -- with branchInt64 and branchOffsets.
+    generic [R: Region, S: Region]
+    function readPast(bytes: Span[Nat8, R], t: &[Tree, S], word: Span[Nat8, Static]): Unit is
+        var i: Index := branchCount(t);
+        let inside: Bool := equal(word, "inside");
+        if inside then
+            i := i - 1;
+        end if;
+        if inside or equal(word, "int64") then
+            case branchInt64(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if equal(word, "float64") then
+            case branchFloat64(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Float64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if equal(word, "float32") then
+            case branchFloat32(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Float32]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if inside or equal(word, "offsets") then
+            case branchOffsets(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if equal(word, "strings") then
+            case branchStrings(bytes, t, i, limit) of
+                when Right(right as texts: Buffer[String]) do
+                    destroyBranchStrings(texts);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        return nil;
+    end;
+
+    -- An index at branchCount is refused by the requires of each reader of
+    -- a branch, before the body looks at the branch; the last is taken.
+    function testABranchPastTheLastIsRefused(): Unit is
+        if asChild("int64") then
+            let ran: Bool := pastBranch("int64");
+            return nil;
+        end if;
+        if asChild("float64") then
+            let ran: Bool := pastBranch("float64");
+            return nil;
+        end if;
+        if asChild("float32") then
+            let ran: Bool := pastBranch("float32");
+            return nil;
+        end if;
+        if asChild("offsets") then
+            let ran: Bool := pastBranch("offsets");
+            return nil;
+        end if;
+        if asChild("strings") then
+            let ran: Bool := pastBranch("strings");
+            return nil;
+        end if;
+        if asChild("inside") then
+            let ran: Bool := pastBranch("inside");
+            return nil;
+        end if;
+        assertTrue(pastBranch("inside"), "the tree sample is read and its last branch taken");
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testABranchPastTheLastIsRefused", "int64", "contract violated: the requires"), "branchInt64 at branchCount is refused");
+        assertTrue(refusedInChild("testABranchPastTheLastIsRefused", "float64", "contract violated: the requires"), "branchFloat64 at branchCount is refused");
+        assertTrue(refusedInChild("testABranchPastTheLastIsRefused", "float32", "contract violated: the requires"), "branchFloat32 at branchCount is refused");
+        assertTrue(refusedInChild("testABranchPastTheLastIsRefused", "offsets", "contract violated: the requires"), "branchOffsets at branchCount is refused");
+        assertTrue(refusedInChild("testABranchPastTheLastIsRefused", "strings", "contract violated: the requires"), "branchStrings at branchCount is refused");
+        assertTrue(not refusedInChild("testABranchPastTheLastIsRefused", "inside", "contract violated"), "the last branch breaks no contract");
+        return nil;
+    end;
+
+    -- The class TTree of the streamer information, asked for its member
+    -- at memberCount by the reader word names: name, typeName or type; for
+    -- inside its last member by all three. False when it is not read.
+    function pastMember(word: Span[Nat8, Static]): Bool is
+        let file: String := load("testdata/uproot/uproot-sample-6.20.04-uncompressed.root");
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readStreamers(asSpan(&file), header, limit) of
+                    when Right(right as s: Streamers) do
+                        var tree: Index := classCount(&s);
+                        var i: Index := 0;
+                        while i < classCount(&s) do
+                            if classIs(&s, i, "TTree") then
+                                tree := i;
+                            end if;
+                            i := i + 1;
+                        end while;
+                        if tree < classCount(&s) then
+                            ok := true;
+                            var j: Index := memberCount(&s, tree);
+                            let inside: Bool := equal(word, "inside");
+                            if inside then
+                                j := j - 1;
+                            end if;
+                            if inside or equal(word, "name") then
+                                let named: String := memberName(&s, tree, j);
+                                destroyString(named);
+                            end if;
+                            if inside or equal(word, "typeName") then
+                                let typed: String := memberTypeName(&s, tree, j);
+                                destroyString(typed);
+                            end if;
+                            if inside or equal(word, "type") then
+                                let code: Int64 := memberType(&s, tree, j);
+                            end if;
+                        end if;
+                        destroyStreamers(s);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    -- A member at memberCount: the condition j < memberCount(s, i) reaches
+    -- C and cannot be a requires, so the body stops the programme, with
+    -- its own message and before it reads past the members of the class.
+    function testAMemberPastTheLastStops(): Unit is
+        if asChild("name") then
+            let ran: Bool := pastMember("name");
+            return nil;
+        end if;
+        if asChild("typeName") then
+            let ran: Bool := pastMember("typeName");
+            return nil;
+        end if;
+        if asChild("type") then
+            let ran: Bool := pastMember("type");
+            return nil;
+        end if;
+        if asChild("inside") then
+            let ran: Bool := pastMember("inside");
+            return nil;
+        end if;
+        assertTrue(pastMember("inside"), "the streamer information is read and the last member of TTree taken");
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testAMemberPastTheLastStops", "name", "a member beyond the members of its class"), "memberName at memberCount stops");
+        assertTrue(refusedInChild("testAMemberPastTheLastStops", "typeName", "a member beyond the members of its class"), "memberTypeName at memberCount stops");
+        assertTrue(refusedInChild("testAMemberPastTheLastStops", "type", "a member beyond the members of its class"), "memberType at memberCount stops");
+        assertTrue(not refusedInChild("testAMemberPastTheLastStops", "inside", "Mirco.RootTree"), "the last member is taken");
+        return nil;
+    end;
+end module body.

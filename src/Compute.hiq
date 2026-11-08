@@ -1,0 +1,568 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    destroyFree,
+    length,
+    nth,
+    nthMut,
+    storeNth,
+    insertBack,
+    wholeSpan
+);
+import Mirco.Element (Element, zeroElement);
+import Mirco.Numeric (Numeric, plus, minus, times, dividedBy, less, isNaN, fromCount);
+import Mirco.Array (
+    NdArray,
+    View,
+    rank,
+    dimension,
+    count,
+    shapeOf,
+    flatGet,
+    flatGetMut,
+    flatSet,
+    countMut,
+    destroyNdArray,
+    fromSpan,
+    view,
+    destroyView,
+    viewGet,
+    broadcastShape,
+    broadcastTo,
+    shapeCount
+);
+
+module body Mirco.Compute is
+    -- The operation of an elementwise call: 1 plus, 2 minus, 3 times,
+    -- 4 divided by.
+    generic [T: Free(Numeric)]
+    function apply(op: Nat8, x: T, y: T): T is
+        if op = 1 then
+            return plus(x, y);
+        else if op = 2 then
+            return minus(x, y);
+        else if op = 3 then
+            return times(x, y);
+        end if;
+        return dividedBy(x, y);
+    end;
+
+    -- The next index in row-major order: the last axis counts up and
+    -- carries into the one before it.
+    generic [R: Region, S: Region]
+    function nextIndex(index: &![Buffer[Index], R], dims: Span[Index, S]): Unit is
+        var axis: Index := spanLength(dims);
+        var carrying: Bool := true;
+        while carrying and (axis > 0) do
+            axis := axis - 1;
+            let next: Index := nthMut(&~index, axis) + 1;
+            if next < dims[axis] then
+                storeNth(&~index, axis, next);
+                carrying := false;
+            else
+                storeNth(&~index, axis, 0);
+            end if;
+        end while;
+        return nil;
+    end;
+
+    -- Both views broadcast to shape, walked together in row-major order.
+    generic [T: Free(Element, Numeric), R: Region, S: Region, Q: Region]
+    function combineViews(op: Nat8, a: &[View[T, R], S], b: &[View[T, R], S], shape: Span[Index, Q]): NdArray[T] is
+        let total: Index := shapeCount(shape);
+        var values: Buffer[T] := allocateEmpty();
+        var index: Buffer[Index] := initialize(spanLength(shape), 0);
+        var done: Index := 0;
+        while done < total do
+            let x: T := viewGet(a, wholeSpan(&index));
+            let y: T := viewGet(b, wholeSpan(&index));
+            insertBack(&!values, apply(op, x, y));
+            nextIndex(&!index, shape);
+            done := done + 1;
+        end while;
+        destroyFree(index);
+        let made: NdArray[T] := fromSpan(shape, wholeSpan(&values));
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function elementwise(op: Nat8, a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]] is
+        case broadcastShape(shapeOf(a), shapeOf(b)) of
+            when None do
+                let none: Option[NdArray[T]] := None();
+                return none;
+            when Some(value as shape: Buffer[Index]) do
+                let made: NdArray[T] := broadcastBoth(op, a, b, wholeSpan(&shape));
+                destroyFree(shape);
+                return Some(value => made);
+        end case;
+    end;
+
+    -- a and b as views under shape, which both broadcast to.
+    generic [T: Free(Element, Numeric), R: Region, S: Region, Q: Region]
+    function broadcastBoth(op: Nat8, a: &[NdArray[T], R], b: &[NdArray[T], S], shape: Span[Index, Q]): NdArray[T] is
+        let left: NdArray[T] := spread(a, shape);
+        let right: NdArray[T] := spread(b, shape);
+        let made: NdArray[T] := pairwise(op, &left, &right);
+        destroyArray(left);
+        destroyArray(right);
+        return made;
+    end;
+
+    -- A new array of shape with the elements of a repeated as broadcasting
+    -- repeats them.
+    generic [T: Free(Element), R: Region, Q: Region]
+    function spread(a: &[NdArray[T], R], shape: Span[Index, Q]): NdArray[T] is
+        let whole: View[T, R] := view(a);
+        case broadcastTo(&whole, shape) of
+            when Some(value as wide: View[T, R]) do
+                let made: NdArray[T] := copyOut(&wide, shape);
+                destroyView(wide);
+                destroyView(whole);
+                return made;
+            when None do
+                destroyView(whole);
+                abort("Mirco.Compute: a shape that broadcasting gave does not fit");
+        end case;
+    end;
+
+    generic [T: Free(Element), R: Region, S: Region, Q: Region]
+    function copyOut(seen: &[View[T, R], S], shape: Span[Index, Q]): NdArray[T] is
+        let total: Index := shapeCount(shape);
+        var values: Buffer[T] := allocateEmpty();
+        var index: Buffer[Index] := initialize(spanLength(shape), 0);
+        var done: Index := 0;
+        while done < total do
+            insertBack(&!values, viewGet(seen, wholeSpan(&index)));
+            nextIndex(&!index, shape);
+            done := done + 1;
+        end while;
+        destroyFree(index);
+        let made: NdArray[T] := fromSpan(shape, wholeSpan(&values));
+        destroyFree(values);
+        return made;
+    end;
+
+    -- Two arrays of the same count, element by element.
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function pairwise(op: Nat8, a: &[NdArray[T], R], b: &[NdArray[T], S]): NdArray[T] is
+        var values: Buffer[T] := allocateEmpty();
+        var at: Index := 0;
+        while at < count(a) do
+            insertBack(&!values, apply(op, flatGet(a, at), flatGet(b, at)));
+            at := at + 1;
+        end while;
+        let made: NdArray[T] := fromSpan(shapeOf(a), wholeSpan(&values));
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free]
+    function destroyArray(a: NdArray[T]): Unit is
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function add(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]] is
+        return elementwise(1, a, b);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function subtract(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]] is
+        return elementwise(2, a, b);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function multiply(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]] is
+        return elementwise(3, a, b);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function divide(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]] is
+        return elementwise(4, a, b);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function scalar(op: Nat8, a: &[NdArray[T], R], value: T): NdArray[T] is
+        var values: Buffer[T] := allocateEmpty();
+        var at: Index := 0;
+        while at < count(a) do
+            insertBack(&!values, apply(op, flatGet(a, at), value));
+            at := at + 1;
+        end while;
+        let made: NdArray[T] := fromSpan(shapeOf(a), wholeSpan(&values));
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function addScalar(a: &[NdArray[T], R], value: T): NdArray[T] is
+        return scalar(1, a, value);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function multiplyScalar(a: &[NdArray[T], R], value: T): NdArray[T] is
+        return scalar(3, a, value);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function sum(a: &[NdArray[T], R]): T is
+        var total: T := zeroElement();
+        var at: Index := 0;
+        while at < count(a) do
+            total := plus(total, flatGet(a, at));
+            at := at + 1;
+        end while;
+        return total;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function product(a: &[NdArray[T], R]): T is
+        var total: T := flatGet(a, 0);
+        var at: Index := 1;
+        while at < count(a) do
+            total := times(total, flatGet(a, at));
+            at := at + 1;
+        end while;
+        return total;
+    end;
+
+    -- The smallest element when smaller is true, else the largest; a NaN is
+    -- passed over unless every element is one.
+    generic [T: Free(Element, Numeric), R: Region]
+    function extreme(a: &[NdArray[T], R], smaller: Bool): T is
+        var best: T := flatGet(a, 0);
+        var at: Index := 1;
+        while at < count(a) do
+            let x: T := flatGet(a, at);
+            if isNaN(best) then
+                best := x;
+            else if not isNaN(x) then
+                if smaller and less(x, best) then
+                    best := x;
+                else if (not smaller) and less(best, x) then
+                    best := x;
+                end if;
+            end if;
+            at := at + 1;
+        end while;
+        return best;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function minimum(a: &[NdArray[T], R]): T is
+        return extreme(a, true);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function maximum(a: &[NdArray[T], R]): T is
+        return extreme(a, false);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function mean(a: &[NdArray[T], R]): T is
+        let n: T := fromCount(count(a));
+        return dividedBy(sum(a), n);
+    end;
+
+    -- x joined to best by the reduction of code reduction: 1 sum, 2 the
+    -- smaller, 3 the larger, 4 product.  The smaller and the larger pass a
+    -- NaN over unless both are one, as extreme does.
+    generic [T: Free(Numeric)]
+    function joined(reduction: Nat8, best: T, x: T): T is
+        if reduction = 1 then
+            return plus(best, x);
+        else if reduction = 4 then
+            return times(best, x);
+        end if;
+        if isNaN(best) then
+            return x;
+        else if isNaN(x) then
+            return best;
+        else if (reduction = 2) and less(x, best) then
+            return x;
+        else if (reduction = 3) and less(best, x) then
+            return x;
+        end if;
+        return best;
+    end;
+
+    -- The reduction of code reduction along axis.  A sum starts from the
+    -- zero of the type, as sum does; the others start from the first
+    -- element along the axis, as product and extreme do.
+    generic [T: Free(Element, Numeric), R: Region]
+    function reduceAxis(reduction: Nat8, a: &[NdArray[T], R], axis: Index): NdArray[T] is
+        let shape: Span[Index, R] := shapeOf(a);
+        var out_shape: Buffer[Index] := allocateEmpty();
+        var d: Index := 0;
+        while d < spanLength(shape) do
+            if d /= axis then
+                insertBack(&!out_shape, shape[d]);
+            end if;
+            d := d + 1;
+        end while;
+        if length(&out_shape) = 0 then
+            insertBack(&!out_shape, 1);
+        end if;
+        let zero: T := zeroElement();
+        var sums: Buffer[T] := initialize(shapeCount(wholeSpan(&out_shape)), zero);
+        var index: Buffer[Index] := initialize(spanLength(shape), 0);
+        var at: Index := 0;
+        while at < count(a) do
+            -- The position of the index without its axis, in row-major order.
+            var target: Index := 0;
+            var k: Index := 0;
+            while k < spanLength(shape) do
+                if k /= axis then
+                    target := (target * shape[k]) + nth(&index, k);
+                end if;
+                k := k + 1;
+            end while;
+            if (reduction /= 1) and (nth(&index, axis) = 0) then
+                storeNth(&!sums, target, flatGet(a, at));
+            else
+                let before: T := nth(&sums, target);
+                storeNth(&!sums, target, joined(reduction, before, flatGet(a, at)));
+            end if;
+            nextIndex(&!index, shape);
+            at := at + 1;
+        end while;
+        destroyFree(index);
+        let made: NdArray[T] := fromSpan(wholeSpan(&out_shape), wholeSpan(&sums));
+        destroyFree(out_shape);
+        destroyFree(sums);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function sumAxis(a: &[NdArray[T], R], axis: Index): NdArray[T] is
+        return reduceAxis(1, a, axis);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function productAxis(a: &[NdArray[T], R], axis: Index): NdArray[T] is
+        return reduceAxis(4, a, axis);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function minimumAxis(a: &[NdArray[T], R], axis: Index): NdArray[T] is
+        return reduceAxis(2, a, axis);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function maximumAxis(a: &[NdArray[T], R], axis: Index): NdArray[T] is
+        return reduceAxis(3, a, axis);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function meanAxis(a: &[NdArray[T], R], axis: Index): NdArray[T] is
+        let sums: NdArray[T] := reduceAxis(1, a, axis);
+        let made: NdArray[T] := meanOfSums(&sums, dimension(a, axis));
+        destroyNdArray(sums);
+        return made;
+    end;
+
+    function reductionSum(): Nat8 is
+        return 1;
+    end;
+
+    function reductionMinimum(): Nat8 is
+        return 2;
+    end;
+
+    function reductionMaximum(): Nat8 is
+        return 3;
+    end;
+
+    function reductionProduct(): Nat8 is
+        return 4;
+    end;
+
+    generic [T: Free(Element, Numeric)]
+    function combineValues(first: T, second: T, reduction: Nat8): T is
+        return joined(reduction, first, second);
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function sameShape(first: &[NdArray[T], R], second: &[NdArray[T], S]): Bool is
+        if rank(first) /= rank(second) then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < rank(first) do
+            if dimension(first, axis) /= dimension(second, axis) then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function combine(first: &[NdArray[T], R], second: &[NdArray[T], S], reduction: Nat8): Option[NdArray[T]] is
+        if not sameShape(first, second) then
+            let none: Option[NdArray[T]] := None();
+            return none;
+        end if;
+        var values: Buffer[T] := allocateEmpty();
+        var at: Index := 0;
+        while at < count(first) do
+            insertBack(&!values, joined(reduction, flatGet(first, at), flatGet(second, at)));
+            at := at + 1;
+        end while;
+        let made: NdArray[T] := fromSpan(shapeOf(first), wholeSpan(&values));
+        destroyFree(values);
+        let some: Option[NdArray[T]] := Some(value => made);
+        return some;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function meanOfSums(sums: &[NdArray[T], R], total: Index): NdArray[T] is
+        let n: T := fromCount(total);
+        var values: Buffer[T] := allocateEmpty();
+        var at: Index := 0;
+        while at < count(sums) do
+            insertBack(&!values, dividedBy(flatGet(sums, at), n));
+            at := at + 1;
+        end while;
+        let made: NdArray[T] := fromSpan(shapeOf(sums), wholeSpan(&values));
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function dot(a: &[NdArray[T], R], b: &[NdArray[T], S]): T is
+        var total: T := zeroElement();
+        var at: Index := 0;
+        while at < count(a) do
+            total := plus(total, times(flatGet(a, at), flatGet(b, at)));
+            at := at + 1;
+        end while;
+        return total;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function transpose(a: &[NdArray[T], R]): NdArray[T] is
+        let rows: Index := dimension(a, 0);
+        let cols: Index := dimension(a, 1);
+        var values: Buffer[T] := allocateEmpty();
+        var j: Index := 0;
+        while j < cols do
+            var i: Index := 0;
+            while i < rows do
+                insertBack(&!values, flatGet(a, (i * cols) + j));
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, cols);
+        insertBack(&!shape, rows);
+        let made: NdArray[T] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function matvec(m: &[NdArray[T], R], x: &[NdArray[T], S]): NdArray[T] is
+        let rows: Index := dimension(m, 0);
+        let cols: Index := dimension(m, 1);
+        if cols /= count(x) then
+            abort("Mirco.Compute: the columns of the matrix are not the length of the vector");
+        end if;
+        var values: Buffer[T] := allocateEmpty();
+        var i: Index := 0;
+        while i < rows do
+            var total: T := zeroElement();
+            var p: Index := 0;
+            while p < cols do
+                total := plus(total, times(flatGet(m, (i * cols) + p), flatGet(x, p)));
+                p := p + 1;
+            end while;
+            insertBack(&!values, total);
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        let made: NdArray[T] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function matmul(a: &[NdArray[T], R], b: &[NdArray[T], S]): NdArray[T] is
+        let n: Index := dimension(a, 0);
+        let k: Index := dimension(a, 1);
+        let m: Index := dimension(b, 1);
+        if k /= dimension(b, 0) then
+            abort("Mirco.Compute: the columns of the first matrix are not the rows of the second");
+        end if;
+        var values: Buffer[T] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            var j: Index := 0;
+            while j < m do
+                var total: T := zeroElement();
+                var p: Index := 0;
+                while p < k do
+                    total := plus(total, times(flatGet(a, (i * k) + p), flatGet(b, (p * m) + j)));
+                    p := p + 1;
+                end while;
+                insertBack(&!values, total);
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        insertBack(&!shape, m);
+        let made: NdArray[T] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region, Q: Region]
+    function gemv(alpha: T, m: &[NdArray[T], R], x: &[NdArray[T], S], beta: T, y: &![NdArray[T], Q]): Unit is
+        let made: NdArray[T] := matvec(m, x);
+        if count(&made) /= countMut(&~y) then
+            abort("Mirco.Compute: the rows of the matrix are not the length of y");
+        end if;
+        var at: Index := 0;
+        while at < count(&made) do
+            let old: T := flatGetMut(&~y, at);
+            flatSet(&~y, at, plus(times(alpha, flatGet(&made, at)), times(beta, old)));
+            at := at + 1;
+        end while;
+        destroyArray(made);
+        return nil;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region, Q: Region]
+    function gemm(alpha: T, a: &[NdArray[T], R], b: &[NdArray[T], S], beta: T, c: &![NdArray[T], Q]): Unit is
+        let made: NdArray[T] := matmul(a, b);
+        if count(&made) /= countMut(&~c) then
+            abort("Mirco.Compute: the product has another shape than c");
+        end if;
+        var at: Index := 0;
+        while at < count(&made) do
+            let old: T := flatGetMut(&~c, at);
+            flatSet(&~c, at, plus(times(alpha, flatGet(&made, at)), times(beta, old)));
+            at := at + 1;
+        end while;
+        destroyArray(made);
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,313 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A unit is a record of one field that nothing reads: its type is all
+-- that counts, and a quantity keeps one beside its number, so that the
+-- methods of SiUnit have a value of the unit to be called on.
+import Standard.String (String, asSpan, destroyString);
+import Standard.StringBuilder (StringBuilder, makeStringBuilder, writeByte, writeString, finalize);
+import Mirco.Text (formatFloat64);
+
+module body Mirco.Units is
+    record Meter: Free is
+        mark: Bool;
+    end;
+
+    record Second: Free is
+        mark: Bool;
+    end;
+
+    record Kilogram: Free is
+        mark: Bool;
+    end;
+
+    record Ampere: Free is
+        mark: Bool;
+    end;
+
+    record Kelvin: Free is
+        mark: Bool;
+    end;
+
+    record SquareMeter: Free is
+        mark: Bool;
+    end;
+
+    record CubicMeter: Free is
+        mark: Bool;
+    end;
+
+    record MeterPerSecond: Free is
+        mark: Bool;
+    end;
+
+    record MeterPerSecondSquared: Free is
+        mark: Bool;
+    end;
+
+    record Newton: Free is
+        mark: Bool;
+    end;
+
+    record Joule: Free is
+        mark: Bool;
+    end;
+
+    record Watt: Free is
+        mark: Bool;
+    end;
+
+    record Pascal: Free is
+        mark: Bool;
+    end;
+
+    record Hertz: Free is
+        mark: Bool;
+    end;
+
+    record Coulomb: Free is
+        mark: Bool;
+    end;
+
+    record Volt: Free is
+        mark: Bool;
+    end;
+
+    record Ohm: Free is
+        mark: Bool;
+    end;
+
+    record KilogramPerCubicMeter: Free is
+        mark: Bool;
+    end;
+
+    instance SiUnit(Meter) is
+        method symbol(unit: Meter): Span[Nat8, Static] is
+            return "m";
+        end;
+    end;
+
+    instance SiUnit(Second) is
+        method symbol(unit: Second): Span[Nat8, Static] is
+            return "s";
+        end;
+    end;
+
+    instance SiUnit(Kilogram) is
+        method symbol(unit: Kilogram): Span[Nat8, Static] is
+            return "kg";
+        end;
+    end;
+
+    instance SiUnit(Ampere) is
+        method symbol(unit: Ampere): Span[Nat8, Static] is
+            return "A";
+        end;
+    end;
+
+    instance SiUnit(Kelvin) is
+        method symbol(unit: Kelvin): Span[Nat8, Static] is
+            return "K";
+        end;
+    end;
+
+    instance SiUnit(SquareMeter) is
+        method symbol(unit: SquareMeter): Span[Nat8, Static] is
+            return "m^2";
+        end;
+    end;
+
+    instance SiUnit(CubicMeter) is
+        method symbol(unit: CubicMeter): Span[Nat8, Static] is
+            return "m^3";
+        end;
+    end;
+
+    instance SiUnit(MeterPerSecond) is
+        method symbol(unit: MeterPerSecond): Span[Nat8, Static] is
+            return "m/s";
+        end;
+    end;
+
+    instance SiUnit(MeterPerSecondSquared) is
+        method symbol(unit: MeterPerSecondSquared): Span[Nat8, Static] is
+            return "m/s^2";
+        end;
+    end;
+
+    instance SiUnit(Newton) is
+        method symbol(unit: Newton): Span[Nat8, Static] is
+            return "N";
+        end;
+    end;
+
+    instance SiUnit(Joule) is
+        method symbol(unit: Joule): Span[Nat8, Static] is
+            return "J";
+        end;
+    end;
+
+    instance SiUnit(Watt) is
+        method symbol(unit: Watt): Span[Nat8, Static] is
+            return "W";
+        end;
+    end;
+
+    instance SiUnit(Pascal) is
+        method symbol(unit: Pascal): Span[Nat8, Static] is
+            return "Pa";
+        end;
+    end;
+
+    instance SiUnit(Hertz) is
+        method symbol(unit: Hertz): Span[Nat8, Static] is
+            return "Hz";
+        end;
+    end;
+
+    instance SiUnit(Coulomb) is
+        method symbol(unit: Coulomb): Span[Nat8, Static] is
+            return "C";
+        end;
+    end;
+
+    instance SiUnit(Volt) is
+        method symbol(unit: Volt): Span[Nat8, Static] is
+            return "V";
+        end;
+    end;
+
+    instance SiUnit(Ohm) is
+        method symbol(unit: Ohm): Span[Nat8, Static] is
+            return "Ohm";
+        end;
+    end;
+
+    instance SiUnit(KilogramPerCubicMeter) is
+        method symbol(unit: KilogramPerCubicMeter): Span[Nat8, Static] is
+            return "kg/m^3";
+        end;
+    end;
+
+    record Quantity[U: Free]: Free is
+        value: Float64;
+        unit: U;
+    end;
+
+    generic [U: Free]
+    function valueOf(q: Quantity[U]): Float64 is
+        return q.value;
+    end;
+
+    generic [U: Free]
+    function add(a: Quantity[U], b: Quantity[U]): Quantity[U] is
+        return Quantity(value => a.value + b.value, unit => a.unit);
+    end;
+
+    generic [U: Free]
+    function subtract(a: Quantity[U], b: Quantity[U]): Quantity[U] is
+        return Quantity(value => a.value - b.value, unit => a.unit);
+    end;
+
+    generic [U: Free]
+    function scale(a: Quantity[U], factor: Float64): Quantity[U] is
+        return Quantity(value => a.value * factor, unit => a.unit);
+    end;
+
+    generic [U: Free]
+    function ratio(a: Quantity[U], b: Quantity[U]): Float64 is
+        return a.value / b.value;
+    end;
+
+    generic [U: Free]
+    function less(a: Quantity[U], b: Quantity[U]): Bool is
+        return a.value < b.value;
+    end;
+
+    generic [U: Free(SiUnit)]
+    function format(q: Quantity[U]): String is
+        var b: StringBuilder := makeStringBuilder();
+        let number: String := formatFloat64(q.value);
+        writeString(&!b, asSpan(&number));
+        destroyString(number);
+        writeByte(&!b, 32);
+        writeString(&!b, symbol(q.unit));
+        return finalize(b);
+    end;
+
+    function meters(v: Float64): Quantity[Meter] is
+        return Quantity(value => v, unit => Meter(mark => false));
+    end;
+
+    function seconds(v: Float64): Quantity[Second] is
+        return Quantity(value => v, unit => Second(mark => false));
+    end;
+
+    function kilograms(v: Float64): Quantity[Kilogram] is
+        return Quantity(value => v, unit => Kilogram(mark => false));
+    end;
+
+    function amperes(v: Float64): Quantity[Ampere] is
+        return Quantity(value => v, unit => Ampere(mark => false));
+    end;
+
+    function kelvins(v: Float64): Quantity[Kelvin] is
+        return Quantity(value => v, unit => Kelvin(mark => false));
+    end;
+
+    function area(a: Quantity[Meter], b: Quantity[Meter]): Quantity[SquareMeter] is
+        return Quantity(value => a.value * b.value, unit => SquareMeter(mark => false));
+    end;
+
+    function volume(a: Quantity[SquareMeter], b: Quantity[Meter]): Quantity[CubicMeter] is
+        return Quantity(value => a.value * b.value, unit => CubicMeter(mark => false));
+    end;
+
+    function velocity(d: Quantity[Meter], t: Quantity[Second]): Quantity[MeterPerSecond] is
+        return Quantity(value => d.value / t.value, unit => MeterPerSecond(mark => false));
+    end;
+
+    function acceleration(v: Quantity[MeterPerSecond], t: Quantity[Second]): Quantity[MeterPerSecondSquared] is
+        return Quantity(value => v.value / t.value, unit => MeterPerSecondSquared(mark => false));
+    end;
+
+    function force(m: Quantity[Kilogram], a: Quantity[MeterPerSecondSquared]): Quantity[Newton] is
+        return Quantity(value => m.value * a.value, unit => Newton(mark => false));
+    end;
+
+    function work(f: Quantity[Newton], d: Quantity[Meter]): Quantity[Joule] is
+        return Quantity(value => f.value * d.value, unit => Joule(mark => false));
+    end;
+
+    function powerOf(e: Quantity[Joule], t: Quantity[Second]): Quantity[Watt] is
+        return Quantity(value => e.value / t.value, unit => Watt(mark => false));
+    end;
+
+    function pressure(f: Quantity[Newton], a: Quantity[SquareMeter]): Quantity[Pascal] is
+        return Quantity(value => f.value / a.value, unit => Pascal(mark => false));
+    end;
+
+    function frequency(events: Float64, t: Quantity[Second]): Quantity[Hertz] is
+        return Quantity(value => events / t.value, unit => Hertz(mark => false));
+    end;
+
+    function charge(i: Quantity[Ampere], t: Quantity[Second]): Quantity[Coulomb] is
+        return Quantity(value => i.value * t.value, unit => Coulomb(mark => false));
+    end;
+
+    function voltage(p: Quantity[Watt], i: Quantity[Ampere]): Quantity[Volt] is
+        return Quantity(value => p.value / i.value, unit => Volt(mark => false));
+    end;
+
+    function resistance(u: Quantity[Volt], i: Quantity[Ampere]): Quantity[Ohm] is
+        return Quantity(value => u.value / i.value, unit => Ohm(mark => false));
+    end;
+
+    function density(m: Quantity[Kilogram], v: Quantity[CubicMeter]): Quantity[KilogramPerCubicMeter] is
+        return Quantity(value => m.value / v.value, unit => KilogramPerCubicMeter(mark => false));
+    end;
+end module body.

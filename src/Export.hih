@@ -1,0 +1,56 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Functions of Mirco callable from C and so from Python through ctypes, over vectors given as bytes.
+
+- A vector crosses as its bytes, each Float64 eight bytes little endian, as numpy.ndarray.tobytes writes them.
+- A count of bytes that is no multiple of 8, or two vectors of different lengths, give a NaN rather than a guess.
+- A result is written into memory of the caller, which must be as large as the result; every index is checked.
+
+    let d: Float64 := dotBytes(a, b);
+"""
+module Mirco.Export is
+    """
+    The dot product of two vectors of the same length; a NaN for bytes that are no such vectors.
+    No contract: no precondition, since bytes that are no two vectors of the same length give a NaN; a C caller gets the NaN, never a stop.
+    """
+    generic [R: Region, S: Region]
+    function dotBytes(a: Span[Nat8, R], b: Span[Nat8, S]): Float64;
+
+    """
+    The mean of a vector; a NaN for no element or bytes that are no vector.
+    No contract: no precondition, since bytes that are no vector give a NaN; a C caller gets the NaN, never a stop.
+    """
+    generic [R: Region]
+    function meanBytes(values: Span[Nat8, R]): Float64;
+
+    """
+    The standard deviation of a vector with ddof; a NaN where there are not more elements than ddof.
+    No contract: no precondition, since bytes that are no vector, or not more elements than ddof, give a NaN; a C caller gets the NaN, never a stop.
+    """
+    generic [R: Region]
+    function deviationBytes(values: Span[Nat8, R], ddof: Index): Float64;
+
+    """
+    Writes the product of the matrix a of rows by inner and b of inner by cols into out, row-major; false,
+    and nothing written, when the length of a or b does not fit.  out must hold at least 8 times rows times
+    cols bytes.  True only for rows, inner and cols above 0 and a and b of 8 times rows times inner and
+    8 times inner times cols bytes.
+    No contract: no requires on the length of out, at least 8 times rows times cols bytes, since a condition reads no writable span: spanWriteLength(out) is refused (H3097), spanLength(out) too (H3060).
+    Until then the check of every index stops the programme with "Array index out of bounds." at the first
+    byte beyond a shorter out, and nothing beyond it is written. The check of conditions refuses every part
+    of a writable type (check_condition in Hilde's lib/Contracts.ml), so a requires on out needs another
+    signature, which the lead of the project decides.
+    Gap: 8 times rows times inner, 8 times inner times cols and 8 times rows times cols must fit into an
+    Index; rows of 2 to the 62 stop the programme with an Overflow before false, as for a C caller.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function matmulBytes(a: Span[Nat8, R], b: Span[Nat8, S], rows: Index, inner: Index, cols: Index, out: Span![Nat8, Q]): Bool
+        ensures (not result) or ((rows > 0) and (inner > 0) and (cols > 0))
+        ensures (not result) or ((spanLength(a) = (8 * (rows * inner))) and (spanLength(b) = (8 * (inner * cols))));
+end module.

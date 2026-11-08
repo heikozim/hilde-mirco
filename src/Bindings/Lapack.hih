@@ -1,0 +1,92 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the routines of Lapack and Blas in the library mircoblis that the package mirco-blis builds.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.Lapack is the safe module built on it, and the one a programme imports.
+- Each function is the routine of the same name, matrices in column-major order; info comes back and stands in info[0].
+
+    let result: Int32 := gesv(n, 1, a, pivots, b, info);
+"""
+module Mirco.Bindings.Lapack is
+    """
+    dgesv: solves a x = b for the n by n matrix a and nrhs columns of b; a and b are overwritten.
+    No contract: a binding to C; its caller Mirco.Lapack.solve states the contract (a square a and a b of as many rows) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region, I: Region]
+    function gesv(n: Int32, nrhs: Int32, a: Span![Float64, R], pivots: Span![Int32, S], b: Span![Float64, Q], info: Span![Int32, I]): Int32;
+
+    """
+    dgetrf: the factors with partial pivoting of the m by n matrix a, in place.
+    No contract: a binding to C; its caller Mirco.Lapack.determinant states the contract (a square a) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, I: Region]
+    function getrf(m: Int32, n: Int32, a: Span![Float64, R], pivots: Span![Int32, S], info: Span![Int32, I]): Int32;
+
+    """
+    dpotrf: the lower Cholesky factor of the n by n matrix a, in place.
+    No contract: a binding to C; its caller Mirco.Lapack.cholesky states the contract (a square a) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, I: Region]
+    function potrf(n: Int32, a: Span![Float64, R], info: Span![Int32, I]): Int32;
+
+    """
+    dgeqrf: the QR factors of the m by n matrix a in place and the scalars tau; work has lwork elements,
+    and lwork -1 asks for the best size in work[0].
+    No contract: a binding to C; its caller Mirco.Lapack.qr states the contract (an a with at least as many rows as columns) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region, I: Region]
+    function geqrf(m: Int32, n: Int32, a: Span![Float64, R], tau: Span![Float64, S], work: Span![Float64, Q], lwork: Int32, info: Span![Int32, I]): Int32;
+
+    """
+    dorgqr: the m by n matrix q of k reflections from dgeqrf, in place.
+    No contract: a binding to C; its caller Mirco.Lapack.qr states the contract (an a with at least as many rows as columns) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region, I: Region]
+    function orgqr(m: Int32, n: Int32, k: Int32, a: Span![Float64, R], tau: Span![Float64, S], work: Span![Float64, Q], lwork: Int32, info: Span![Int32, I]): Int32;
+
+    """
+    dsyevd with jobz V and uplo L: the eigenvalues of the symmetric n by n matrix a in ascending order into
+    w and its eigenvectors into a.
+    No contract: a binding to C; its caller Mirco.Lapack.eigenSymmetric states the contract (a square a) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region, P: Region, I: Region]
+    function syevd(n: Int32, a: Span![Float64, R], w: Span![Float64, S], work: Span![Float64, Q], lwork: Int32, iwork: Span![Int32, P], liwork: Int32, info: Span![Int32, I]): Int32;
+
+    """
+    dgesdd with jobz S: the thin singular value decomposition of the m by n matrix a; lwork is the length of
+    work, and a work of one element asks for the best size in work[0].
+    No contract: a binding to C; its caller Mirco.Lapack.svd states the contract (an a with at least as many rows as columns) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region, P: Region, O: Region, N: Region, I: Region]
+    function gesdd(m: Int32, n: Int32, a: Span![Float64, R], s: Span![Float64, S], u: Span![Float64, Q], vt: Span![Float64, P], work: Span![Float64, O], iwork: Span![Int32, N], info: Span![Int32, I]): Int32;
+
+    """
+    dgelsd: the x of least squares for the m by n matrix a and one column b of max(m, n) rows, with rcond -1;
+    info into info[0] and the rank of a into info[1]; lwork is the length of work, and a work of one element
+    asks for the best size in work[0].
+    No contract: a binding to C; its caller Mirco.Lapack.lstsq states the contract (a b of as many rows as a) and sizes every span it passes. The body gives -1000 and calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region, O: Region, N: Region, I: Region]
+    function gelsd(m: Int32, n: Int32, a: Span![Float64, R], b: Span![Float64, S], s: Span![Float64, Q], work: Span![Float64, O], iwork: Span![Int32, N], info: Span![Int32, I]): Int32;
+
+    """
+    dgemm without transposes: c = a b for a m by k, b k by n and c m by n.
+    No contract: a binding to C; its caller Mirco.Lapack.matmul states the contract (as many columns of a as rows of b) and sizes every span it passes. The body calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function gemm(m: Int32, n: Int32, k: Int32, a: Span[Float64, R], b: Span[Float64, S], c: Span![Float64, Q]): Unit;
+
+    """
+    dgemm without transposes, scaled: c = alpha a b + beta c for a m by k, b k by n and c m by n.
+    No contract: a binding to C; its callers Mirco.Lapack.dot, matvec, gemv and gemm state the contract (as many columns of a as rows of b, a c of the rows of a and the columns of b) and size every span they pass. The body calls no routine when a dimension is below 1 or a span is shorter than the routine touches.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function gemmScaled(m: Int32, n: Int32, k: Int32, alpha: Float64, a: Span[Float64, R], b: Span[Float64, S], beta: Float64, c: Span![Float64, Q]): Unit;
+end module.

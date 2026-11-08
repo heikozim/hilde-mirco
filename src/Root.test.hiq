@@ -1,0 +1,389 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan, getSpan, storeNth, length, nth);
+import Standard.String (String, asSpan, destroyString, length as stringLength);
+import Standard.Text (equal, contains);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    closeFile,
+    readAll,
+    environmentValue
+);
+import Mirco.Root (
+    RootFault,
+    RootError,
+    RootHeader,
+    RootKey,
+    readHeader,
+    readKeys,
+    className,
+    keyName,
+    objectBytes,
+    objString
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Root.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The file testdata/two-strings.root, which tools/make-root-files.py
+    -- writes: two keys of the class TObjString, the second compressed.
+    function twoStrings(): Buffer[Nat8] is
+        return fromHex("726f6f740000f2fe00000064000002bc0000000000000000000000000000007e040000006500000000000000000001000102030405060708090a0b0c0d0e0f00000000000000000000000000000000000000000000000000000000000000000000000000000000ba00040000006b7a9c2b40004f00010000006400000000055446696c651074776f2d737472696e67732e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f1074776f2d737472696e67732e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00057a9c2b407a9c2b40000000d30000007e0000006400000000000001e90001000102030405060708090a0b0c0d0e0f000000000000000000000000000000620004000000217a9c2b40004100010000011e000000640a544f626a537472696e67086772656574696e6712636f6c6c65637461626c6520737472696e674000001d0001000100000000030000001068656c6c6f2066726f6d2061206b65790000006900040000026d7a9c2b40003f000100000180000000640a544f626a537472696e67067061636b656412636f6c6c65637461626c6520737472696e675a4c082100006d0200789c736060ca64600442206006e2ff0c0c4c118949c9a36814511d01008573e7ba000000d30004000000847a9c2b40004f0001000001e900000064055446696c651074776f2d737472696e67732e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00000002000000620004000000217a9c2b40004100010000011e000000640a544f626a537472696e67086772656574696e6712636f6c6c65637461626c6520737472696e670000006900040000026d7a9c2b40003f000100000180000000640a544f626a537472696e67067061636b656412636f6c6c65637461626c6520737472696e67");
+    end;
+
+    -- The offset of the block of zlib in that file.
+    constant packed_at: Index := 447;
+
+    -- The file testdata/three-strings.root: the same two keys and a third,
+    -- fast, whose block is of LZ4, at the offset fastAt.
+    function threeStrings(): Buffer[Nat8] is
+        return fromHex("726f6f740000f2fe000000640000037200000000000000000000000000000082040000006500000000000000000001000102030405060708090a0b0c0d0e0f00000000000000000000000000000000000000000000000000000000000000000000000000000000be00040000006d7a9c2b40005100010000006400000000055446696c651274687265652d737472696e67732e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f1274687265652d737472696e67732e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00057a9c2b407a9c2b4000000112000000820000006400000000000002600001000102030405060708090a0b0c0d0e0f000000000000000000000000000000620004000000217a9c2b400041000100000122000000640a544f626a537472696e67086772656574696e6712636f6c6c65637461626c6520737472696e674000001d0001000100000000030000001068656c6c6f2066726f6d2061206b65790000006900040000026d7a9c2b40003f000100000184000000640a544f626a537472696e67067061636b656412636f6c6c65637461626c6520737472696e675a4c082100006d0200789c736060ca64600442206006e2ff0c0c4c118949c9a36814511d01008573e7ba0000007300040000026d7a9c2b40003d0001000001ed000000640a544f626a537472696e67046661737412636f6c6c65637461626c6520737472696e674c34012d00006d02008b8010155c0a6582ff0940000269000100010000000003000000ff000002586162630300ffff3f506263616263000001120004000000c17a9c2b40005100010000026000000064055446696c651274687265652d737472696e67732e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00000003000000620004000000217a9c2b400041000100000122000000640a544f626a537472696e67086772656574696e6712636f6c6c65637461626c6520737472696e670000006900040000026d7a9c2b40003f000100000184000000640a544f626a537472696e67067061636b656412636f6c6c65637461626c6520737472696e670000007300040000026d7a9c2b40003d0001000001ed000000640a544f626a537472696e67046661737412636f6c6c65637461626c6520737472696e67");
+    end;
+
+    constant fast_at: Index := 554;
+
+    -- The file testdata/xz-string.root: one key, slow, whose block is of xz,
+    -- at the offset slowAt.
+    function xzString(): Buffer[Nat8] is
+        return fromHex("726f6f740000f2fe000000640000024a0000000000000000000000000000007a040000006500000000000000000001000102030405060708090a0b0c0d0e0f00000000000000000000000000000000000000000000000000000000000000000000000000000000b60004000000697a9c2b40004d00010000006400000000055446696c650e787a2d737472696e672e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f0e787a2d737472696e672e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00057a9c2b407a9c2b400000008e0000007a0000006400000000000001bc0001000102030405060708090a0b0c0d0e0f000000000000000000000000000000a200040000026d7a9c2b40003d00010000011a000000640a544f626a537472696e6704736c6f7712636f6c6c65637461626c6520737472696e67585a015c00006d0200fd377a585a0000016922de360200210116000000742fe5a3e0026c001d5d001ffffc46f22b03bf2a75b47cbb85e537cb144d4fbeda35e95812752000000000000c7b8edf000135ed04000000fad6c4c83e300d8b020000000001595a0000008e0004000000417a9c2b40004d0001000001bc00000064055446696c650e787a2d737472696e672e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00000001000000a200040000026d7a9c2b40003d00010000011a000000640a544f626a537472696e6704736c6f7712636f6c6c65637461626c6520737472696e67");
+    end;
+
+    constant slow_at: Index := 343;
+
+    -- The file testdata/zstd-string.root: one key, zipped, whose block is of
+    -- Zstandard, at the offset zippedAt.
+    function zstdString(): Buffer[Nat8] is
+        return fromHex("726f6f740000f2fe00000064000002240000000000000000000000000000007e040000006500000000000000000001000102030405060708090a0b0c0d0e0f00000000000000000000000000000000000000000000000000000000000000000000000000000000ba00040000006b7a9c2b40004f00010000006400000000055446696c65107a7374642d737472696e672e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f107a7374642d737472696e672e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f00057a9c2b407a9c2b40000000920000007e0000006400000000000001920001000102030405060708090a0b0c0d0e0f0000000000000000000000000000007400040000026d7a9c2b40003f00010000011e000000640a544f626a537472696e67067a697070656412636f6c6c65637461626c6520737472696e675a53012c00006d020028b52ffd0458fd0000c040000269000100010000000003000000ff00000258616263010048b172636bce9c18000000920004000000437a9c2b40004f00010000019200000064055446696c65107a7374642d737472696e672e726f6f741d612066696c6520666f7220746865207465737473206f66204d6972636f000000010000007400040000026d7a9c2b40003f00010000011e000000640a544f626a537472696e67067a697070656412636f6c6c65637461626c6520737472696e67");
+    end;
+
+    constant zipped_at: Index := 349;
+
+    function nibble(c: Nat8): Nat8 is
+        if (c >= 48) and (c <= 57) then
+            return c - 48;
+        else if (c >= 97) and (c <= 102) then
+            return c - 87;
+        end if;
+        abort("Mirco.Root.Test: a vector holds a character that is no hex digit");
+    end;
+
+    function fromHex(text: Span[Nat8, Static]): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 0;
+        while (at + 1) < spanLength(text) do
+            let high: Nat8 := nibble(text[at]);
+            let low: Nat8 := nibble(text[at + 1]);
+            insertBack(&!out, (high * 16) + low);
+            at := at + 2;
+        end while;
+        return out;
+    end;
+
+    function code(fault: RootFault): Int32 is
+        case fault of
+            when NotRoot do
+                return 1;
+            when Truncated do
+                return 2;
+            when BadOffset do
+                return 3;
+            when BadString do
+                return 4;
+            when BadCompression do
+                return 5;
+            when UnknownCompression do
+                return 6;
+            when TooLarge do
+                return 7;
+            when BadObject do
+                return 8;
+            when UnknownVersion do
+                return 9;
+            when BadChecksum do
+                return 10;
+        end case;
+    end;
+
+    -- The text of the TObjString of key k of the file, or the code of the
+    -- refusal as one byte, the digit of the code.
+    generic [R: Region]
+    function textOf(file: &[Buffer[Nat8], R], k: Index, limit: Index): Int32 is
+        let bytes: Span[Nat8, R] := wholeSpan(file);
+        case readHeader(bytes) of
+            when Left(left as e: RootError) do
+                return code(e.fault);
+            when Right(right as h: RootHeader) do
+                case readKeys(bytes, h) of
+                    when Left(left as e: RootError) do
+                        return code(e.fault);
+                    when Right(right as keys: Buffer[RootKey]) do
+                        let key: RootKey := nth(&keys, k);
+                        destroyFree(keys);
+                        case objectBytes(bytes, key, limit) of
+                            when Left(left as e: RootError) do
+                                return code(e.fault);
+                            when Right(right as object: String) do
+                                case objString(asSpan(&object)) of
+                                    when Left(left as e: RootError) do
+                                        destroyString(object);
+                                        return code(e.fault);
+                                    when Right(right as text: String) do
+                                        destroyString(object);
+                                        var result: Int32 := 0;
+                                        if equal(asSpan(&text), "hello from a key") then
+                                            result := 100;
+                                        end if;
+                                        if (stringLength(&text) = 600) and equal(spanPart(asSpan(&text), 594, 6), "abcabc") then
+                                            result := 200;
+                                        end if;
+                                        destroyString(text);
+                                        return result;
+                                end case;
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function testHeaderAndKeys(): Unit is
+        let file: Buffer[Nat8] := twoStrings();
+        case readHeader(wholeSpan(&file)) of
+            when Right(right as h: RootHeader) do
+                assertTrue((h.version = 62206) and (h.begin = 100) and (h.finish = 700), "version, begin, end");
+                assertTrue((h.compression = 101) and (not h.large), "zlib at level 1, small offsets");
+                case readKeys(wholeSpan(&file), h) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        assertTrue(length(&keys) = 2, "two keys");
+                        let first: RootKey := nth(&keys, 0);
+                        let second: RootKey := nth(&keys, 1);
+                        assertTrue(equal(keyName(wholeSpan(&file), first), "greeting"), "the first name");
+                        assertTrue(equal(keyName(wholeSpan(&file), second), "packed"), "the second name");
+                        assertTrue(equal(className(wholeSpan(&file), second), "TObjString"), "the class");
+                        assertTrue((second.objectLength > (second.nbytes - second.keyLength)), "the second is compressed");
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        assertTrue(false, "the keys are read");
+                end case;
+            when Left(left as e: RootError) do
+                assertTrue(false, "the header is read");
+        end case;
+        destroyFree(file);
+        return nil;
+    end;
+
+    function testObjects(): Unit is
+        let file: Buffer[Nat8] := twoStrings();
+        assertTrue(textOf(&file, 0, 1000) = 100, "the stored string");
+        assertTrue(textOf(&file, 1, 1000) = 200, "the compressed string, 600 bytes");
+        assertTrue(textOf(&file, 1, 100) = 7, "above the limit");
+        destroyFree(file);
+        return nil;
+    end;
+
+    function testLz4(): Unit is
+        let file: Buffer[Nat8] := threeStrings();
+        assertTrue(textOf(&file, 2, 1000) = 200, "the string of 600 bytes from a block of LZ4");
+        assertTrue(textOf(&file, 1, 1000) = 200, "and the same from zlib");
+        var sum: Buffer[Nat8] := threeStrings();
+        let flipped: Nat8 := nth(&sum, fast_at + 12) + 1;
+        storeNth(&!sum, fast_at + 12, flipped);
+        assertTrue(textOf(&sum, 2, 1000) = 5, "a changed byte of the checksum");
+        var cut: Buffer[Nat8] := threeStrings();
+        let shorter: Nat8 := nth(&cut, fast_at + 6) - 1;
+        storeNth(&!cut, fast_at + 6, shorter);
+        assertTrue(textOf(&cut, 2, 1000) = 5, "an unpacked length that is not the one of the block");
+        destroyFree(file);
+        destroyFree(sum);
+        destroyFree(cut);
+        return nil;
+    end;
+
+    function testXz(): Unit is
+        let file: Buffer[Nat8] := xzString();
+        assertTrue(textOf(&file, 0, 1000) = 200, "the string of 600 bytes from a block of xz");
+        var changed: Buffer[Nat8] := xzString();
+        let b: Nat8 := nth(&changed, slow_at + 40) + 1;
+        storeNth(&!changed, slow_at + 40, b);
+        assertTrue(textOf(&changed, 0, 1000) = 5, "a changed byte of the stream");
+        destroyFree(file);
+        destroyFree(changed);
+        return nil;
+    end;
+
+    function testZstd(): Unit is
+        let file: Buffer[Nat8] := zstdString();
+        assertTrue(textOf(&file, 0, 1000) = 200, "the string of 600 bytes from a block of Zstandard");
+        var changed: Buffer[Nat8] := zstdString();
+        let b: Nat8 := nth(&changed, zipped_at + 12) + 1;
+        storeNth(&!changed, zipped_at + 12, b);
+        assertTrue(textOf(&changed, 0, 1000) = 5, "a changed byte of the frame");
+        destroyFree(file);
+        destroyFree(changed);
+        return nil;
+    end;
+
+    function testRefusals(): Unit is
+        var magic: Buffer[Nat8] := twoStrings();
+        storeNth(&!magic, 0, 82);
+        assertTrue(textOf(&magic, 0, 1000) = 1, "another magic");
+        var stream: Buffer[Nat8] := twoStrings();
+        let changed: Nat8 := nth(&stream, packed_at + 20) + 1;
+        storeNth(&!stream, packed_at + 20, changed);
+        assertTrue(textOf(&stream, 1, 1000) = 5, "a byte of the stream changed");
+        var kind: Buffer[Nat8] := twoStrings();
+        storeNth(&!kind, packed_at, 81);
+        storeNth(&!kind, packed_at + 1, 81);
+        assertTrue(textOf(&kind, 1, 1000) = 6, "an unknown kind of block");
+        let whole: Buffer[Nat8] := twoStrings();
+        var short: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 0;
+        while at < 650 do
+            insertBack(&!short, nth(&whole, at));
+            at := at + 1;
+        end while;
+        assertTrue(textOf(&short, 0, 1000) = 2, "cut inside the list of keys");
+        destroyFree(magic);
+        destroyFree(stream);
+        destroyFree(kind);
+        destroyFree(whole);
+        destroyFree(short);
+        return nil;
+    end;
+
+    -- A key whose class or name is placed by word: classPast and namePast
+    -- one byte past the end of the file, classWrap and nameWrap at the
+    -- largest Index with a length of 2, whose sum would overflow; inside
+    -- both end on the last byte. className and keyName are asked for both.
+    function placedKey(word: Span[Nat8, Static]): Bool is
+        let file: Buffer[Nat8] := twoStrings();
+        let size: Index := length(&file);
+        let largest: Index := 18446744073709551615;
+        let two: Index := 2;
+        let four: Index := 4;
+        var class_at: Index := size - four;
+        var class_length: Index := four;
+        var name_at: Index := size - four;
+        var name_length: Index := four;
+        if equal(word, "classPast") then
+            class_at := size - 3;
+        end if;
+        if equal(word, "classWrap") then
+            class_at := largest;
+            class_length := two;
+        end if;
+        if equal(word, "namePast") then
+            name_at := size - 3;
+        end if;
+        if equal(word, "nameWrap") then
+            name_at := largest;
+            name_length := two;
+        end if;
+        let zero: Index := 0;
+        let key: RootKey := RootKey(nbytes => zero, objectLength => zero, keyLength => zero, cycle => 1, seekKey => zero, seekDirectory => zero, classAt => class_at, classLength => class_length, nameAt => name_at, nameLength => name_length, titleAt => zero, titleLength => zero);
+        let found: Index := spanLength(className(wholeSpan(&file), key));
+        let named: Index := spanLength(keyName(wholeSpan(&file), key));
+        destroyFree(file);
+        return (found = 4) and (named = 4);
+    end;
+
+    -- A class or a name that leaves the bytes is refused by the requires of
+    -- className and keyName, also when its start and length would overflow
+    -- as a sum; one that ends on the last byte is taken.
+    function testAKeyPastTheBytesIsRefused(): Unit is
+        if asChild("classPast") then
+            let ran: Bool := placedKey("classPast");
+            return nil;
+        end if;
+        if asChild("classWrap") then
+            let ran: Bool := placedKey("classWrap");
+            return nil;
+        end if;
+        if asChild("namePast") then
+            let ran: Bool := placedKey("namePast");
+            return nil;
+        end if;
+        if asChild("nameWrap") then
+            let ran: Bool := placedKey("nameWrap");
+            return nil;
+        end if;
+        if asChild("inside") then
+            let ran: Bool := placedKey("inside");
+            return nil;
+        end if;
+        assertTrue(placedKey("inside"), "a class and a name on the last four bytes are taken");
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testAKeyPastTheBytesIsRefused", "classPast", "contract violated: the requires"), "className one byte past the end is refused");
+        assertTrue(refusedInChild("testAKeyPastTheBytesIsRefused", "classWrap", "contract violated: the requires"), "className at the largest Index is refused, not an Overflow");
+        assertTrue(refusedInChild("testAKeyPastTheBytesIsRefused", "namePast", "contract violated: the requires"), "keyName one byte past the end is refused");
+        assertTrue(refusedInChild("testAKeyPastTheBytesIsRefused", "nameWrap", "contract violated: the requires"), "keyName at the largest Index is refused, not an Overflow");
+        assertTrue(not refusedInChild("testAKeyPastTheBytesIsRefused", "inside", "contract violated"), "a key inside the bytes breaks no contract");
+        return nil;
+    end;
+end module body.

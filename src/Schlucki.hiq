@@ -1,0 +1,1689 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A table keeps its values by kind: the values of column c lie in the
+-- store of its kind from base at c on, one for each row, and whether a
+-- value is present lies in valid at c times the rows plus the row.  Texts
+-- lie in one buffer of bytes with a start and a length for each.  A path
+-- through a write reference uses the reference up, so each store is
+-- changed by a small function of its own.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    swapIndex,
+    wholeSpan,
+    getSpan
+);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal, formatInt);
+import Standard.Csv (CsvError, CsvTable, CsvWriter, readCsvWith, destroyCsv, rowCount as csvRows, columnCount as csvColumns, fieldAt,
+    makeCsvWriter, writeField, endRow, finishCsv);
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    SqlError,
+    Values,
+    Cursor,
+    noValues,
+    withInt64OrNull,
+    withFloat64OrNull,
+    withTextOrNull,
+    start,
+    execute,
+    advance,
+    columnInt64OrNone,
+    columnFloat64OrNone,
+    columnTextOrNone,
+    finish
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, count, flatGet, zeros, flatSet, countMut, fromSpan);
+import Mirco.Text (parseFloat64, formatFloat64);
+import Standard.Bits (float64FromBits);
+
+module body Mirco.Schlucki is
+    constant nan_bits: Nat64 := 9221120237041090560;
+
+    record Table: Linear is
+        rows: Index;
+        names: Buffer[Nat8];
+        nameAt: Buffer[Index];
+        nameLength: Buffer[Index];
+        kinds: Buffer[Nat8];
+        base: Buffer[Index];
+        floats: Buffer[Float64];
+        ints: Buffer[Int64];
+        bools: Buffer[Bool];
+        textAt: Buffer[Index];
+        textLength: Buffer[Index];
+        bytes: Buffer[Nat8];
+        valid: Buffer[Bool];
+    end;
+
+    function kindFloat(): Nat8 is
+        return 1;
+    end;
+
+    function kindInt(): Nat8 is
+        return 2;
+    end;
+
+    function kindText(): Nat8 is
+        return 3;
+    end;
+
+    function kindBool(): Nat8 is
+        return 4;
+    end;
+
+    function aggregateSum(): Nat8 is
+        return 1;
+    end;
+
+    function aggregateMean(): Nat8 is
+        return 2;
+    end;
+
+    function aggregateCount(): Nat8 is
+        return 3;
+    end;
+
+    function aggregateMinimum(): Nat8 is
+        return 4;
+    end;
+
+    function aggregateMaximum(): Nat8 is
+        return 5;
+    end;
+
+    -- The code of the SqlError with which fromQuery refuses a column asked
+    -- for as kindBool whose value SQLite does not hold a Bool as: 20, the
+    -- datatype mismatch of SQLite.
+    function datatypeMismatch(): Int32 is
+        return 20;
+    end;
+
+    function table(rows: Index): Table is
+        return Table(rows => rows, names => allocateEmpty(), nameAt => allocateEmpty(), nameLength => allocateEmpty(),
+            kinds => allocateEmpty(), base => allocateEmpty(), floats => allocateEmpty(), ints => allocateEmpty(),
+            bools => allocateEmpty(), textAt => allocateEmpty(), textLength => allocateEmpty(), bytes => allocateEmpty(),
+            valid => allocateEmpty());
+    end;
+
+    function destroyTable(t: Table): Unit is
+        let { rows: Index, names: Buffer[Nat8], nameAt as name_at: Buffer[Index], nameLength as name_length: Buffer[Index], kinds: Buffer[Nat8],
+            base: Buffer[Index], floats: Buffer[Float64], ints: Buffer[Int64], bools: Buffer[Bool], textAt as starts: Buffer[Index],
+            textLength as text_length: Buffer[Index], bytes: Buffer[Nat8], valid: Buffer[Bool] } := t;
+        destroyFree(names);
+        destroyFree(name_at);
+        destroyFree(name_length);
+        destroyFree(kinds);
+        destroyFree(base);
+        destroyFree(floats);
+        destroyFree(ints);
+        destroyFree(bools);
+        destroyFree(starts);
+        destroyFree(text_length);
+        destroyFree(bytes);
+        destroyFree(valid);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rowCount(t: &[Table, R]): Index is
+        return t->rows;
+    end;
+
+    generic [R: Region]
+    function columnCount(t: &[Table, R]): Index is
+        return length(&(t->kinds));
+    end;
+
+    generic [R: Region]
+    function columnName(t: &[Table, R], c: Index): Span[Nat8, R] is
+        let at: Index := nth(&(t->nameAt), c);
+        let n: Index := nth(&(t->nameLength), c);
+        return spanPart(wholeSpan(&(t->names)), at, n);
+    end;
+
+    generic [R: Region, S: Region]
+    function columnIndex(t: &[Table, R], name: Span[Nat8, S]): Option[Index] is
+        var c: Index := 0;
+        while c < columnCount(t) do
+            if equal(columnName(t, c), name) then
+                return Some(value => c);
+            end if;
+            c := c + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region]
+    function columnKind(t: &[Table, R], c: Index): Nat8 is
+        let k: Nat8 := nth(&(t->kinds), c);
+        if (k < 1) or (k > 4) then
+            abort("Mirco.Schlucki: a column of no kind");
+        end if;
+        return k;
+    end;
+
+    -- The small functions that change one store each.
+    generic [R: Region]
+    function pushFloat(t: &![Table, R], v: Float64): Unit is
+        insertBack(&!(t->floats), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushInt(t: &![Table, R], v: Int64): Unit is
+        insertBack(&!(t->ints), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushBool(t: &![Table, R], v: Bool): Unit is
+        insertBack(&!(t->bools), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushValid(t: &![Table, R], v: Bool): Unit is
+        insertBack(&!(t->valid), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushKind(t: &![Table, R], k: Nat8): Unit is
+        insertBack(&!(t->kinds), k);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushBase(t: &![Table, R], b: Index): Unit is
+        insertBack(&!(t->base), b);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushNameAt(t: &![Table, R], at: Index): Unit is
+        insertBack(&!(t->nameAt), at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushNameLength(t: &![Table, R], n: Index): Unit is
+        insertBack(&!(t->nameLength), n);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushNameByte(t: &![Table, R], b: Nat8): Unit is
+        insertBack(&!(t->names), b);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushTextAt(t: &![Table, R], at: Index): Unit is
+        insertBack(&!(t->textAt), at);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushTextLength(t: &![Table, R], n: Index): Unit is
+        insertBack(&!(t->textLength), n);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushByte(t: &![Table, R], b: Nat8): Unit is
+        insertBack(&!(t->bytes), b);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rowsOf(t: &![Table, R]): Index is
+        return t->rows;
+    end;
+
+    generic [R: Region]
+    function storeLength(t: &![Table, R], kind: Nat8): Index is
+        if kind = 1 then
+            return lengthMut(&!(t->floats));
+        end if;
+        return otherStoreLength(&~t, kind);
+    end;
+
+    generic [R: Region]
+    function otherStoreLength(t: &![Table, R], kind: Nat8): Index is
+        if kind = 2 then
+            return lengthMut(&!(t->ints));
+        end if;
+        return lastStoreLength(&~t, kind);
+    end;
+
+    generic [R: Region]
+    function lastStoreLength(t: &![Table, R], kind: Nat8): Index is
+        if kind = 3 then
+            return lengthMut(&!(t->textAt));
+        end if;
+        return lengthMut(&!(t->bools));
+    end;
+
+    generic [R: Region]
+    function byteCount(t: &![Table, R]): Index is
+        return lengthMut(&!(t->bytes));
+    end;
+
+    generic [R: Region, S: Region]
+    function hasName(t: &![Table, R], name: Span[Nat8, S]): Bool is
+        return nameTaken(&~t, name);
+    end;
+
+    -- The name compared with every name of the table, through a read of
+    -- the buffers of names behind the write reference.
+    generic [R: Region, S: Region]
+    function nameTaken(t: &![Table, R], name: Span[Nat8, S]): Bool is
+        let n: Index := kindCount(&~t);
+        return (n > 0) and namesHold(&~t, name, n);
+    end;
+
+    generic [R: Region, S: Region]
+    function namesHold(t: &![Table, R], name: Span[Nat8, S], n: Index): Bool is
+        var c: Index := 0;
+        while c < n do
+            let at: Index := nameAtOf(&~t, c);
+            let size: Index := nameLengthOf(&~t, c);
+            if size = spanLength(name) then
+                var same: Bool := true;
+                var i: Index := 0;
+                while i < size do
+                    if nameByteOf(&~t, at + i) /= name[i] then
+                        same := false;
+                    end if;
+                    i := i + 1;
+                end while;
+                if same then
+                    return true;
+                end if;
+            end if;
+            c := c + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function kindCount(t: &![Table, R]): Index is
+        return lengthMut(&!(t->kinds));
+    end;
+
+    generic [R: Region]
+    function nameAtOf(t: &![Table, R], c: Index): Index is
+        return nthMut(&!(t->nameAt), c);
+    end;
+
+    generic [R: Region]
+    function nameLengthOf(t: &![Table, R], c: Index): Index is
+        return nthMut(&!(t->nameLength), c);
+    end;
+
+    generic [R: Region]
+    function nameByteOf(t: &![Table, R], at: Index): Nat8 is
+        return nthMut(&!(t->names), at);
+    end;
+
+    generic [R: Region]
+    function nameCount(t: &![Table, R]): Index is
+        return lengthMut(&!(t->names));
+    end;
+
+    -- The head of a new column: its name, its kind and where its values
+    -- begin in the store of its kind.
+    generic [R: Region, S: Region]
+    function beginColumn(t: &![Table, R], name: Span[Nat8, S], kind: Nat8): Unit is
+        let name_start: Index := nameCount(&~t);
+        pushNameAt(&~t, name_start);
+        pushNameLength(&~t, spanLength(name));
+        var i: Index := 0;
+        while i < spanLength(name) do
+            pushNameByte(&~t, name[i]);
+            i := i + 1;
+        end while;
+        let base: Index := storeLength(&~t, kind);
+        pushBase(&~t, base);
+        pushKind(&~t, kind);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addFloatColumn(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Float64], Q]): Bool is
+        let rows: Index := rowsOf(&~t);
+        let taken: Bool := hasName(&~t, name);
+        if (count(values) /= rows) or taken then
+            return false;
+        end if;
+        beginColumn(&~t, name, 1);
+        var r: Index := 0;
+        while r < count(values) do
+            pushFloat(&~t, flatGet(values, r));
+            pushValid(&~t, true);
+            r := r + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function addFloatColumnWith(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Float64], Q], there: &[NdArray[Bool], P]): Bool is
+        let rows: Index := rowsOf(&~t);
+        let taken: Bool := hasName(&~t, name);
+        if (count(values) /= rows) or (count(there) /= count(values)) or taken then
+            return false;
+        end if;
+        beginColumn(&~t, name, 1);
+        var r: Index := 0;
+        while r < count(values) do
+            pushFloat(&~t, flatGet(values, r));
+            pushValid(&~t, flatGet(there, r));
+            r := r + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addIntColumn(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Int64], Q]): Bool is
+        let rows: Index := rowsOf(&~t);
+        let taken: Bool := hasName(&~t, name);
+        if (count(values) /= rows) or taken then
+            return false;
+        end if;
+        beginColumn(&~t, name, 2);
+        var r: Index := 0;
+        while r < count(values) do
+            pushInt(&~t, flatGet(values, r));
+            pushValid(&~t, true);
+            r := r + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addBoolColumn(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Bool], Q]): Bool is
+        let rows: Index := rowsOf(&~t);
+        let taken: Bool := hasName(&~t, name);
+        if (count(values) /= rows) or taken then
+            return false;
+        end if;
+        beginColumn(&~t, name, 4);
+        var r: Index := 0;
+        while r < count(values) do
+            pushBool(&~t, flatGet(values, r));
+            pushValid(&~t, true);
+            r := r + 1;
+        end while;
+        return true;
+    end;
+
+    -- One text value at the end of the store of bytes.
+    generic [R: Region, S: Region]
+    function pushText(t: &![Table, R], text: Span[Nat8, S], here: Bool): Unit is
+        let text_start: Index := byteCount(&~t);
+        pushTextAt(&~t, text_start);
+        pushTextLength(&~t, spanLength(text));
+        var i: Index := 0;
+        while i < spanLength(text) do
+            pushByte(&~t, text[i]);
+            i := i + 1;
+        end while;
+        pushValid(&~t, here);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addTextColumn(t: &![Table, R], name: Span[Nat8, S], joined: Span[Nat8, Q], separator: Nat8): Bool is
+        var pieces: Index := 1;
+        var i: Index := 0;
+        while i < spanLength(joined) do
+            if joined[i] = separator then
+                pieces := pieces + 1;
+            end if;
+            i := i + 1;
+        end while;
+        let rows: Index := rowsOf(&~t);
+        let taken: Bool := hasName(&~t, name);
+        if (pieces /= rows) or taken then
+            return false;
+        end if;
+        beginColumn(&~t, name, 3);
+        var first: Index := 0;
+        i := 0;
+        while i <= spanLength(joined) do
+            var ends: Bool := i = spanLength(joined);
+            if not ends then
+                ends := joined[i] = separator;
+            end if;
+            if ends then
+                pushText(&~t, spanPart(joined, first, i - first), true);
+                first := i + 1;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isPresent(t: &[Table, R], c: Index, r: Index): Bool is
+        return nth(&(t->valid), (c * (t->rows)) + r);
+    end;
+
+    generic [R: Region]
+    function expect(t: &[Table, R], c: Index, kind: Nat8): Index is
+        if nth(&(t->kinds), c) /= kind then
+            abort("Mirco.Schlucki: a column read as a kind it does not hold");
+        end if;
+        return nth(&(t->base), c);
+    end;
+
+    generic [R: Region]
+    function floatAt(t: &[Table, R], c: Index, r: Index): Option[Float64] is
+        let b: Index := expect(t, c, 1);
+        if not isPresent(t, c, r) then
+            return None();
+        end if;
+        return Some(value => nth(&(t->floats), b + r));
+    end;
+
+    generic [R: Region]
+    function intAt(t: &[Table, R], c: Index, r: Index): Option[Int64] is
+        let b: Index := expect(t, c, 2);
+        if not isPresent(t, c, r) then
+            return None();
+        end if;
+        return Some(value => nth(&(t->ints), b + r));
+    end;
+
+    generic [R: Region]
+    function textAt(t: &[Table, R], c: Index, r: Index): Option[Span[Nat8, R]] is
+        let b: Index := expect(t, c, 3);
+        if not isPresent(t, c, r) then
+            return None();
+        end if;
+        let at: Index := nth(&(t->textAt), b + r);
+        let n: Index := nth(&(t->textLength), b + r);
+        return Some(value => spanPart(wholeSpan(&(t->bytes)), at, n));
+    end;
+
+    generic [R: Region]
+    function boolAt(t: &[Table, R], c: Index, r: Index): Option[Bool] is
+        let b: Index := expect(t, c, 4);
+        if not isPresent(t, c, r) then
+            return None();
+        end if;
+        return Some(value => nth(&(t->bools), b + r));
+    end;
+
+    function vectorShape(n: Index): Buffer[Index] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        return shape;
+    end;
+
+    generic [R: Region]
+    function floatColumn(t: &[Table, R], c: Index): NdArray[Float64] is
+        let shape: Buffer[Index] := vectorShape(t->rows);
+        var made: NdArray[Float64] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        var r: Index := 0;
+        while r < (t->rows) do
+            case floatAt(t, c, r) of
+                when Some(value as v: Float64) do
+                    flatSet(&!made, r, v);
+                when None do
+                    flatSet(&!made, r, float64FromBits(nan_bits));
+            end case;
+            r := r + 1;
+        end while;
+        return made;
+    end;
+
+    generic [R: Region]
+    function present(t: &[Table, R], c: Index): NdArray[Bool] is
+        let shape: Buffer[Index] := vectorShape(t->rows);
+        var made: NdArray[Bool] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        var r: Index := 0;
+        while r < (t->rows) do
+            flatSet(&!made, r, isPresent(t, c, r));
+            r := r + 1;
+        end while;
+        return made;
+    end;
+
+    -- Copies column c of src, the rows at the positions of picks in their
+    -- order, into dst under the name given.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function copyColumn(dst: &![Table, R], src: &[Table, S], c: Index, picks: &[Buffer[Index], Q], name: Span[Nat8, P]): Unit is
+        let kind: Nat8 := nth(&(src->kinds), c);
+        beginColumn(&~dst, name, kind);
+        let b: Index := nth(&(src->base), c);
+        var i: Index := 0;
+        while i < length(picks) do
+            let r: Index := nth(picks, i);
+            let here: Bool := isPresent(src, c, r);
+            if kind = 1 then
+                pushFloat(&~dst, nth(&(src->floats), b + r));
+                pushValid(&~dst, here);
+            else if kind = 2 then
+                pushInt(&~dst, nth(&(src->ints), b + r));
+                pushValid(&~dst, here);
+            else if kind = 4 then
+                pushBool(&~dst, nth(&(src->bools), b + r));
+                pushValid(&~dst, here);
+            else
+                let at: Index := nth(&(src->textAt), b + r);
+                let n: Index := nth(&(src->textLength), b + r);
+                pushText(&~dst, spanPart(wholeSpan(&(src->bytes)), at, n), here);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function everyRow(n: Index): Buffer[Index] is
+        var picks: Buffer[Index] := allocateEmpty();
+        var r: Index := 0;
+        while r < n do
+            insertBack(&!picks, r);
+            r := r + 1;
+        end while;
+        return picks;
+    end;
+
+    -- A new table of the rows picks and every column of t.
+    generic [R: Region, S: Region]
+    function gather(t: &[Table, R], picks: &[Buffer[Index], S]): Table is
+        var made: Table := table(length(picks));
+        var c: Index := 0;
+        while c < columnCount(t) do
+            copyColumn(&!made, t, c, picks, columnName(t, c));
+            c := c + 1;
+        end while;
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function columnsExist(t: &[Table, R], cols: Span[Index, S]): Bool is
+        var i: Index := 0;
+        while i < spanLength(cols) do
+            if cols[i] >= columnCount(t) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function select(t: &[Table, R], cols: Span[Index, S]): Table is
+        let picks: Buffer[Index] := everyRow(t->rows);
+        var made: Table := table(t->rows);
+        var i: Index := 0;
+        while i < spanLength(cols) do
+            let c: Index := cols[i];
+            if c >= columnCount(t) then
+                abort("Mirco.Schlucki: select names a column the table does not have");
+            end if;
+            copyColumn(&!made, t, c, &picks, columnName(t, c));
+            i := i + 1;
+        end while;
+        destroyFree(picks);
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function filter(t: &[Table, R], keep: &[NdArray[Bool], S]): Table is
+        var picks: Buffer[Index] := allocateEmpty();
+        var r: Index := 0;
+        while r < count(keep) do
+            if flatGet(keep, r) then
+                insertBack(&!picks, r);
+            end if;
+            r := r + 1;
+        end while;
+        let made: Table := gather(t, &picks);
+        destroyFree(picks);
+        return made;
+    end;
+
+    function mask(n: Index): NdArray[Bool] is
+        let shape: Buffer[Index] := vectorShape(n);
+        let made: NdArray[Bool] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        return made;
+    end;
+
+    generic [R: Region]
+    function whereBetween(t: &[Table, R], c: Index, low: Float64, high: Float64): NdArray[Bool] is
+        var made: NdArray[Bool] := mask(t->rows);
+        var r: Index := 0;
+        while r < (t->rows) do
+            case floatAt(t, c, r) of
+                when Some(value as v: Float64) do
+                    flatSet(&!made, r, (v >= low) and (v <= high));
+                when None do
+                    skip;
+            end case;
+            r := r + 1;
+        end while;
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function whereText(t: &[Table, R], c: Index, text: Span[Nat8, S]): NdArray[Bool] is
+        var made: NdArray[Bool] := mask(t->rows);
+        var r: Index := 0;
+        while r < (t->rows) do
+            case textAt(t, c, r) of
+                when Some(value as v: Span[Nat8, R]) do
+                    flatSet(&!made, r, equal(v, text));
+                when None do
+                    skip;
+            end case;
+            r := r + 1;
+        end while;
+        return made;
+    end;
+
+    -- -1, 0 or 1 as the bytes of a come before, with or after those of b.
+    generic [R: Region, S: Region]
+    function compareBytes(a: Span[Nat8, R], b: Span[Nat8, S]): Int32 is
+        var i: Index := 0;
+        while (i < spanLength(a)) and (i < spanLength(b)) do
+            if a[i] < b[i] then
+                return -1;
+            end if;
+            if a[i] > b[i] then
+                return 1;
+            end if;
+            i := i + 1;
+        end while;
+        if spanLength(a) < spanLength(b) then
+            return -1;
+        end if;
+        if spanLength(a) > spanLength(b) then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- The order of the rows r and s in column c: -1, 0 or 1; a missing value
+    -- after every present one.
+    generic [R: Region]
+    function compareRows(t: &[Table, R], c: Index, r: Index, s: Index): Int32 is
+        let hr: Bool := isPresent(t, c, r);
+        let hs: Bool := isPresent(t, c, s);
+        if (not hr) or (not hs) then
+            if hr then
+                return -1;
+            end if;
+            if hs then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        let kind: Nat8 := nth(&(t->kinds), c);
+        let b: Index := nth(&(t->base), c);
+        if kind = 1 then
+            let x: Float64 := nth(&(t->floats), b + r);
+            let y: Float64 := nth(&(t->floats), b + s);
+            if x < y then
+                return -1;
+            end if;
+            if x > y then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        if kind = 2 then
+            let x: Int64 := nth(&(t->ints), b + r);
+            let y: Int64 := nth(&(t->ints), b + s);
+            if x < y then
+                return -1;
+            end if;
+            if x > y then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        if kind = 4 then
+            let x: Bool := nth(&(t->bools), b + r);
+            let y: Bool := nth(&(t->bools), b + s);
+            if (not x) and y then
+                return -1;
+            end if;
+            if x and (not y) then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        let bytes: Span[Nat8, R] := wholeSpan(&(t->bytes));
+        return compareBytes(spanPart(bytes, nth(&(t->textAt), b + r), nth(&(t->textLength), b + r)),
+            spanPart(bytes, nth(&(t->textAt), b + s), nth(&(t->textLength), b + s)));
+    end;
+
+    -- True when row r goes before row s, or both may stay as they are.
+    generic [R: Region]
+    function before(t: &[Table, R], c: Index, r: Index, s: Index, ascending: Bool): Bool is
+        let hr: Bool := isPresent(t, c, r);
+        let hs: Bool := isPresent(t, c, s);
+        if (not hr) or (not hs) then
+            return hr or (not hs);
+        end if;
+        let order: Int32 := compareRows(t, c, r, s);
+        if ascending then
+            return order <= 0;
+        end if;
+        return order >= 0;
+    end;
+
+    -- A merge sort of the positions, which keeps equal rows in their order.
+    generic [R: Region, S: Region]
+    function sortPicks(t: &[Table, R], c: Index, picks: &![Buffer[Index], S], ascending: Bool): Unit is
+        let n: Index := lengthMut(&~picks);
+        var width: Index := 1;
+        var scratch: Buffer[Index] := everyRow(n);
+        while width < n do
+            var low: Index := 0;
+            while low < n do
+                var middle: Index := low + width;
+                if middle > n then
+                    middle := n;
+                end if;
+                var high: Index := middle + width;
+                if high > n then
+                    high := n;
+                end if;
+                var i: Index := low;
+                var j: Index := middle;
+                var k: Index := low;
+                while k < high do
+                    var take_left: Bool := false;
+                    if i < middle then
+                        if j >= high then
+                            take_left := true;
+                        else
+                            let a: Index := nthMut(&~picks, i);
+                            let b: Index := nthMut(&~picks, j);
+                            take_left := before(t, c, a, b, ascending);
+                        end if;
+                    end if;
+                    if take_left then
+                        storeNth(&!scratch, k, nthMut(&~picks, i));
+                        i := i + 1;
+                    else
+                        storeNth(&!scratch, k, nthMut(&~picks, j));
+                        j := j + 1;
+                    end if;
+                    k := k + 1;
+                end while;
+                low := high;
+            end while;
+            var m: Index := 0;
+            while m < n do
+                storeNth(&~picks, m, nthMut(&!scratch, m));
+                m := m + 1;
+            end while;
+            width := width * 2;
+        end while;
+        destroyFree(scratch);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function sortBy(t: &[Table, R], c: Index, ascending: Bool): Table is
+        var picks: Buffer[Index] := everyRow(t->rows);
+        sortPicks(t, c, &!picks, ascending);
+        let made: Table := gather(t, &picks);
+        destroyFree(picks);
+        return made;
+    end;
+
+    -- True when the keys of row r of a in column ca and of row s of b in
+    -- column cb are present and equal; the kinds are the same.
+    generic [R: Region, S: Region]
+    function sameKey(a: &[Table, R], ca: Index, r: Index, b: &[Table, S], cb: Index, s: Index): Bool is
+        if (not isPresent(a, ca, r)) or (not isPresent(b, cb, s)) then
+            return false;
+        end if;
+        let kind: Nat8 := nth(&(a->kinds), ca);
+        let ba: Index := nth(&(a->base), ca);
+        let bb: Index := nth(&(b->base), cb);
+        if kind = 1 then
+            return nth(&(a->floats), ba + r) = nth(&(b->floats), bb + s);
+        end if;
+        if kind = 2 then
+            return nth(&(a->ints), ba + r) = nth(&(b->ints), bb + s);
+        end if;
+        if kind = 4 then
+            return nth(&(a->bools), ba + r) = nth(&(b->bools), bb + s);
+        end if;
+        let ta: Span[Nat8, R] := spanPart(wholeSpan(&(a->bytes)), nth(&(a->textAt), ba + r), nth(&(a->textLength), ba + r));
+        let tb: Span[Nat8, S] := spanPart(wholeSpan(&(b->bytes)), nth(&(b->textAt), bb + s), nth(&(b->textLength), bb + s));
+        return equal(ta, tb);
+    end;
+
+    -- The value of row r of column c as a Float64, for the aggregates.
+    generic [R: Region]
+    function numberAt(t: &[Table, R], c: Index, r: Index): Float64 is
+        let kind: Nat8 := nth(&(t->kinds), c);
+        let b: Index := nth(&(t->base), c);
+        if kind = 1 then
+            return nth(&(t->floats), b + r);
+        end if;
+        if kind = 2 then
+            case toFloat64(nth(&(t->ints), b + r)) of
+                when Some(value as v: Float64) do
+                    return v;
+                when None do
+                    abort("Mirco.Schlucki: an Int64 that is no Float64");
+            end case;
+        end if;
+        abort("Mirco.Schlucki: an aggregate over a column that holds no numbers");
+    end;
+
+    generic [R: Region]
+    function groupBy(t: &[Table, R], key: Index, value: Index, aggregate: Nat8): Table is
+        var firsts: Buffer[Index] := allocateEmpty();
+        var group: Buffer[Index] := allocateEmpty();
+        var r: Index := 0;
+        while r < (t->rows) do
+            var g: Index := 0;
+            var found: Bool := false;
+            if not isPresent(t, key, r) then
+                insertBack(&!group, 1000000000000);
+            else
+                while (g < length(&firsts)) and (not found) do
+                    if sameKey(t, key, nthMut(&!firsts, g), t, key, r) then
+                        found := true;
+                    else
+                        g := g + 1;
+                    end if;
+                end while;
+                if not found then
+                    insertBack(&!firsts, r);
+                end if;
+                insertBack(&!group, g);
+            end if;
+            r := r + 1;
+        end while;
+        let groups: Index := length(&firsts);
+        var made: Table := table(groups);
+        copyColumn(&!made, t, key, &firsts, columnName(t, key));
+        beginColumn(&!made, "aggregate", 1);
+        var gi: Index := 0;
+        while gi < groups do
+            var total: Float64 := 0.0;
+            var n: Index := 0;
+            var best: Float64 := 0.0;
+            r := 0;
+            while r < (t->rows) do
+                if (nthMut(&!group, r) = gi) and isPresent(t, value, r) then
+                    let v: Float64 := numberAt(t, value, r);
+                    if (n = 0) or ((aggregate = 4) and (v < best)) or ((aggregate = 5) and (v > best)) then
+                        best := v;
+                    end if;
+                    total := total + v;
+                    n := n + 1;
+                end if;
+                r := r + 1;
+            end while;
+            var outcome: Float64 := total;
+            var here: Bool := true;
+            if aggregate = 2 then
+                if n = 0 then
+                    here := false;
+                else
+                    outcome := total / wide(n);
+                end if;
+            else if aggregate = 3 then
+                outcome := wide(n);
+            else if (aggregate = 4) or (aggregate = 5) then
+                outcome := best;
+                here := n > 0;
+            end if;
+            pushFloat(&!made, outcome);
+            pushValid(&!made, here);
+            gi := gi + 1;
+        end while;
+        destroyFree(firsts);
+        destroyFree(group);
+        return made;
+    end;
+
+    function wide(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as w: Float64) do
+                return w;
+            when None do
+                abort("Mirco.Schlucki: a count that is no Float64");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function join(left: &[Table, R], right: &[Table, S], left_key: Index, right_key: Index): Option[Table] is
+        if nth(&(left->kinds), left_key) /= nth(&(right->kinds), right_key) then
+            return None();
+        end if;
+        var lp: Buffer[Index] := allocateEmpty();
+        var rp: Buffer[Index] := allocateEmpty();
+        var r: Index := 0;
+        while r < (left->rows) do
+            var s: Index := 0;
+            while s < (right->rows) do
+                if sameKey(left, left_key, r, right, right_key, s) then
+                    insertBack(&!lp, r);
+                    insertBack(&!rp, s);
+                end if;
+                s := s + 1;
+            end while;
+            r := r + 1;
+        end while;
+        var made: Table := gather(left, &lp);
+        var c: Index := 0;
+        while c < columnCount(right) do
+            if c /= right_key then
+                let name: Span[Nat8, S] := columnName(right, c);
+                if hasName(&!made, name) then
+                    var suffixed: Buffer[Nat8] := allocateEmpty();
+                    var i: Index := 0;
+                    while i < spanLength(name) do
+                        insertBack(&!suffixed, name[i]);
+                        i := i + 1;
+                    end while;
+                    let tail: Span[Nat8, Static] := "_right";
+                    i := 0;
+                    while i < spanLength(tail) do
+                        insertBack(&!suffixed, tail[i]);
+                        i := i + 1;
+                    end while;
+                    copyColumn(&!made, right, c, &rp, wholeSpan(&suffixed));
+                    destroyFree(suffixed);
+                else
+                    copyColumn(&!made, right, c, &rp, name);
+                end if;
+            end if;
+            c := c + 1;
+        end while;
+        destroyFree(lp);
+        destroyFree(rp);
+        return Some(value => made);
+    end;
+
+    function refused(code: Int32, line: Index, column: Index): Either[TableError, Table] is
+        let e: Either[TableError, Table] := Left(left => TableError(code => code, line => line, column => column));
+        return e;
+    end;
+
+    -- An Int64 written in decimal, a sign allowed; None for anything else.
+    -- A negative number is gathered below zero, so that the smallest Int64,
+    -- whose magnitude no Int64 holds, is read as well.
+    generic [R: Region]
+    function parseInt(text: Span[Nat8, R]): Option[Int64] is
+        var at: Index := 0;
+        var negative: Bool := false;
+        if (spanLength(text) > 0) and ((text[0] = 45) or (text[0] = 43)) then
+            negative := text[0] = 45;
+            at := 1;
+        end if;
+        if at >= spanLength(text) then
+            return None();
+        end if;
+        let smallest: Int64 := (0 - 9223372036854775807) - 1;
+        var v: Int64 := 0;
+        while at < spanLength(text) do
+            let b: Nat8 := text[at];
+            if (b < 48) or (b > 57) then
+                return None();
+            end if;
+            let d: Int64 := digit(b);
+            if negative then
+                if v < ((smallest + d) / 10) then
+                    return None();
+                end if;
+                v := (v * 10) - d;
+            else
+                if v > ((9223372036854775807 - d) / 10) then
+                    return None();
+                end if;
+                v := (v * 10) + d;
+            end if;
+            at := at + 1;
+        end while;
+        return Some(value => v);
+    end;
+
+    function digit(b: Nat8): Int64 is
+        case toInt64(b) of
+            when Some(value as v: Int64) do
+                return v - 48;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function readCsv(text: Span[Nat8, R], kinds: Span[Nat8, S]): Either[TableError, Table] is
+        case readCsvWith(text, 44) of
+            when Left(left as e: CsvError) do
+                return refused(1, e.line, 0);
+            when Right(right as csv: CsvTable) do
+                let result: Either[TableError, Table] := tableOf(&csv, kinds);
+                destroyCsv(csv);
+                return result;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function tableOf(csv: &[CsvTable, R], kinds: Span[Nat8, S]): Either[TableError, Table] is
+        let cols: Index := csvColumns(csv);
+        if cols /= spanLength(kinds) then
+            return refused(2, 1, 0);
+        end if;
+        var k: Index := 0;
+        while k < cols do
+            if (kinds[k] < 1) or (kinds[k] > 4) then
+                return refused(4, 1, k);
+            end if;
+            k := k + 1;
+        end while;
+        var rows: Index := 0;
+        if csvRows(csv) > 0 then
+            rows := csvRows(csv) - 1;
+        end if;
+        var made: Table := table(rows);
+        var c: Index := 0;
+        while c < cols do
+            case fieldAt(csv, 0, c) of
+                when Some(value as n: Span[Nat8, R]) do
+                    beginColumn(&!made, n, kinds[c]);
+                when None do
+                    beginColumn(&!made, "", kinds[c]);
+            end case;
+            var r: Index := 0;
+            while r < rows do
+                case fieldAt(csv, r + 1, c) of
+                    when Some(value as field: Span[Nat8, R]) do
+                        if not pushField(&!made, kinds[c], field) then
+                            destroyTable(made);
+                            return refused(3, r + 2, c);
+                        end if;
+                    when None do
+                        destroyTable(made);
+                        return refused(3, r + 2, c);
+                end case;
+                r := r + 1;
+            end while;
+            c := c + 1;
+        end while;
+        let good: Either[TableError, Table] := Right(right => made);
+        return good;
+    end;
+
+    -- One field of CSV into a column of kind: an empty one is missing, any
+    -- other must be of the kind; false when it is not.
+    generic [R: Region, S: Region]
+    function pushField(t: &![Table, R], kind: Nat8, field: Span[Nat8, S]): Bool is
+        let empty: Bool := spanLength(field) = 0;
+        if kind = 3 then
+            pushText(&~t, field, not empty);
+            return true;
+        end if;
+        if kind = 1 then
+            if empty then
+                pushFloat(&~t, 0.0);
+                pushValid(&~t, false);
+                return true;
+            end if;
+            case parseFloat64(field) of
+                when Some(value as v: Float64) do
+                    pushFloat(&~t, v);
+                    pushValid(&~t, true);
+                    return true;
+                when None do
+                    return false;
+            end case;
+        end if;
+        if kind = 2 then
+            if empty then
+                pushInt(&~t, 0);
+                pushValid(&~t, false);
+                return true;
+            end if;
+            case parseInt(field) of
+                when Some(value as v: Int64) do
+                    pushInt(&~t, v);
+                    pushValid(&~t, true);
+                    return true;
+                when None do
+                    return false;
+            end case;
+        end if;
+        if empty then
+            pushBool(&~t, false);
+            pushValid(&~t, false);
+            return true;
+        end if;
+        if equal(field, "true") then
+            pushBool(&~t, true);
+            pushValid(&~t, true);
+            return true;
+        end if;
+        if equal(field, "false") then
+            pushBool(&~t, false);
+            pushValid(&~t, true);
+            return true;
+        end if;
+        return false;
+    end;
+
+    generic [R: Region]
+    function writeCsv(t: &[Table, R]): Option[String] is
+        var w: CsvWriter := makeCsvWriter();
+        var c: Index := 0;
+        while c < columnCount(t) do
+            writeField(&!w, columnName(t, c));
+            c := c + 1;
+        end while;
+        endRow(&!w);
+        var r: Index := 0;
+        while r < rowCount(t) do
+            c := 0;
+            while c < columnCount(t) do
+                writeValue(&!w, t, c, r);
+                c := c + 1;
+            end while;
+            endRow(&!w);
+            r := r + 1;
+        end while;
+        return finishCsv(w);
+    end;
+
+    -- The field of column c, row r, as pushField reads it back: empty when
+    -- the value is missing.
+    generic [W: Region, R: Region]
+    function writeValue(w: &![CsvWriter, W], t: &[Table, R], c: Index, r: Index): Unit is
+        let kind: Nat8 := columnKind(t, c);
+        if kind = 1 then
+            case floatAt(t, c, r) of
+                when Some(value as v: Float64) do
+                    let text: String := formatFloat64(v);
+                    writeField(&~w, asSpan(&text));
+                    destroyString(text);
+                when None do
+                    writeField(&~w, "");
+            end case;
+            return nil;
+        end if;
+        if kind = 2 then
+            case intAt(t, c, r) of
+                when Some(value as v: Int64) do
+                    let text: String := formatInt(v);
+                    writeField(&~w, asSpan(&text));
+                    destroyString(text);
+                when None do
+                    writeField(&~w, "");
+            end case;
+            return nil;
+        end if;
+        if kind = 3 then
+            case textAt(t, c, r) of
+                when Some(value as v: Span[Nat8, R]) do
+                    writeField(&~w, v);
+                when None do
+                    writeField(&~w, "");
+            end case;
+            return nil;
+        end if;
+        case boolAt(t, c, r) of
+            when Some(value as v: Bool) do
+                if v then
+                    writeField(&~w, "true");
+                else
+                    writeField(&~w, "false");
+                end if;
+            when None do
+                writeField(&~w, "");
+        end case;
+        return nil;
+    end;
+
+    generic [M: Free, R: Region, S: Region, Q: Region]
+    function fromQuery(db: &![Connection[M], R], sql: Span[Nat8, Static], kinds: Span[Nat8, S], names: Span[Nat8, Q]): Either[SqlError, Table] is
+        var picked: Table := table(0);
+        var cursor: Cursor := start(&~db, sql, noValues());
+        var rows: Index := 0;
+        var floats: Buffer[Float64] := allocateEmpty();
+        var ints: Buffer[Int64] := allocateEmpty();
+        var bools: Buffer[Bool] := allocateEmpty();
+        var valid: Buffer[Bool] := allocateEmpty();
+        var texts: Table := table(0);
+        -- A value SQLite does not hold a Bool as ends both loops, so no
+        -- later cell is read and the query is refused below.
+        var mismatch: Bool := false;
+        while (not mismatch) and advance(&!cursor) do
+            var c: Index := 0;
+            while (not mismatch) and (c < spanLength(kinds)) do
+                let index: Int32 := columnNumber(c);
+                if kinds[c] = 1 then
+                    case columnFloat64OrNone(&cursor, index) of
+                        when Some(value as v: Float64) do
+                            insertBack(&!floats, v);
+                            insertBack(&!valid, true);
+                        when None do
+                            insertBack(&!floats, 0.0);
+                            insertBack(&!valid, false);
+                    end case;
+                else if kinds[c] = 2 then
+                    case columnInt64OrNone(&cursor, index) of
+                        when Some(value as v: Int64) do
+                            insertBack(&!ints, v);
+                            insertBack(&!valid, true);
+                        when None do
+                            insertBack(&!ints, 0);
+                            insertBack(&!valid, false);
+                    end case;
+                else if kinds[c] = 4 then
+                    if not readBool(&cursor, index, &!bools, &!valid) then
+                        mismatch := true;
+                    end if;
+                else
+                    readText(&cursor, index, &!texts, &!valid);
+                end if;
+                c := c + 1;
+            end while;
+            rows := rows + 1;
+        end while;
+        -- finish gives the statement back whether a value was refused or
+        -- not; a value SQLite does not hold a Bool as is refused with the
+        -- datatype mismatch, whatever the statement answered at its end.
+        var failure: Option[SqlError] := finish(&~db, cursor);
+        if mismatch then
+            failure := Some(value => SqlError(code => datatypeMismatch()));
+        end if;
+        case failure of
+            when Some(value as e: SqlError) do
+                destroyTable(picked);
+                destroyTable(texts);
+                destroyFree(floats);
+                destroyFree(ints);
+                destroyFree(bools);
+                destroyFree(valid);
+                return Left(left => e);
+            when None do
+                skip;
+        end case;
+        destroyTable(picked);
+        let made: Table := laidOut(rows, kinds, names, &floats, &ints, &bools, &valid, &texts);
+        destroyTable(texts);
+        destroyFree(floats);
+        destroyFree(ints);
+        destroyFree(bools);
+        destroyFree(valid);
+        return Right(right => made);
+    end;
+
+    -- The text of one cell of the row the cursor is at.
+    generic [C: Region, R: Region, S: Region]
+    function readText(cursor: &[Cursor, C], index: Int32, texts: &![Table, R], valid: &![Buffer[Bool], S]): Unit is
+        case columnTextOrNone(cursor, index) of
+            when Some(value as v: Span[Nat8, C]) do
+                pushText(&~texts, v, true);
+                insertBack(&~valid, true);
+            when None do
+                pushText(&~texts, "", false);
+                insertBack(&~valid, false);
+        end case;
+        return nil;
+    end;
+
+    -- One cell of the row the cursor is at, as a Bool: SQLite holds a Bool
+    -- as the integer 0 or 1, as insertRows writes it, so a null is a missing
+    -- value and 0 and 1 are false and true; any other value is no Bool
+    -- SQLite can give, and false comes back so the query is refused rather
+    -- than the value read as a text or turned into a Bool without saying so.
+    generic [C: Region, B: Region, V: Region]
+    function readBool(cursor: &[Cursor, C], index: Int32, bools: &![Buffer[Bool], B], valid: &![Buffer[Bool], V]): Bool is
+        case columnInt64OrNone(cursor, index) of
+            when Some(value as v: Int64) do
+                if (v = 0) or (v = 1) then
+                    let b: Bool := v = 1;
+                    insertBack(&~bools, b);
+                    insertBack(&~valid, true);
+                    return true;
+                end if;
+                return false;
+            when None do
+                insertBack(&~bools, false);
+                insertBack(&~valid, false);
+                return true;
+        end case;
+    end;
+
+    function columnNumber(c: Index): Int32 is
+        case toInt32(c) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Mirco.Schlucki: a column number above the range of Int32");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function insertRows(db: &![Connection[Writing], R], sql: Span[Nat8, Static], t: &[Table, S]): Either[SqlError, Nat64] is
+        var changed: Nat64 := 0;
+        var r: Index := 0;
+        while r < (t->rows) do
+            var values: Values := noValues();
+            var c: Index := 0;
+            while c < columnCount(t) do
+                let kind: Nat8 := nth(&(t->kinds), c);
+                if kind = 1 then
+                    values := withFloat64OrNull(values, floatAt(t, c, r));
+                else if kind = 2 then
+                    values := withInt64OrNull(values, intAt(t, c, r));
+                else if kind = 4 then
+                    case boolAt(t, c, r) of
+                        when Some(value as b: Bool) do
+                            var v: Int64 := 0;
+                            if b then
+                                v := 1;
+                            end if;
+                            values := withInt64OrNull(values, Some(value => v));
+                        when None do
+                            let none: Option[Int64] := None();
+                            values := withInt64OrNull(values, none);
+                    end case;
+                else
+                    values := withTextOrNull(values, textAt(t, c, r));
+                end if;
+                c := c + 1;
+            end while;
+            case execute(&~db, sql, values) of
+                when Left(left as e: SqlError) do
+                    return Left(left => e);
+                when Right(right as n: Nat64) do
+                    changed := changed + n;
+            end case;
+            r := r + 1;
+        end while;
+        return Right(right => changed);
+    end;
+
+    -- The values of the rows lie by kind as in fromQuery: the k-th value of
+    -- a kind in a row is that of the k-th column of the kind, and whether
+    -- value c of row r is there lies in valid at r times the columns plus c.
+    -- column is the column the next value goes to, whole the count of whole
+    -- rows.
+    record Rows: Linear is
+        kinds: Buffer[Nat8];
+        floats: Buffer[Float64];
+        ints: Buffer[Int64];
+        bools: Buffer[Bool];
+        valid: Buffer[Bool];
+        texts: Table;
+        columns: Index;
+        column: Index;
+        whole: Index;
+    end;
+
+    generic [R: Region]
+    function kindsKnown(kinds: Span[Nat8, R]): Bool is
+        var c: Index := 0;
+        while c < spanLength(kinds) do
+            if (kinds[c] < 1) or (kinds[c] > 4) then
+                return false;
+            end if;
+            c := c + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function rowsFor(kinds: Span[Nat8, R]): Rows is
+        if (spanLength(kinds) = 0) or (not kindsKnown(kinds)) then
+            abort("Mirco.Schlucki: rows for no columns or for an unknown kind");
+        end if;
+        var copied: Buffer[Nat8] := allocateEmpty();
+        var c: Index := 0;
+        while c < spanLength(kinds) do
+            insertBack(&!copied, kinds[c]);
+            c := c + 1;
+        end while;
+        return Rows(kinds => copied, floats => allocateEmpty(), ints => allocateEmpty(), bools => allocateEmpty(),
+            valid => allocateEmpty(), texts => table(0), columns => spanLength(kinds), column => 0, whole => 0);
+    end;
+
+    generic [R: Region]
+    function gatheredRows(rows: &[Rows, R]): Index is
+        return rows->whole;
+    end;
+
+    generic [R: Region]
+    function nextKind(rows: &[Rows, R]): Nat8 is
+        let k: Nat8 := nth(&(rows->kinds), rows->column);
+        if (k < 1) or (k > 4) then
+            abort("Mirco.Schlucki: rows of no kind");
+        end if;
+        return k;
+    end;
+
+    -- The small functions that change one store of the rows each.
+    generic [R: Region]
+    function kindAhead(rows: &![Rows, R]): Nat8 is
+        let at: Index := rows->column;
+        return nthMut(&!(rows->kinds), at);
+    end;
+
+    generic [R: Region]
+    function gatherFloat(rows: &![Rows, R], v: Float64): Unit is
+        insertBack(&!(rows->floats), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function gatherInt(rows: &![Rows, R], v: Int64): Unit is
+        insertBack(&!(rows->ints), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function gatherBool(rows: &![Rows, R], v: Bool): Unit is
+        insertBack(&!(rows->bools), v);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function gatherValid(rows: &![Rows, R], v: Bool): Unit is
+        insertBack(&!(rows->valid), v);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function gatherText(rows: &![Rows, R], text: Span[Nat8, S], here: Bool): Unit is
+        pushText(&!(rows->texts), text, here);
+        return nil;
+    end;
+
+    -- One value put: the next column, and one whole row more after the last.
+    generic [R: Region]
+    function advanceColumn(rows: &![Rows, R]): Unit is
+        if (rows->column + 1) = rows->columns then
+            let first: Index := 0;
+            rows->column := first;
+            rows->whole := rows->whole + 1;
+        else
+            rows->column := rows->column + 1;
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function putFloat(rows: &![Rows, R], value: Option[Float64]): Unit is
+        if kindAhead(&~rows) /= 1 then
+            abort("Mirco.Schlucki: a Float64 put into a column of another kind");
+        end if;
+        case value of
+            when Some(value as v: Float64) do
+                gatherFloat(&~rows, v);
+                gatherValid(&~rows, true);
+            when None do
+                gatherFloat(&~rows, 0.0);
+                gatherValid(&~rows, false);
+        end case;
+        advanceColumn(&~rows);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function putInt(rows: &![Rows, R], value: Option[Int64]): Unit is
+        if kindAhead(&~rows) /= 2 then
+            abort("Mirco.Schlucki: an Int64 put into a column of another kind");
+        end if;
+        case value of
+            when Some(value as v: Int64) do
+                gatherInt(&~rows, v);
+                gatherValid(&~rows, true);
+            when None do
+                gatherInt(&~rows, 0);
+                gatherValid(&~rows, false);
+        end case;
+        advanceColumn(&~rows);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function putText(rows: &![Rows, R], value: Option[Span[Nat8, S]]): Unit is
+        if kindAhead(&~rows) /= 3 then
+            abort("Mirco.Schlucki: a text put into a column of another kind");
+        end if;
+        case value of
+            when Some(value as v: Span[Nat8, S]) do
+                gatherText(&~rows, v, true);
+                gatherValid(&~rows, true);
+            when None do
+                gatherText(&~rows, "", false);
+                gatherValid(&~rows, false);
+        end case;
+        advanceColumn(&~rows);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function putBool(rows: &![Rows, R], value: Option[Bool]): Unit is
+        if kindAhead(&~rows) /= 4 then
+            abort("Mirco.Schlucki: a Bool put into a column of another kind");
+        end if;
+        case value of
+            when Some(value as v: Bool) do
+                gatherBool(&~rows, v);
+                gatherValid(&~rows, true);
+            when None do
+                gatherBool(&~rows, false);
+                gatherValid(&~rows, false);
+        end case;
+        advanceColumn(&~rows);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function finishRows(rows: Rows, names: Span[Nat8, R]): Table is
+        let { kinds: Buffer[Nat8], floats: Buffer[Float64], ints: Buffer[Int64], bools: Buffer[Bool], valid: Buffer[Bool],
+            texts: Table, columns: Index, column: Index, whole: Index } := rows;
+        let made: Table := laidOut(whole, wholeSpan(&kinds), names, &floats, &ints, &bools, &valid, &texts);
+        destroyTable(texts);
+        destroyFree(kinds);
+        destroyFree(floats);
+        destroyFree(ints);
+        destroyFree(bools);
+        destroyFree(valid);
+        return made;
+    end;
+
+    -- The whole rows of finishRows and of fromQuery laid out column by
+    -- column, with a store of Bool of their own; a name past the end of
+    -- names is empty.
+    generic [R: Region, S: Region, A: Region, B: Region, C: Region, D: Region, E: Region]
+    function laidOut(rows: Index, kinds: Span[Nat8, R], names: Span[Nat8, S], floats: &[Buffer[Float64], A], ints: &[Buffer[Int64], B], bools: &[Buffer[Bool], E], valid: &[Buffer[Bool], C], texts: &[Table, D]): Table is
+        let cols: Index := spanLength(kinds);
+        var counts: Buffer[Index] := allocateEmpty();
+        var kind: Nat8 := 1;
+        while kind <= 4 do
+            var n: Index := 0;
+            var c: Index := 0;
+            while c < cols do
+                if kinds[c] = kind then
+                    n := n + 1;
+                end if;
+                c := c + 1;
+            end while;
+            insertBack(&!counts, n);
+            kind := kind + 1;
+        end while;
+        var made: Table := table(rows);
+        var name_start: Index := 0;
+        var c: Index := 0;
+        while c < cols do
+            var name_end: Index := name_start;
+            while (name_end < spanLength(names)) and (names[name_end] /= 44) do
+                name_end := name_end + 1;
+            end while;
+            let k: Nat8 := kinds[c];
+            if name_start < spanLength(names) then
+                beginColumn(&!made, spanPart(names, name_start, name_end - name_start), k);
+            else
+                beginColumn(&!made, "", k);
+            end if;
+            var position: Index := 0;
+            var p: Index := 0;
+            while p < c do
+                if kinds[p] = k then
+                    position := position + 1;
+                end if;
+                p := p + 1;
+            end while;
+            var r: Index := 0;
+            while r < rows do
+                let here: Bool := nth(valid, (r * cols) + c);
+                if k = 1 then
+                    pushFloat(&!made, nth(floats, (r * nth(&counts, 0)) + position));
+                    pushValid(&!made, here);
+                else if k = 2 then
+                    pushInt(&!made, nth(ints, (r * nth(&counts, 1)) + position));
+                    pushValid(&!made, here);
+                else if k = 4 then
+                    pushBool(&!made, nth(bools, (r * nth(&counts, 3)) + position));
+                    pushValid(&!made, here);
+                else
+                    let at: Index := (r * nth(&counts, 2)) + position;
+                    let start: Index := nth(&(texts->textAt), at);
+                    let n: Index := nth(&(texts->textLength), at);
+                    pushText(&!made, spanPart(wholeSpan(&(texts->bytes)), start, n), here);
+                end if;
+                r := r + 1;
+            end while;
+            name_start := name_end + 1;
+            c := c + 1;
+        end while;
+        destroyFree(counts);
+        return made;
+    end;
+end module body.

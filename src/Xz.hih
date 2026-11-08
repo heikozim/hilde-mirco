@@ -1,0 +1,26 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Unpacks a stream of the xz format with the filter LZMA2, as liblzma writes it and .root files hold it.
+
+- The headers of the stream and of each block are checked with their CRC32, and a block with its check.
+- The checks none and CRC32 are verified; a CRC64 or SHA-256 check is skipped, its bytes counted.
+- Unpacking stops at the limit the caller names; a stream that breaks a rule gives None, never an abort.
+
+    let text: Option[String] := unxz(packed, 1048576);
+"""
+import Standard.String (String);
+
+module Mirco.Xz is
+    """
+    The bytes the xz stream data holds, at most limit of them; None for a stream that is not one.
+    No contract: no precondition, since data that are no stream, or that unpack to more than limit bytes, give None.
+    """
+    generic [R: Region]
+    function unxz(data: Span[Nat8, R], limit: Index): Option[String];
+end module.

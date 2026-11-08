@@ -1,0 +1,575 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A .root file holds its numbers big endian.  Every read of a field is preceded
+-- by a check that its bytes are there, so that no index leaves the span.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, length as bufferLength, nthMut, wholeSpan);
+import Standard.String (String, fromSpan, fromByteBuffer, asSpan, destroyString, length);
+import Standard.Gzip (GzipFailure, inflateRaw);
+import Mirco.Xz (unxz);
+import Mirco.Zstd (unzstd, xxh64);
+
+module body Mirco.Root is
+    constant large_version: Int64 := 1000000;
+    constant large_key: Int64 := 1000;
+    constant byte_count_mask: Nat64 := 1073741824;
+    constant is_referenced: Nat64 := 16;
+    constant adler_base: Nat64 := 65521;
+
+    function failed(fault: RootFault, at: Index): RootError is
+        return RootError(fault => fault, at => at);
+    end;
+
+    -- True when n bytes from at are inside bytes.
+    generic [R: Region]
+    function fits(bytes: Span[Nat8, R], at: Index, n: Index): Bool is
+        return (at <= spanLength(bytes)) and (n <= (spanLength(bytes) - at));
+    end;
+
+    function wide(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- n bytes from at, big endian, n at most 8; the caller has checked fits.
+    generic [R: Region]
+    function unsignedAt(bytes: Span[Nat8, R], at: Index, n: Index): Nat64 is
+        var v: Nat64 := 0;
+        var i: Index := 0;
+        while i < n do
+            v := modularAdd(modularMultiply(v, 256), wide(bytes[at + i]));
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    -- n bytes from at as a signed number of 8 n bits, n 2, 4 or 8.
+    generic [R: Region]
+    function signedAt(bytes: Span[Nat8, R], at: Index, n: Index): Int64 is
+        let v: Nat64 := unsignedAt(bytes, at, n);
+        if n = 8 then
+            if v > 9223372036854775807 then
+                return 0 - (toSigned(modularSubtract(0, v)));
+            end if;
+            return toSigned(v);
+        end if;
+        var top: Nat64 := 1;
+        var i: Index := 0;
+        while i < ((8 * n) - 1) do
+            top := top * 2;
+            i := i + 1;
+        end while;
+        if v >= top then
+            return toSigned(v) - (2 * toSigned(top));
+        end if;
+        return toSigned(v);
+    end;
+
+    function toSigned(v: Nat64): Int64 is
+        case toInt64(v) of
+            when Some(value as s: Int64) do
+                return s;
+            when None do
+                return 9223372036854775807;
+        end case;
+    end;
+
+    -- A signed field that is an offset or a length: -1 for a negative one or
+    -- one that is no Index.
+    function asIndex(v: Int64): Int64 is
+        if v < 0 then
+            return -1;
+        end if;
+        return v;
+    end;
+
+    function indexOf(v: Int64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A string of a .root file: one byte of length, or 255 and four bytes of length,
+    -- then the bytes.  The start of the bytes, their length and the first
+    -- byte after them; at is the length 0 and next the start when it does
+    -- not fit.
+    record Piece: Free is
+        start: Index;
+        size: Index;
+        next: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region]
+    function stringAt(bytes: Span[Nat8, R], at: Index): Piece is
+        let bad: Piece := Piece(start => at, size => 0, next => at, good => false);
+        if not fits(bytes, at, 1) then
+            return bad;
+        end if;
+        var size: Index := indexOf(toSigned(unsignedAt(bytes, at, 1)));
+        var start: Index := at + 1;
+        if size = 255 then
+            if not fits(bytes, at + 1, 4) then
+                return bad;
+            end if;
+            size := indexOf(toSigned(unsignedAt(bytes, at + 1, 4)));
+            start := at + 5;
+        end if;
+        if not fits(bytes, start, size) then
+            return bad;
+        end if;
+        return Piece(start => start, size => size, next => start + size, good => true);
+    end;
+
+    generic [R: Region]
+    function readHeader(bytes: Span[Nat8, R]): Either[RootError, RootHeader] is
+        if not fits(bytes, 0, 41) then
+            return Left(left => failed(Truncated(), spanLength(bytes)));
+        end if;
+        if (bytes[0] /= 114) or (bytes[1] /= 111) or (bytes[2] /= 111) or (bytes[3] /= 116) then
+            return Left(left => failed(NotRoot(), 0));
+        end if;
+        let version: Int64 := signedAt(bytes, 4, 4);
+        let begin: Int64 := asIndex(signedAt(bytes, 8, 4));
+        let large: Bool := version >= large_version;
+        var w: Index := 4;
+        if large then
+            w := 8;
+        end if;
+        let finish: Int64 := asIndex(signedAt(bytes, 12, w));
+        let after_free: Index := (12 + w) + w;
+        if not fits(bytes, after_free, 13 + (2 * w)) then
+            return Left(left => failed(Truncated(), after_free));
+        end if;
+        let nbytes_name: Int64 := asIndex(signedAt(bytes, after_free + 8, 4));
+        let compression: Int64 := signedAt(bytes, after_free + 13, 4);
+        let seek_info: Int64 := asIndex(signedAt(bytes, after_free + 17, w));
+        let nbytes_info: Int64 := asIndex(signedAt(bytes, after_free + 17 + w, 4));
+        if (begin < 0) or (finish < 0) or (nbytes_name < 0) or (seek_info < 0) or (nbytes_info < 0) then
+            return Left(left => failed(BadOffset(), 8));
+        end if;
+        let directory: Index := indexOf(begin) + indexOf(nbytes_name);
+        case seekKeysAt(bytes, directory) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as seek_keys: Index) do
+                let header: RootHeader := RootHeader(version => version, begin => indexOf(begin), finish => indexOf(finish),
+                    compression => compression, seekInfo => indexOf(seek_info), nbytesInfo => indexOf(nbytes_info),
+                    seekKeys => seek_keys, large => large);
+                return Right(right => header);
+        end case;
+    end;
+
+    -- The record of a directory: its version, two dates, the lengths of its
+    -- keys and its name, then its own offset, its parent's and that of its
+    -- keys, each of 64 bits when the version is above 1000.
+    generic [R: Region]
+    function seekKeysAt(bytes: Span[Nat8, R], at: Index): Either[RootError, Index] is
+        if not fits(bytes, at, 2) then
+            return Left(left => failed(Truncated(), at));
+        end if;
+        let version: Int64 := signedAt(bytes, at, 2);
+        var w: Index := 4;
+        if version > large_key then
+            w := 8;
+        end if;
+        let field: Index := at + 18 + (2 * w);
+        if not fits(bytes, field, w) then
+            return Left(left => failed(Truncated(), field));
+        end if;
+        let seek_keys: Int64 := asIndex(signedAt(bytes, field, w));
+        if seek_keys <= 0 then
+            return Left(left => failed(BadOffset(), field));
+        end if;
+        return Right(right => indexOf(seek_keys));
+    end;
+
+    -- The key whose header begins at at.
+    generic [R: Region]
+    function keyAt(bytes: Span[Nat8, R], at: Index): Either[RootError, RootKey] is
+        if not fits(bytes, at, 18) then
+            return Left(left => failed(Truncated(), at));
+        end if;
+        let nbytes: Int64 := asIndex(signedAt(bytes, at, 4));
+        let version: Int64 := signedAt(bytes, at + 4, 2);
+        let object_length: Int64 := asIndex(signedAt(bytes, at + 6, 4));
+        let key_length: Int64 := asIndex(signedAt(bytes, at + 14, 2));
+        let cycle: Int64 := signedAt(bytes, at + 16, 2);
+        var w: Index := 4;
+        if version > large_key then
+            w := 8;
+        end if;
+        if not fits(bytes, at + 18, 2 * w) then
+            return Left(left => failed(Truncated(), at + 18));
+        end if;
+        let seek_key: Int64 := asIndex(signedAt(bytes, at + 18, w));
+        let seek_directory: Int64 := asIndex(signedAt(bytes, (at + 18) + w, w));
+        if (nbytes < 0) or (object_length < 0) or (key_length <= 0) or (seek_key < 0) or (seek_directory < 0) or (nbytes < key_length) then
+            return Left(left => failed(BadOffset(), at));
+        end if;
+        let cls: Piece := stringAt(bytes, (at + 18) + (2 * w));
+        let name: Piece := stringAt(bytes, cls.next);
+        let title: Piece := stringAt(bytes, name.next);
+        if not (cls.good and name.good and title.good) then
+            return Left(left => failed(BadString(), (at + 18) + (2 * w)));
+        end if;
+        let key: RootKey := RootKey(nbytes => indexOf(nbytes), objectLength => indexOf(object_length), keyLength => indexOf(key_length),
+            cycle => cycle, seekKey => indexOf(seek_key), seekDirectory => indexOf(seek_directory),
+            classAt => cls.start, classLength => cls.size, nameAt => name.start, nameLength => name.size,
+            titleAt => title.start, titleLength => title.size);
+        return Right(right => key);
+    end;
+
+    -- The list of keys at seekKeys: a key of its own, then the count of keys
+    -- and their headers one after the other.
+    generic [R: Region]
+    function keysAt(bytes: Span[Nat8, R], seek_keys: Index): Either[RootError, Buffer[RootKey]] is
+        case keyAt(bytes, seek_keys) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as list: RootKey) do
+                let count_at: Index := seek_keys + list.keyLength;
+                if not fits(bytes, count_at, 4) then
+                    return Left(left => failed(Truncated(), count_at));
+                end if;
+                let n: Int64 := asIndex(signedAt(bytes, count_at, 4));
+                if (n < 0) or ((indexOf(n) * 18) > (spanLength(bytes) - (count_at + 4))) then
+                    return Left(left => failed(BadOffset(), count_at));
+                end if;
+                var keys: Buffer[RootKey] := allocateEmpty();
+                var at: Index := count_at + 4;
+                var i: Index := 0;
+                while i < indexOf(n) do
+                    case keyAt(bytes, at) of
+                        when Left(left as e: RootError) do
+                            destroyFree(keys);
+                            return Left(left => e);
+                        when Right(right as k: RootKey) do
+                            if not fits(bytes, k.seekKey, k.nbytes) then
+                                destroyFree(keys);
+                                return Left(left => failed(Truncated(), k.seekKey));
+                            end if;
+                            insertBack(&!keys, k);
+                            at := at + k.keyLength;
+                    end case;
+                    i := i + 1;
+                end while;
+                return Right(right => keys);
+        end case;
+    end;
+
+    generic [R: Region]
+    function readKeys(bytes: Span[Nat8, R], header: RootHeader): Either[RootError, Buffer[RootKey]] is
+        return keysAt(bytes, header.seekKeys);
+    end;
+
+    generic [R: Region]
+    function readDirectoryKeys(bytes: Span[Nat8, R], header: RootHeader, key: RootKey): Either[RootError, Buffer[RootKey]] is
+        case seekKeysAt(bytes, key.seekKey + key.keyLength) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as seek_keys: Index) do
+                return keysAt(bytes, seek_keys);
+        end case;
+    end;
+
+    generic [R: Region]
+    function className(bytes: Span[Nat8, R], key: RootKey): Span[Nat8, R] is
+        return spanPart(bytes, key.classAt, key.classLength);
+    end;
+
+    generic [R: Region]
+    function keyName(bytes: Span[Nat8, R], key: RootKey): Span[Nat8, R] is
+        return spanPart(bytes, key.nameAt, key.nameLength);
+    end;
+
+    -- Adler-32 of data, the checksum at the end of a stream of zlib.
+    generic [R: Region]
+    function adler32(data: Span[Nat8, R]): Nat64 is
+        var a: Nat64 := 1;
+        var b: Nat64 := 0;
+        var i: Index := 0;
+        while i < spanLength(data) do
+            a := rem(a + wide(data[i]), adler_base);
+            b := rem(b + a, adler_base);
+            i := i + 1;
+        end while;
+        return (b * 65536) + a;
+    end;
+
+    -- n bytes from at, little endian, as the lengths of a block header are.
+    generic [R: Region]
+    function littleAt(bytes: Span[Nat8, R], at: Index, n: Index): Index is
+        var v: Index := 0;
+        var i: Index := n;
+        while i > 0 do
+            i := i - 1;
+            v := (v * 256) + indexOf(toSigned(wide(bytes[at + i])));
+        end while;
+        return v;
+    end;
+
+    -- One block: two letters of the method, a byte, the lengths packed and
+    -- unpacked in three bytes each, then the stream.  Its bytes are added to
+    -- out; the length of the block comes back, or 0 on a refusal.
+    generic [R: Region, S: Region]
+    function unpackBlock(bytes: Span[Nat8, R], at: Index, out: &![Buffer[Nat8], S], room: Index): Either[RootError, Index] is
+        if not fits(bytes, at, 9) then
+            return Left(left => failed(Truncated(), at));
+        end if;
+        let packed: Index := littleAt(bytes, at + 3, 3);
+        let unpacked: Index := littleAt(bytes, at + 6, 3);
+        if (not fits(bytes, at + 9, packed)) or (unpacked > room) or (packed < 6) then
+            return Left(left => failed(BadCompression(), at));
+        end if;
+        if (bytes[at] = 76) and (bytes[at + 1] = 52) then
+            return unpackLz4(bytes, at, packed, unpacked, &~out);
+        end if;
+        if (bytes[at] = 88) and (bytes[at + 1] = 90) then
+            return unpackXz(bytes, at, packed, unpacked, &~out);
+        end if;
+        if (bytes[at] = 90) and (bytes[at + 1] = 83) then
+            return unpackZstd(bytes, at, packed, unpacked, &~out);
+        end if;
+        if not ((bytes[at] = 90) and (bytes[at + 1] = 76)) then
+            return Left(left => failed(UnknownCompression(), at));
+        end if;
+        let cmf: Nat64 := wide(bytes[at + 9]);
+        let flg: Nat64 := wide(bytes[at + 10]);
+        if (rem(cmf, 16) /= 8) or (rem((cmf * 256) + flg, 31) /= 0) or (rem(flg / 32, 2) = 1) then
+            return Left(left => failed(BadCompression(), at + 9));
+        end if;
+        case inflateRaw(spanPart(bytes, at + 11, packed - 6), unpacked) of
+            when Left(left as why: GzipFailure) do
+                return Left(left => failed(BadCompression(), at + 11));
+            when Right(right as text: String) do
+                let sum: Nat64 := unsignedAt(bytes, (at + 9) + (packed - 4), 4);
+                if (length(&text) /= unpacked) or (adler32(asSpan(&text)) /= sum) then
+                    destroyString(text);
+                    return Left(left => failed(BadCompression(), at + 9));
+                end if;
+                appendAll(&~out, asSpan(&text));
+                destroyString(text);
+                return Right(right => 9 + packed);
+        end case;
+    end;
+
+    -- n bytes from at, little endian, n at most 8.
+    generic [R: Region]
+    function littleWord(data: Span[Nat8, R], at: Index, n: Index): Nat64 is
+        var v: Nat64 := 0;
+        var i: Index := n;
+        while i > 0 do
+            i := i - 1;
+            v := modularAdd(modularMultiply(v, 256), wide(data[at + i]));
+        end while;
+        return v;
+    end;
+
+    -- A length of LZ4: the nibble, and when it is 15 the bytes after it,
+    -- each added, until one below 255.  The length and the next position;
+    -- good false when the bytes end first.
+    record Run: Free is
+        size: Index;
+        next: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region]
+    function runLength(data: Span[Nat8, R], at: Index, nibble: Index): Run is
+        var size: Index := nibble;
+        var i: Index := at;
+        if nibble = 15 then
+            var more: Bool := true;
+            while more do
+                if i >= spanLength(data) then
+                    return Run(size => size, next => i, good => false);
+                end if;
+                let b: Index := indexOf(toSigned(wide(data[i])));
+                size := size + b;
+                i := i + 1;
+                more := b = 255;
+            end while;
+        end if;
+        return Run(size => size, next => i, good => true);
+    end;
+
+    -- A block of LZ4 as a .root file holds it: the nine bytes of the header, the
+    -- XXH64 of the block, big endian, then the block: sequences of a token,
+    -- literals and a match two bytes back at most 65535, the last one
+    -- literals only.  Every length and offset is checked against what is
+    -- there and what was asked for.
+    generic [R: Region, S: Region]
+    function unpackLz4(bytes: Span[Nat8, R], at: Index, packed: Index, unpacked: Index, out: &![Buffer[Nat8], S]): Either[RootError, Index] is
+        if packed < 8 then
+            return Left(left => failed(BadCompression(), at));
+        end if;
+        let block: Span[Nat8, R] := spanPart(bytes, at + 17, packed - 8);
+        if xxh64(block) /= unsignedAt(bytes, at + 9, 8) then
+            return Left(left => failed(BadCompression(), at + 9));
+        end if;
+        var made: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < spanLength(block) do
+            let token: Index := indexOf(toSigned(wide(block[i])));
+            let literals: Run := runLength(block, i + 1, token / 16);
+            if (not literals.good) or (literals.size > (spanLength(block) - literals.next)) or (literals.size > (unpacked - bufferLength(&made))) then
+                destroyFree(made);
+                return Left(left => failed(BadCompression(), at + 17 + i));
+            end if;
+            appendAll(&!made, spanPart(block, literals.next, literals.size));
+            i := literals.next + literals.size;
+            if i < spanLength(block) then
+                if (i + 2) > spanLength(block) then
+                    destroyFree(made);
+                    return Left(left => failed(BadCompression(), at + 17 + i));
+                end if;
+                let offset: Index := indexOf(toSigned(littleWord(block, i, 2)));
+                let match: Run := runLength(block, i + 2, rem(token, 16));
+                let size: Index := match.size + 4;
+                if (not match.good) or (offset = 0) or (offset > bufferLength(&made)) or (size > (unpacked - bufferLength(&made))) then
+                    destroyFree(made);
+                    return Left(left => failed(BadCompression(), at + 17 + i));
+                end if;
+                var k: Index := 0;
+                while k < size do
+                    let back: Index := bufferLength(&made) - offset;
+                    let b: Nat8 := nthMut(&!made, back);
+                    insertBack(&!made, b);
+                    k := k + 1;
+                end while;
+                i := match.next;
+            end if;
+        end while;
+        if bufferLength(&made) /= unpacked then
+            destroyFree(made);
+            return Left(left => failed(BadCompression(), at));
+        end if;
+        appendAll(&~out, wholeSpan(&made));
+        destroyFree(made);
+        return Right(right => 9 + packed);
+    end;
+
+    -- A block of Zstandard: the nine bytes of the header, then frames.
+    generic [R: Region, S: Region]
+    function unpackZstd(bytes: Span[Nat8, R], at: Index, packed: Index, unpacked: Index, out: &![Buffer[Nat8], S]): Either[RootError, Index] is
+        case unzstd(spanPart(bytes, at + 9, packed), unpacked) of
+            when Some(value as text: String) do
+                if length(&text) /= unpacked then
+                    destroyString(text);
+                    return Left(left => failed(BadCompression(), at));
+                end if;
+                appendAll(&~out, asSpan(&text));
+                destroyString(text);
+                return Right(right => 9 + packed);
+            when None do
+                return Left(left => failed(BadCompression(), at + 9));
+        end case;
+    end;
+
+    -- A block of xz: the nine bytes of the header, then a whole stream of
+    -- xz with the filter LZMA2.
+    generic [R: Region, S: Region]
+    function unpackXz(bytes: Span[Nat8, R], at: Index, packed: Index, unpacked: Index, out: &![Buffer[Nat8], S]): Either[RootError, Index] is
+        case unxz(spanPart(bytes, at + 9, packed), unpacked) of
+            when Some(value as text: String) do
+                if length(&text) /= unpacked then
+                    destroyString(text);
+                    return Left(left => failed(BadCompression(), at));
+                end if;
+                appendAll(&~out, asSpan(&text));
+                destroyString(text);
+                return Right(right => 9 + packed);
+            when None do
+                return Left(left => failed(BadCompression(), at + 9));
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function appendAll(out: &![Buffer[Nat8], R], data: Span[Nat8, S]): Unit is
+        var i: Index := 0;
+        while i < spanLength(data) do
+            insertBack(&~out, data[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function readKeyAt(bytes: Span[Nat8, R], at: Index): Either[RootError, RootKey] is
+        return keyAt(bytes, at);
+    end;
+
+    generic [R: Region]
+    function objectBytes(bytes: Span[Nat8, R], key: RootKey, limit: Index): Either[RootError, String] is
+        if key.objectLength > limit then
+            return Left(left => failed(TooLarge(), key.seekKey));
+        end if;
+        return regionBytes(bytes, key.seekKey + key.keyLength, key.nbytes - key.keyLength, key.objectLength, limit);
+    end;
+
+    generic [R: Region]
+    function regionBytes(bytes: Span[Nat8, R], start: Index, stored: Index, unpacked: Index, limit: Index): Either[RootError, String] is
+        if not fits(bytes, start, stored) then
+            return Left(left => failed(Truncated(), start));
+        end if;
+        if unpacked > limit then
+            return Left(left => failed(TooLarge(), start));
+        end if;
+        if stored = unpacked then
+            return Right(right => fromSpan(spanPart(bytes, start, stored)));
+        end if;
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := start;
+        while bufferLength(&out) < unpacked do
+            if at >= (start + stored) then
+                destroyFree(out);
+                return Left(left => failed(BadCompression(), at));
+            end if;
+            let room: Index := unpacked - bufferLength(&out);
+            case unpackBlock(spanPart(bytes, 0, start + stored), at, &!out, room) of
+                when Left(left as e: RootError) do
+                    destroyFree(out);
+                    return Left(left => e);
+                when Right(right as used: Index) do
+                    at := at + used;
+            end case;
+        end while;
+        return Right(right => fromByteBuffer(out));
+    end;
+
+    -- A TObjString: a count of bytes with its flag, a version, the TObject
+    -- (a version, an identifier and the bits, two more bytes when it is
+    -- referenced), then the string.
+    generic [R: Region]
+    function objString(object: Span[Nat8, R]): Either[RootError, String] is
+        if not fits(object, 0, 16) then
+            return Left(left => failed(Truncated(), 0));
+        end if;
+        let count: Nat64 := unsignedAt(object, 0, 4);
+        if rem(count / byte_count_mask, 2) /= 1 then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        let bits: Nat64 := unsignedAt(object, 12, 4);
+        var at: Index := 16;
+        if rem(bits / is_referenced, 2) = 1 then
+            at := 18;
+        end if;
+        let text: Piece := stringAt(object, at);
+        if not text.good then
+            return Left(left => failed(BadString(), at));
+        end if;
+        return Right(right => fromSpan(spanPart(object, text.start, text.size)));
+    end;
+end module body.

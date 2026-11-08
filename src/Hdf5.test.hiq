@@ -1,0 +1,428 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal, contains);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue,
+    removeFileIfThere
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, destroyNdArray, rank, dimension, count, flatGet, fromSpan);
+import Mirco.Hdf5 (Hdf5Fault, writeFloat64, writeInt64, readFloat64, readInt64);
+import Mirco.Bindings.Hdf5 (zeroFree, createFile, openFile, createDataset, openDataset, closeDataset, closeFile as closeHdf5File);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Hdf5.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function faultCode(fault: Hdf5Fault): Int32 is
+        case fault of
+            when CannotOpen do
+                return 1;
+            when NoDataset do
+                return 2;
+            when WrongType do
+                return 3;
+            when BadShape do
+                return 4;
+            when Failed do
+                return 5;
+        end case;
+    end;
+
+    function writtenFloat(path: Span[Nat8, Static]): Bool is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 3);
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.5);
+        insertBack(&!values, -2.0);
+        insertBack(&!values, 3.25);
+        insertBack(&!values, 0.0);
+        insertBack(&!values, 1.0e300);
+        insertBack(&!values, -7.0e-300);
+        let a: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        var done: Bool := false;
+        case writeFloat64(path, "x", &a, true) of
+            when Right(right as u: Unit) do
+                done := true;
+            when Left(left as f: Hdf5Fault) do
+                done := false;
+        end case;
+        destroyNdArray(a);
+        return done;
+    end;
+
+    function writtenInt(path: Span[Nat8, Static]): Bool is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 4);
+        var values: Buffer[Int64] := allocateEmpty();
+        insertBack(&!values, -9223372036854775807);
+        insertBack(&!values, -1);
+        insertBack(&!values, 0);
+        insertBack(&!values, 9223372036854775807);
+        let a: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        var done: Bool := false;
+        case writeInt64(path, "group-free-n", &a, false) of
+            when Right(right as u: Unit) do
+                done := true;
+            when Left(left as f: Hdf5Fault) do
+                done := false;
+        end case;
+        destroyNdArray(a);
+        return done;
+    end;
+
+    -- A file at path with the dataset x of the dimensions first x second,
+    -- of Float64 when floating holds and of Int64 otherwise, no element
+    -- written: the shape the file announces without the elements to back
+    -- it, as a hostile file gives it.
+    function madeEmpty(path: Span[Nat8, Static], first: Nat64, second: Nat64, floating: Bool): Bool is
+        let file: Int64 := createFile(path);
+        if file < 0 then
+            return false;
+        end if;
+        var dims: Buffer[Nat64] := allocateEmpty();
+        insertBack(&!dims, first);
+        insertBack(&!dims, second);
+        let dataset: Int64 := createDataset(file, "x", wholeSpan(&dims), floating);
+        destroyFree(dims);
+        var closed_set: Int32 := -1;
+        if dataset >= 0 then
+            closed_set := closeDataset(dataset);
+        end if;
+        let closed: Int32 := closeHdf5File(file);
+        return (dataset >= 0) and ((closed_set = 0) and (closed = 0));
+    end;
+
+    -- The code of the fault readFloat64 gives for the dataset x of the
+    -- file at path, or 0 when it gives an array.
+    function readFloatCode(path: Span[Nat8, Static]): Int32 is
+        case readFloat64(path, "x") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                return 0;
+            when Left(left as f: Hdf5Fault) do
+                return faultCode(f);
+        end case;
+    end;
+
+    -- The code of the fault readInt64 gives for the dataset x of the file
+    -- at path, or 0 when it gives an array.
+    function readIntCode(path: Span[Nat8, Static]): Int32 is
+        case readInt64(path, "x") of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                return 0;
+            when Left(left as f: Hdf5Fault) do
+                return faultCode(f);
+        end case;
+    end;
+
+    -- A matrix of Float64 and a vector of Int64 in one file, read back
+    -- element for element with their shapes.
+    function testRoundTrip(): Unit is
+        assertTrue(writtenFloat("mirco-test.h5"), "the matrix is written into a new file");
+        assertTrue(writtenInt("mirco-test.h5"), "the vector is written into the same file");
+        case readFloat64("mirco-test.h5", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                assertTrue((rank(&m) = 2) and ((dimension(&m, 0) = 2) and (dimension(&m, 1) = 3)), "two by three");
+                assertTrue((flatGet(&m, 0) = 1.5) and ((flatGet(&m, 2) = 3.25) and (flatGet(&m, 4) = 1.0e300)), "the numbers");
+                assertTrue(flatGet(&m, 5) = -7.0e-300, "the smallest");
+                destroyNdArray(m);
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(false, "the matrix is read");
+        end case;
+        case readInt64("mirco-test.h5", "group-free-n") of
+            when Right(right as v: NdArray[Int64]) do
+                assertTrue((rank(&v) = 1) and (count(&v) = 4), "four integers");
+                assertTrue((flatGet(&v, 0) = -9223372036854775807) and (flatGet(&v, 3) = 9223372036854775807), "the extremes");
+                destroyNdArray(v);
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(false, "the vector is read");
+        end case;
+        assertTrue(removeFileIfThere("mirco-test.h5"), "the file is removed");
+        return nil;
+    end;
+
+    -- A missing file, a missing dataset and a dataset of the other type.
+    function testRefusals(): Unit is
+        case readFloat64("mirco-missing.h5", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "no such file");
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(faultCode(f) = 1, "CannotOpen");
+        end case;
+        assertTrue(writtenFloat("mirco-refused.h5"), "the matrix is written");
+        assertTrue(writtenInt("mirco-refused.h5"), "the vector is written");
+        case readFloat64("mirco-refused.h5", "y") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "no dataset y");
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(faultCode(f) = 2, "NoDataset");
+        end case;
+        case readFloat64("mirco-refused.h5", "group-free-n") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "integers are no Float64");
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(faultCode(f) = 3, "WrongType for integers");
+        end case;
+        case readInt64("mirco-refused.h5", "x") of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                assertTrue(false, "Float64 is no Int64");
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(faultCode(f) = 3, "WrongType for numbers");
+        end case;
+        assertTrue(removeFileIfThere("mirco-refused.h5"), "the file is removed");
+        return nil;
+    end;
+
+    -- The dimensions a file announces are checked before the array is
+    -- made: a dimension of 0, and a product of the dimensions that does
+    -- not fit an Index or goes above readElementLimit(), come back as
+    -- BadShape; before the check each of them stopped the programme over
+    -- a contract of Mirco.Array.  A file with a shape an array can have
+    -- is read as one, whatever its elements hold.
+    function testHostileDimensionsAreFaults(): Unit is
+        assertTrue(madeEmpty("mirco-hostile.h5", 0, 3, true), "a dataset of 0 x 3 is made");
+        assertTrue(readFloatCode("mirco-hostile.h5") = 4, "a dimension of 0 gives BadShape");
+        assertTrue(madeEmpty("mirco-hostile.h5", 0, 3, false), "an integer dataset of 0 x 3 is made");
+        assertTrue(readIntCode("mirco-hostile.h5") = 4, "a dimension of 0 gives BadShape for integers");
+        assertTrue(madeEmpty("mirco-hostile.h5", 1099511627776, 1099511627776, true), "a dataset of 2^40 x 2^40 is made");
+        assertTrue(readFloatCode("mirco-hostile.h5") = 4, "a count of elements that overflows an Index gives BadShape");
+        assertTrue(madeEmpty("mirco-hostile.h5", 1048576, 1048576, true), "a dataset of 2^20 x 2^20 is made");
+        assertTrue(readFloatCode("mirco-hostile.h5") = 4, "2^20 x 2^20, a count of 2^40 elements above readElementLimit(), gives BadShape");
+        assertTrue(madeEmpty("mirco-hostile.h5", 1048576, 1048576, false), "an integer dataset of 2^20 x 2^20 is made");
+        assertTrue(readIntCode("mirco-hostile.h5") = 4, "2^20 x 2^20 gives BadShape for integers");
+        assertTrue(madeEmpty("mirco-hostile.h5", 65536, 65537, false), "an integer dataset of 65536 x 65537 is made");
+        assertTrue(readIntCode("mirco-hostile.h5") = 4, "a count of elements above readElementLimit() gives BadShape");
+        assertTrue(madeEmpty("mirco-hostile.h5", 2, 3, true), "a dataset of 2 x 3 is made");
+        case readFloat64("mirco-hostile.h5", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                assertTrue((rank(&m) = 2) and ((dimension(&m, 0) = 2) and (dimension(&m, 1) = 3)), "two by three");
+                assertTrue(count(&m) = 6, "six elements");
+                destroyNdArray(m);
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(false, "a shape an array can have is read");
+        end case;
+        assertTrue(madeEmpty("mirco-hostile.h5", 2, 3, false), "an integer dataset of 2 x 3 is made");
+        case readInt64("mirco-hostile.h5", "x") of
+            when Right(right as v: NdArray[Int64]) do
+                assertTrue((rank(&v) = 2) and (count(&v) = 6), "six integers in two axes");
+                destroyNdArray(v);
+            when Left(left as f: Hdf5Fault) do
+                assertTrue(false, "a shape an array can have is read as integers");
+        end case;
+        assertTrue(removeFileIfThere("mirco-hostile.h5"), "the file is removed");
+        return nil;
+    end;
+
+    -- The contract of the Hdf5 functions asks for zeroFree of the path and the
+    -- name: the library would read a zero byte as the end of the text.
+    function testAZeroByteInAPathIsRefused(): Unit is
+        var clean: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!clean, 120);
+        insertBack(&!clean, 46);
+        insertBack(&!clean, 104);
+        var broken: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!broken, 120);
+        insertBack(&!broken, 0);
+        insertBack(&!broken, 104);
+        var alone: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!alone, 0);
+        let empty: Buffer[Nat8] := allocateEmpty();
+        assertTrue(zeroFree(wholeSpan(&clean)), "a text without a zero byte is taken");
+        assertTrue(zeroFree(wholeSpan(&empty)), "an empty text holds no zero byte");
+        assertFalse(zeroFree(wholeSpan(&broken)), "a zero byte inside ends the name for C");
+        assertFalse(zeroFree(wholeSpan(&alone)), "a zero byte alone is refused");
+        destroyFree(clean);
+        destroyFree(broken);
+        destroyFree(alone);
+        destroyFree(empty);
+        return nil;
+    end;
+
+    -- Calls, as the child for the word MIRCO_REFUSE names, the function of
+    -- that word with a zero byte in the path or the name; for inside, the
+    -- same functions with a path and a name without one.
+    function callWithZero(): Unit is
+        var clean: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!clean, 120);
+        var broken: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!broken, 120);
+        insertBack(&!broken, 0);
+        insertBack(&!broken, 104);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 1);
+        var floats: Buffer[Float64] := allocateEmpty();
+        insertBack(&!floats, 1.0);
+        var ints: Buffer[Int64] := allocateEmpty();
+        insertBack(&!ints, 1);
+        let f: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&floats));
+        let n: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&ints));
+        if asChild("writeFloat64Path") then
+            case writeFloat64(wholeSpan(&broken), "x", &f, true) of
+                when Right(right as u: Unit) do
+                    skip;
+                when Left(left as e: Hdf5Fault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("writeInt64Name") then
+            case writeInt64("mirco-zero.h5", wholeSpan(&broken), &n, true) of
+                when Right(right as u: Unit) do
+                    skip;
+                when Left(left as e: Hdf5Fault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("readFloat64Path") then
+            case readFloat64(wholeSpan(&broken), "x") of
+                when Right(right as m: NdArray[Float64]) do
+                    destroyNdArray(m);
+                when Left(left as e: Hdf5Fault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("readInt64Name") then
+            case readInt64("mirco-missing.h5", wholeSpan(&broken)) of
+                when Right(right as m: NdArray[Int64]) do
+                    destroyNdArray(m);
+                when Left(left as e: Hdf5Fault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("createFile") then
+            let file: Int64 := createFile(wholeSpan(&broken));
+        end if;
+        if asChild("openFile") then
+            let file: Int64 := openFile(wholeSpan(&broken), false);
+        end if;
+        if asChild("createDataset") then
+            var dims: Buffer[Nat64] := allocateEmpty();
+            insertBack(&!dims, 1);
+            let dataset: Int64 := createDataset(-1, wholeSpan(&broken), wholeSpan(&dims), true);
+            destroyFree(dims);
+        end if;
+        if asChild("openDataset") then
+            let dataset: Int64 := openDataset(-1, wholeSpan(&broken));
+        end if;
+        if asChild("inside") then
+            case readFloat64("mirco-missing.h5", wholeSpan(&clean)) of
+                when Right(right as m: NdArray[Float64]) do
+                    destroyNdArray(m);
+                when Left(left as e: Hdf5Fault) do
+                    skip;
+            end case;
+            let dataset: Int64 := openDataset(-1, wholeSpan(&clean));
+        end if;
+        destroyNdArray(f);
+        destroyNdArray(n);
+        destroyFree(shape);
+        destroyFree(floats);
+        destroyFree(ints);
+        destroyFree(clean);
+        destroyFree(broken);
+        return nil;
+    end;
+
+    -- A zero byte in the path or the name is refused by the requires of
+    -- each function that hands it to C, before the library sees it; a path
+    -- and a name without one break no contract.
+    function testAZeroByteIsRefusedByTheContracts(): Unit is
+        if asChild("inside") or (asChild("writeFloat64Path") or asChild("writeInt64Name") or asChild("readFloat64Path") or asChild("readInt64Name") or asChild("createFile") or asChild("openFile") or asChild("createDataset") or asChild("openDataset")) then
+            callWithZero();
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "writeFloat64Path", "contract violated: the requires"), "Mirco.Hdf5.writeFloat64 with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "writeInt64Name", "contract violated: the requires"), "Mirco.Hdf5.writeInt64 with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "readFloat64Path", "contract violated: the requires"), "Mirco.Hdf5.readFloat64 with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "readInt64Name", "contract violated: the requires"), "Mirco.Hdf5.readInt64 with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "createFile", "contract violated: the requires"), "createFile of the binding with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "openFile", "contract violated: the requires"), "openFile of the binding with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "createDataset", "contract violated: the requires"), "createDataset of the binding with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "openDataset", "contract violated: the requires"), "openDataset of the binding with a zero byte in the name is refused");
+        assertTrue(not refusedInChild("testAZeroByteIsRefusedByTheContracts", "inside", "contract violated"), "a path and a name without a zero byte break no contract");
+        return nil;
+    end;
+end module body.

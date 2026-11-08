@@ -1,0 +1,433 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- SQLite is the backend of this module: its calls run here, on
+-- Standard.Sqlite, and this body imports nothing of DuckDB, so a
+-- programme that imports Mirco.SchluckiStore alone holds no DuckDB and no
+-- C++.  A store of SQLite holds its connection in writer or in reader, as
+-- it was opened, and the handles of DuckDB are 0; a store of DuckDB holds
+-- the handles of its module Mirco.SchluckiStore.DuckDb and neither
+-- connection, and each call of it is one of the five slots below.
+--
+-- A path through a write reference uses the reference up, so each
+-- connection is reached by a small function of its own.
+import Standard.Sqlite (
+    Connection,
+    Writing,
+    Reading,
+    SqlError,
+    Transaction,
+    Cursor,
+    openWriter,
+    openReader,
+    closeDatabase,
+    begin,
+    commit,
+    rollback,
+    execute,
+    start,
+    advance,
+    finish,
+    noValues,
+    columnInt64OrNone,
+    columnFloat64OrNone,
+    columnTextOrNone
+);
+import Mirco.Schlucki (
+    Table,
+    Rows,
+    destroyTable,
+    insertRows,
+    rowsFor,
+    putFloat,
+    putInt,
+    putText,
+    putBool,
+    finishRows,
+    kindsKnown,
+    kindFloat,
+    kindInt,
+    kindText,
+    kindBool
+);
+
+module body Mirco.SchluckiStore is
+    record Store: Linear is
+        backend: Nat8;
+        writable: Bool;
+        writer: Option[Connection[Writing]];
+        reader: Option[Connection[Reading]];
+        database: Nat64;
+        connection: Nat64;
+    end;
+
+    function backendSqlite(): Nat8 is
+        return 1;
+    end;
+
+    function backendDuckDb(): Nat8 is
+        return 2;
+    end;
+
+    -- The backend of a store whose caller names none is SQLite, so a call
+    -- site that names no backend opens a database of SQLite.
+    function backendDefault(): Nat8 is
+        return backendSqlite();
+    end;
+
+    function cannotOpen(): Int32 is
+        return 1;
+    end;
+
+    function fileHeld(): Int32 is
+        return 2;
+    end;
+
+    function libraryTooOld(): Int32 is
+        return 3;
+    end;
+
+    function statementFailed(): Int32 is
+        return 4;
+    end;
+
+    function wrongColumns(): Int32 is
+        return 5;
+    end;
+
+    function readOnly(): Int32 is
+        return 6;
+    end;
+
+    function wrongParameters(): Int32 is
+        return 7;
+    end;
+
+    function backendAbsent(): Int32 is
+        return 8;
+    end;
+
+    -- The kinds of Mirco as the column types of SQLite: "REAL" for a Float64,
+    -- "INTEGER" for an Int64 and for a Bool, which is the integer 0 or 1, and
+    -- "TEXT" for a text.  A table of these types is "STRICT", so SQLite
+    -- refuses a value of another type instead of converting it, and every
+    -- one of the four may be "NULL", which scan and query read as None.
+    function columnTypeOf(kind: Nat8): Span[Nat8, Static] is
+        if (kind = kindInt()) or (kind = kindBool()) then
+            return "INTEGER";
+        end if;
+        if kind = kindText() then
+            return "TEXT";
+        end if;
+        return "REAL";
+    end;
+
+    function storeError(code: Int32, detail: Int32): StoreError is
+        return StoreError(code => code, detail => detail);
+    end;
+
+    function columnNumber(c: Index): Int32 is
+        case toInt32(c) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Mirco.SchluckiStore: a column number above the range of Int32");
+        end case;
+    end;
+
+    -- The first column of kinds whose code is no kind of Mirco, spanLength
+    -- when every one is; it is the detail of wrongColumns.
+    generic [S: Region]
+    function badKindAt(kinds: Span[Nat8, S]): Index is
+        var c: Index := 0;
+        while c < spanLength(kinds) do
+            if (kinds[c] < 1) or (kinds[c] > 4) then
+                return c;
+            end if;
+            c := c + 1;
+        end while;
+        return spanLength(kinds);
+    end;
+
+    generic [R: Region]
+    function openStore(backend: Nat8, path: Span[Nat8, R], writable: Bool): Either[StoreError, Store] is
+        if backend = backendDuckDb() then
+            return openDuck(path, writable);
+        end if;
+        if writable then
+            return openSqliteWriter(path);
+        end if;
+        return openSqliteReader(path);
+    end;
+
+    generic [R: Region]
+    function openSqliteWriter(path: Span[Nat8, R]): Either[StoreError, Store] is
+        case openWriter(path) of
+            when Right(right as db: Connection[Writing]) do
+                let none: Option[Connection[Reading]] := None();
+                let made: Store := Store(backend => backendSqlite(), writable => true, writer => Some(value => db), reader => none,
+                    database => 0, connection => 0);
+                return Right(right => made);
+            when Left(left as e: SqlError) do
+                return Left(left => storeError(cannotOpen(), e.code));
+        end case;
+    end;
+
+    generic [R: Region]
+    function openSqliteReader(path: Span[Nat8, R]): Either[StoreError, Store] is
+        case openReader(path) of
+            when Right(right as db: Connection[Reading]) do
+                let none: Option[Connection[Writing]] := None();
+                let made: Store := Store(backend => backendSqlite(), writable => false, writer => none, reader => Some(value => db),
+                    database => 0, connection => 0);
+                return Right(right => made);
+            when Left(left as e: SqlError) do
+                return Left(left => storeError(cannotOpen(), e.code));
+        end case;
+    end;
+
+    -- A store of DuckDB is made from the handles of the slot and from
+    -- nothing else, so a programme without the module that implements the
+    -- slot never holds one.
+    generic [R: Region]
+    function openDuck(path: Span[Nat8, R], writable: Bool): Either[StoreError, Store] is
+        case duckOpen(path, writable) of
+            when Right(right as handles: DuckHandles) do
+                let { database: Nat64, connection: Nat64 } := handles;
+                let no_writer: Option[Connection[Writing]] := None();
+                let no_reader: Option[Connection[Reading]] := None();
+                let made: Store := Store(backend => backendDuckDb(), writable => writable, writer => no_writer,
+                    reader => no_reader, database => database, connection => connection);
+                return Right(right => made);
+            when Left(left as e: StoreError) do
+                return Left(left => e);
+        end case;
+    end;
+
+    function closeStore(store: Store): Unit is
+        let { backend: Nat8, writable: Bool, writer: Option[Connection[Writing]], reader: Option[Connection[Reading]],
+            database: Nat64, connection: Nat64 } := store;
+        case writer of
+            when Some(value as db: Connection[Writing]) do
+                closeDatabase(db);
+            when None do
+                skip;
+        end case;
+        case reader of
+            when Some(value as db: Connection[Reading]) do
+                closeDatabase(db);
+            when None do
+                skip;
+        end case;
+        if backend = backendDuckDb() then
+            duckClose(database, connection);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function backendOf(store: &[Store, R]): Nat8 is
+        if store->backend = backendDuckDb() then
+            return backendDuckDb();
+        end if;
+        return backendSqlite();
+    end;
+
+    generic [R: Region]
+    function createTable(store: &![Store, R], sql: Span[Nat8, Static]): Either[StoreError, Unit] is
+        if not store->writable then
+            return Left(left => storeError(readOnly(), 0));
+        end if;
+        if store->backend = backendDuckDb() then
+            return duckCreate(store->connection, sql);
+        end if;
+        return createSqlite(&~store, sql);
+    end;
+
+    generic [R: Region]
+    function createSqlite(store: &![Store, R], sql: Span[Nat8, Static]): Either[StoreError, Unit] is
+        case &!(store->writer) of
+            when Some(value as db: &![Connection[Writing], R]) do
+                case execute(db, sql, noValues()) of
+                    when Right(right as n: Nat64) do
+                        return Right(right => nil);
+                    when Left(left as e: SqlError) do
+                        return Left(left => storeError(statementFailed(), e.code));
+                end case;
+            when None do
+                return Left(left => storeError(readOnly(), 0));
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function scan(store: &![Store, R], sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        if not kindsKnown(kinds) then
+            return Left(left => storeError(wrongColumns(), columnNumber(badKindAt(kinds))));
+        end if;
+        if store->backend = backendDuckDb() then
+            return duckScan(store->connection, sql, kinds);
+        end if;
+        if store->writable then
+            return scanWriter(&~store, sql, kinds);
+        end if;
+        return scanReader(&~store, sql, kinds);
+    end;
+
+    generic [R: Region, S: Region]
+    function scanWriter(store: &![Store, R], sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        case &!(store->writer) of
+            when Some(value as db: &![Connection[Writing], R]) do
+                return scanSqlite(db, sql, kinds);
+            when None do
+                abort("Mirco.SchluckiStore: a store of SQLite for writing without its connection");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function scanReader(store: &![Store, R], sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        case &!(store->reader) of
+            when Some(value as db: &![Connection[Reading], R]) do
+                return scanSqlite(db, sql, kinds);
+            when None do
+                abort("Mirco.SchluckiStore: a store of SQLite for reading without its connection");
+        end case;
+    end;
+
+    -- The rows of a statement of SQLite, a cell for each kind.  The rows of
+    -- a statement that failed are named into a table and that table is
+    -- destroyed, since Rows is linear and Mirco.Schlucki exports no
+    -- destructor of it.
+    generic [M: Free, R: Region, S: Region]
+    function scanSqlite(db: &![Connection[M], R], sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        var rows: Rows := rowsFor(kinds);
+        var cursor: Cursor := start(&~db, sql, noValues());
+        while advance(&!cursor) do
+            var c: Index := 0;
+            while c < spanLength(kinds) do
+                putSqliteCell(&cursor, columnNumber(c), kinds[c], &!rows);
+                c := c + 1;
+            end while;
+        end while;
+        case finish(&~db, cursor) of
+            when Some(value as e: SqlError) do
+                let dropped: Table := finishRows(rows, "");
+                destroyTable(dropped);
+                return Left(left => storeError(statementFailed(), e.code));
+            when None do
+                return Right(right => rows);
+        end case;
+    end;
+
+    -- One cell of the row the cursor is at; a Bool is an integer in SQLite,
+    -- as insertRows writes it.
+    generic [C: Region, R: Region]
+    function putSqliteCell(cursor: &[Cursor, C], index: Int32, kind: Nat8, rows: &![Rows, R]): Unit is
+        if kind = kindFloat() then
+            putFloat(rows, columnFloat64OrNone(cursor, index));
+        else if kind = kindInt() then
+            putInt(rows, columnInt64OrNone(cursor, index));
+        else if kind = kindBool() then
+            case columnInt64OrNone(cursor, index) of
+                when Some(value as v: Int64) do
+                    let b: Bool := v /= 0;
+                    putBool(rows, Some(value => b));
+                when None do
+                    let none: Option[Bool] := None();
+                    putBool(rows, none);
+            end case;
+        else
+            putText(rows, columnTextOrNone(cursor, index));
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function query(store: &![Store, R], sql: Span[Nat8, Static], kinds: Span[Nat8, S], names: Span[Nat8, Q]): Either[StoreError, Table] is
+        case scan(&~store, sql, kinds) of
+            when Left(left as e: StoreError) do
+                return Left(left => e);
+            when Right(right as rows: Rows) do
+                return Right(right => finishRows(rows, names));
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function append(store: &![Store, R], sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64] is
+        if not store->writable then
+            return Left(left => storeError(readOnly(), 0));
+        end if;
+        if store->backend = backendDuckDb() then
+            return duckAppend(store->connection, sql, t);
+        end if;
+        return appendSqlite(&~store, sql, t);
+    end;
+
+    generic [R: Region, S: Region]
+    function appendSqlite(store: &![Store, R], sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64] is
+        case &!(store->writer) of
+            when Some(value as db: &![Connection[Writing], R]) do
+                return inTransaction(db, sql, t);
+            when None do
+                return Left(left => storeError(readOnly(), 0));
+        end case;
+    end;
+
+    -- insertRows between a begin and a commit; the first row that fails
+    -- rolls the transaction back.
+    generic [R: Region, S: Region]
+    function inTransaction(db: &![Connection[Writing], R], sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64] is
+        case begin(&~db) of
+            when Left(left as e: SqlError) do
+                return Left(left => storeError(statementFailed(), e.code));
+            when Right(right as transaction: Transaction) do
+                case insertRows(&~db, sql, t) of
+                    when Left(left as e: SqlError) do
+                        rollback(&~db, transaction);
+                        return Left(left => storeError(statementFailed(), e.code));
+                    when Right(right as n: Nat64) do
+                        case commit(&~db, transaction) of
+                            when Left(left as e: SqlError) do
+                                return Left(left => storeError(statementFailed(), e.code));
+                            when Right(right as done: Unit) do
+                                return Right(right => n);
+                        end case;
+                end case;
+        end case;
+    end;
+
+    ---
+    --- The slots of DuckDB
+    ---
+
+    -- A programme that does not import Mirco.SchluckiStore.DuckDb keeps these
+    -- bodies: opening DuckDB stops the programme with the reason that the
+    -- backend is absent, instead of guessing one, and closing gives back what
+    -- no open gave, which is nothing.
+
+    generic [R: Region]
+    function duckOpen(path: Span[Nat8, R], writable: Bool): Either[StoreError, DuckHandles] is
+        abort("Mirco.SchluckiStore: the backend DuckDB is not in the programme, import Mirco.SchluckiStore.DuckDb");
+    end;
+
+    function duckCreate(connection: Nat64, sql: Span[Nat8, Static]): Either[StoreError, Unit] is
+        abort("Mirco.SchluckiStore: the backend DuckDB is not in the programme, import Mirco.SchluckiStore.DuckDb");
+    end;
+
+    generic [S: Region]
+    function duckScan(connection: Nat64, sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        abort("Mirco.SchluckiStore: the backend DuckDB is not in the programme, import Mirco.SchluckiStore.DuckDb");
+    end;
+
+    generic [S: Region]
+    function duckAppend(connection: Nat64, sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64] is
+        abort("Mirco.SchluckiStore: the backend DuckDB is not in the programme, import Mirco.SchluckiStore.DuckDb");
+    end;
+
+    function duckClose(database: Nat64, connection: Nat64): Unit is
+        return nil;
+    end;
+end module body.

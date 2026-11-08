@@ -1,0 +1,37 @@
+mirco-blis holds C sources of three projects, each under its own licence.
+They were downloaded on 2026-10-27 from the official upstreams named here.
+
+BLIS 2.1
+  From:     https://github.com/flame/blis/archive/refs/tags/2.1.tar.gz
+  SHA-256:  901752ec596cd63421ea45a6a06a9f34491cf5ae01cea412ece05f97a2690a96
+  Licence:  BSD 3-Clause, c/blis/LICENSE
+  Kept:     LICENSE CREDITS README.md CHANGELOG Makefile common.mk configure
+            config_registry blis.pc.in build config frame kernels
+            ref_kernels addon sandbox, unchanged.
+  Left out: blastest (the f2c translation of the BLAS tests), testsuite,
+            test, docs, examples, ci, vendor, RELEASING.md, CONTRIBUTING.md,
+            INSTALL.
+
+LAPACK, the C translation of lapack-netlib in OpenBLAS 0.3.34
+  From:     https://github.com/OpenMathLib/OpenBLAS/releases/download/v0.3.34/OpenBLAS-0.3.34.tar.gz
+  SHA-256:  cd7e129868320cc2d033afa920e31202dfe0b8066a5b66661900ccc0f197dfed
+  Licence:  the modified BSD licence of LAPACK, c/lapack/LICENSE
+            (lapack-netlib/LICENSE); OpenBLAS's own BSD 3-Clause licence,
+            c/lapack/LICENSE.OpenBLAS.
+  Kept:     the 126 C files listed in c/lapack/FILES.txt, unchanged: the
+            routines dgesv, dgetrf, dgetrs, dgeqrf, dorgqr, dormqr, dpotrf,
+            dpotrs, dgesdd, dsyevd, dgeev and dgelsd, and every routine they
+            call, found by linking them against BLIS until no symbol was left.
+
+pocketfft, from NumPy 1.26.4
+  From:     https://github.com/numpy/numpy/releases/download/v1.26.4/numpy-1.26.4.tar.gz
+            (numpy/fft/_pocketfft.c)
+  SHA-256:  2a02aba9ed12e4ac4eb3ea9421c420301a0c6460d9830d74a9df87efa4912010
+  Licence:  BSD 3-Clause, the licence of NumPy, c/pocketfft/LICENSE.numpy;
+            copyright of the code 2004-2018 Max-Planck-Society, Martin Reinecke.
+  Kept:     c/pocketfft/_pocketfft.c.orig, the file as NumPy ships it.
+  Changed:  c/pocketfft/pocketfft.c is made from it by tools/make-pocketfft.pl:
+            the includes of Python and NumPy and the functions over PyObject
+            are left out, assert.h and mirco_pocketfft.h are included, and
+            mirco_cfft, mirco_rfft_forward and mirco_rfft_backward are
+            appended. The transforms themselves are unchanged.

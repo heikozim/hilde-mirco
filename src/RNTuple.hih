@@ -1,0 +1,188 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reads the RNTuple of a .root file, binary format 1.0, and its fields of numbers and strings.
+
+- The anchor, the header, the footer and the page lists are read; their envelopes are checked for type and length.
+- Pages packed by zlib, LZ4, xz or Zstandard are unpacked up to a limit the caller names.
+- Columns of plain and split integers, of binary32 and binary64 numbers and of strings are decoded.
+- A collection of numbers gives its items and their offsets; a projected field reads through its alias columns.
+- A field below the top, a member of a record, the items of an array or of a collection, is named by its path.
+- A variant gives the alternative of each value, and each alternative its own values.
+- A range of clusters can be read alone, so ranks of Sperli read a share each.
+- Integer fields become Int64, float fields Float32, double fields Float64; nothing else is converted.
+- Every offset is checked against the bytes; a malformed RNTuple gives a RootError, never an abort.
+
+    case readNtuple(bytes, key, 16777216) of
+        when Right(right as tuple: Ntuple) do
+            destroyNtuple(tuple);
+        when Left(left as error: RootError) do
+            skip;
+    end case;
+"""
+import Standard.Buffer (Buffer);
+import Standard.String (String);
+import Mirco.Array (NdArray);
+import Mirco.Root (RootError, RootKey);
+
+module Mirco.RNTuple is
+    """
+    The fields, columns and pages of an RNTuple.
+    """
+    type Ntuple: Linear;
+
+    """
+    The RNTuple whose anchor the key holds, a key of the class of anchors of Root; refused above limit bytes unpacked,
+    and for a format of another epoch than 1.
+    No contract: no precondition, since a key, bytes or a limit that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readNtuple(bytes: Span[Nat8, R], key: RootKey, limit: Index): Either[RootError, Ntuple];
+
+    """
+    Gives the RNTuple back.
+    No contract: a destroy function.
+    """
+    function destroyNtuple(tuple: Ntuple): Unit;
+
+    """
+    The count of entries, the sum over the clusters.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function ntupleEntries(tuple: &[Ntuple, R]): Index;
+
+    """
+    The count of clusters of the RNTuple, over all its cluster groups.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function clusterCount(tuple: &[Ntuple, R]): Index;
+
+    """
+    The count of entries of the cluster c, counted from 0 in the order of the file.
+    """
+    generic [R: Region]
+    function clusterEntries(tuple: &[Ntuple, R], c: Index): Index
+        requires c < clusterCount(tuple);
+
+    """
+    The RNTuple cut down to count clusters from first on: only their pages are read, and every reader gives the
+    values of their entries only, the first cluster counted as 0 again. A range past the last cluster is cut at
+    it. A rank of Sperli reads its share with rankFirst and rankCount.
+    No contract: a condition cannot borrow the linear tuple it is given, so the body cuts the range instead.
+    """
+    function narrowClusters(tuple: Ntuple, first: Index, count: Index): Ntuple
+        ensures clusterCount(&result) <= count;
+
+    """
+    The first cluster of rank among ranks when clusters are shared as evenly as can be, the first ranks taking
+    one more when they do not divide.
+    """
+    function rankFirst(clusters: Index, rank: Index, ranks: Index): Index
+        requires (ranks > 0) and (rank < ranks)
+        ensures result <= clusters;
+
+    """
+    The count of clusters of rank among ranks, as rankFirst shares them.
+    """
+    function rankCount(clusters: Index, rank: Index, ranks: Index): Index
+        requires (ranks > 0) and (rank < ranks)
+        ensures result <= clusters;
+
+    """
+    The count of fields at the top of the RNTuple.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function fieldCount(tuple: &[Ntuple, R]): Index;
+
+    """
+    The count of numbers that name a field: the top fields below fieldCount, then one for each field of the
+    RNTuple, as fieldPath gives them.
+    """
+    generic [R: Region]
+    function fieldHandles(tuple: &[Ntuple, R]): Index
+        ensures result >= fieldCount(tuple);
+
+    """
+    The number of the field at path, the names of its fields from the top down joined by dots, such as
+    my_struct.sub_struct.i, or items._0 for the items of a collection or an array; None when no field has that
+    path. Every function that takes a field at i takes it.
+    No contract: an Option result.
+    """
+    generic [R: Region, S: Region]
+    function fieldPath(tuple: &[Ntuple, R], path: Span[Nat8, S]): Option[Index];
+
+    """
+    The name of the field at i, a top field or a number fieldPath gives.
+    """
+    generic [R: Region]
+    function fieldName(tuple: &[Ntuple, R], i: Index): String
+        requires i < fieldHandles(tuple);
+
+    """
+    The name of the type of the field at i, such as std::int32_t, float or std::string.
+    """
+    generic [R: Region]
+    function fieldTypeName(tuple: &[Ntuple, R], i: Index): String
+        requires i < fieldHandles(tuple);
+
+    """
+    The values of the field at i whose column holds integers, one for each entry; for a collection of
+    integers, such as std::vector, all its items in order, which fieldOffsets cuts into entries; for a
+    cardinality the count of items of each entry. Refused for any other column and for an unsigned number
+    above the largest Int64.
+    """
+    generic [R: Region, S: Region]
+    function fieldInt64(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]]
+        requires i < fieldHandles(tuple);
+
+    """
+    The values of the field at i whose column holds binary64 numbers, or the items of a collection of
+    them, as fieldInt64 gives them.
+    """
+    generic [R: Region, S: Region]
+    function fieldFloat64(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Float64]]
+        requires i < fieldHandles(tuple);
+
+    """
+    The values of the field at i whose column holds binary32 numbers, or the items of a collection of
+    them, as fieldInt64 gives them.
+    """
+    generic [R: Region, S: Region]
+    function fieldFloat32(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Float32]]
+        requires i < fieldHandles(tuple);
+
+    """
+    The strings of the field at i of the type std::string, one for each entry, or for a collection of them all
+    its strings in order.
+    """
+    generic [R: Region, S: Region]
+    function fieldStrings(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, Buffer[String]]
+        requires i < fieldHandles(tuple);
+
+    """
+    The alternative of each value of the variant field at i, such as a std::variant: 0 for the first of the
+    fields below it, 1 for the second and so on, -1 for a value of none. The values of an alternative are
+    read through its path, variant._0 for the first. Refused for a field that is no variant and when the
+    indices of its switch column do not count up within each cluster.
+    """
+    generic [R: Region, S: Region]
+    function fieldTags(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]]
+        requires i < fieldHandles(tuple);
+
+    """
+    Where the items of each entry of the field at i begin among all its items, for a field whose first
+    column is an index, such as a std::vector or an RVec: one offset more than there are entries, the first
+    0 and the last the count of items, over all clusters.
+    """
+    generic [R: Region, S: Region]
+    function fieldOffsets(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]]
+        requires i < fieldHandles(tuple);
+end module.

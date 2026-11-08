@@ -1,0 +1,249 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray);
+import Mirco.Integrate (trapezoid, trapezoidOver, simpson, integrate);
+import Mirco.Math (absolute, sine, exponential, pi, euler);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Integrate.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64, tolerance: Float64): Bool is
+        return absolute(a - b) < tolerance;
+    end;
+
+    -- The values of x to the power p at x = 0, 1, ..., n - 1.
+    function powers(n: Index, p: Index): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        var x: Float64 := 0.0;
+        var at: Index := 0;
+        while at < n do
+            var v: Float64 := 1.0;
+            var k: Index := 0;
+            while k < p do
+                v := v * x;
+                k := k + 1;
+            end while;
+            insertBack(&!values, v);
+            x := x + 1.0;
+            at := at + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- x squared at 0 to 4: the trapezoids give 22, Simpson the exact 64 / 3.
+    function testSquares(): Unit is
+        let y: NdArray[Float64] := powers(5, 2);
+        assertTrue(trapezoid(&y, 1.0) = 22.0, "trapezoids of x squared");
+        assertTrue(near(simpson(&y, 1.0), 64.0 / 3.0, 0.000000000001), "Simpson of x squared");
+        destroyNdArray(y);
+        return nil;
+    end;
+
+    -- x cubed at 0 to 5, an even count, and at 0 to 3, four samples:
+    -- exact, 625 / 4 and 81 / 4.
+    function testCubesEvenCount(): Unit is
+        let six: NdArray[Float64] := powers(6, 3);
+        assertTrue(near(simpson(&six, 1.0), 156.25, 0.000000001), "six samples of x cubed");
+        let four: NdArray[Float64] := powers(4, 3);
+        assertTrue(near(simpson(&four, 1.0), 20.25, 0.000000001), "four samples, three eighths");
+        let two: NdArray[Float64] := powers(2, 1);
+        assertTrue(simpson(&two, 1.0) = 0.5, "two samples, one trapezoid");
+        destroyNdArray(six);
+        destroyNdArray(four);
+        destroyNdArray(two);
+        return nil;
+    end;
+
+    -- y = x at x = 0, x = 1 and x = 3: the area 4.5.
+    function testUnevenPoints(): Unit is
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 0.0);
+        insertBack(&!values, 1.0);
+        insertBack(&!values, 3.0);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let x: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let y: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        assertTrue(trapezoidOver(&y, &x) = 4.5, "the area under y = x to 3");
+        destroyNdArray(x);
+        destroyNdArray(y);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testQuadrature(): Unit is
+        assertTrue(near(integrate(sine, 0.0, pi(), 0.000000001), 2.0, 0.00000001), "sine from 0 to pi");
+        assertTrue(near(integrate(exponential, 0.0, 1.0, 0.000000001), euler() - 1.0, 0.00000001), "e to the x from 0 to 1");
+        return nil;
+    end;
+
+    -- integrate of sine from a to b with tolerance; the result is not
+    -- asked for, only whether the call is taken.
+    function integrateOf(a: Float64, b: Float64, tolerance: Float64): Unit is
+        let area: Float64 := integrate(sine, a, b, tolerance);
+        return nil;
+    end;
+
+    -- Each call in a child of its own: bounds the wrong way round, one
+    -- bound twice, an infinite and a NaN bound and a tolerance of 0 are
+    -- refused by the requires of integrate; a dx of 0 and of -1 by those of
+    -- trapezoid and simpson, one sample by simpson, an x of another count
+    -- by trapezoidOver.  The fitting calls are taken.
+    function testRefusals(): Unit is
+        if asChild("integrateReversed") then
+            integrateOf(1.0, 0.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("integrateEmpty") then
+            integrateOf(1.0, 1.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("integrateInfinite") then
+            integrateOf(0.0, exponential(1000.0), 0.000001);
+            return nil;
+        end if;
+        if asChild("integrateNaN") then
+            let infinity: Float64 := exponential(1000.0);
+            integrateOf(infinity - infinity, 1.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("integrateZeroTolerance") then
+            integrateOf(0.0, 1.0, 0.0);
+            return nil;
+        end if;
+        if asChild("trapezoidZeroStep") then
+            let y: NdArray[Float64] := powers(5, 2);
+            let area: Float64 := trapezoid(&y, 0.0);
+            destroyNdArray(y);
+            return nil;
+        end if;
+        if asChild("simpsonNegativeStep") then
+            let y: NdArray[Float64] := powers(5, 2);
+            let area: Float64 := simpson(&y, -1.0);
+            destroyNdArray(y);
+            return nil;
+        end if;
+        if asChild("simpsonOneSample") then
+            let y: NdArray[Float64] := powers(1, 2);
+            let area: Float64 := simpson(&y, 1.0);
+            destroyNdArray(y);
+            return nil;
+        end if;
+        if asChild("trapezoidOverOtherCount") then
+            let y: NdArray[Float64] := powers(5, 2);
+            let x: NdArray[Float64] := powers(4, 1);
+            let area: Float64 := trapezoidOver(&y, &x);
+            destroyNdArray(x);
+            destroyNdArray(y);
+            return nil;
+        end if;
+        if asChild("fits") then
+            integrateOf(0.0, 1.0, 0.000001);
+            let y: NdArray[Float64] := powers(5, 2);
+            let x: NdArray[Float64] := powers(5, 1);
+            let a1: Float64 := trapezoid(&y, 1.0);
+            let a2: Float64 := simpson(&y, 1.0);
+            let a3: Float64 := trapezoidOver(&y, &x);
+            destroyNdArray(x);
+            destroyNdArray(y);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "integrateReversed", "contract violated: the requires"), "integrate from 1 to 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integrateEmpty", "contract violated: the requires"), "integrate from 1 to 1 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integrateInfinite", "contract violated: the requires"), "integrate to an infinity is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integrateNaN", "contract violated: the requires"), "integrate from a NaN is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integrateZeroTolerance", "contract violated: the requires"), "integrate to a tolerance of 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "trapezoidZeroStep", "contract violated: the requires"), "trapezoid with a dx of 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "simpsonNegativeStep", "contract violated: the requires"), "simpson with a dx of -1 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "simpsonOneSample", "contract violated: the requires"), "simpson of one sample is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "trapezoidOverOtherCount", "contract violated: the requires"), "trapezoidOver of 5 samples at 4 points is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "fitting calls break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "fitting calls are taken");
+        return nil;
+    end;
+end module body.

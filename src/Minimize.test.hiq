@@ -1,0 +1,239 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, count, flatGet);
+import Mirco.Minimize (Objective, nelderMead, bfgs);
+import Mirco.Math (absolute);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Minimize.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The function of Rosenbrock, (a - x)^2 + b (y - x^2)^2, smallest at a, a^2.
+    record Rosenbrock: Free is
+        a: Float64;
+        b: Float64;
+    end;
+
+    instance Objective(Rosenbrock) is
+        generic [R: Region]
+        method valueAt(objective: Rosenbrock, x: &[NdArray[Float64], R]): Float64 is
+            let u: Float64 := flatGet(x, 0);
+            let v: Float64 := flatGet(x, 1);
+            let d: Float64 := v - (u * u);
+            return ((objective.a - u) * (objective.a - u)) + (objective.b * (d * d));
+        end;
+    end;
+
+    -- A bowl of three variables, smallest at 3, -1, 0.5.
+    record Bowl: Free is
+        weight: Float64;
+    end;
+
+    instance Objective(Bowl) is
+        generic [R: Region]
+        method valueAt(objective: Bowl, x: &[NdArray[Float64], R]): Float64 is
+            let p: Float64 := flatGet(x, 0) - 3.0;
+            let q: Float64 := flatGet(x, 1) + 1.0;
+            let r: Float64 := flatGet(x, 2) - 0.5;
+            return ((p * p) + (objective.weight * (q * q))) + (r * r);
+        end;
+    end;
+
+    function vector2(x: Float64, y: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, x);
+        insertBack(&!v, y);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    function vector3(x: Float64, y: Float64, z: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, x);
+        insertBack(&!v, y);
+        insertBack(&!v, z);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    function near(a: Float64, b: Float64, tolerance: Float64): Bool is
+        return absolute(a - b) <= tolerance;
+    end;
+
+    -- From the classic start -1.2, 1 both find the minimum 1, 1.
+    function testRosenbrock(): Unit is
+        let f: Rosenbrock := Rosenbrock(a => 1.0, b => 100.0);
+        let start: NdArray[Float64] := vector2(-1.2, 1.0);
+        let simplex: NdArray[Float64] := nelderMead(f, &start, 0.0000000001);
+        assertTrue(near(flatGet(&simplex, 0), 1.0, 0.0001) and near(flatGet(&simplex, 1), 1.0, 0.0001), "Nelder and Mead reach 1, 1");
+        let quasi: NdArray[Float64] := bfgs(f, &start, 0.000001);
+        assertTrue(near(flatGet(&quasi, 0), 1.0, 0.0001) and near(flatGet(&quasi, 1), 1.0, 0.0001), "BFGS reaches 1, 1");
+        destroyNdArray(simplex);
+        destroyNdArray(quasi);
+        destroyNdArray(start);
+        return nil;
+    end;
+
+    -- A bowl of three variables, with a weight that stretches one axis.
+    function testBowl(): Unit is
+        let f: Bowl := Bowl(weight => 10.0);
+        let start: NdArray[Float64] := vector3(0.0, 0.0, 0.0);
+        let simplex: NdArray[Float64] := nelderMead(f, &start, 0.0000000001);
+        assertTrue(count(&simplex) = 3, "three numbers");
+        assertTrue(near(flatGet(&simplex, 0), 3.0, 0.0001) and (near(flatGet(&simplex, 1), -1.0, 0.0001) and near(flatGet(&simplex, 2), 0.5, 0.0001)), "Nelder and Mead");
+        let quasi: NdArray[Float64] := bfgs(f, &start, 0.0000001);
+        assertTrue(near(flatGet(&quasi, 0), 3.0, 0.00001) and (near(flatGet(&quasi, 1), -1.0, 0.00001) and near(flatGet(&quasi, 2), 0.5, 0.00001)), "BFGS");
+        destroyNdArray(simplex);
+        destroyNdArray(quasi);
+        destroyNdArray(start);
+        return nil;
+    end;
+
+    -- The start -1.2, 1 as a matrix of one row and two columns.
+    function row2(x: Float64, y: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, x);
+        insertBack(&!v, y);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 1);
+        insertBack(&!shape, 2);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- Both searches over start with tolerance; the results are not asked for.
+    function searchesOf(start: NdArray[Float64], tolerance: Float64, simplex: Bool): Unit is
+        let f: Rosenbrock := Rosenbrock(a => 1.0, b => 100.0);
+        if simplex then
+            let found: NdArray[Float64] := nelderMead(f, &start, tolerance);
+            destroyNdArray(found);
+        else
+            let found: NdArray[Float64] := bfgs(f, &start, tolerance);
+            destroyNdArray(found);
+        end if;
+        destroyNdArray(start);
+        return nil;
+    end;
+
+    -- Each call in a child of its own: a start of rank 2 and a tolerance
+    -- of 0 are refused by the requires of nelderMead and of bfgs.  A
+    -- vector start with a tolerance above 0 is taken.
+    function testRefusals(): Unit is
+        if asChild("nelderMeadMatrix") then
+            searchesOf(row2(-1.2, 1.0), 0.000001, true);
+            return nil;
+        end if;
+        if asChild("nelderMeadZeroTolerance") then
+            searchesOf(vector2(-1.2, 1.0), 0.0, true);
+            return nil;
+        end if;
+        if asChild("bfgsMatrix") then
+            searchesOf(row2(-1.2, 1.0), 0.000001, false);
+            return nil;
+        end if;
+        if asChild("bfgsZeroTolerance") then
+            searchesOf(vector2(-1.2, 1.0), 0.0, false);
+            return nil;
+        end if;
+        if asChild("fits") then
+            searchesOf(vector2(-1.2, 1.0), 0.000001, true);
+            searchesOf(vector2(-1.2, 1.0), 0.000001, false);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "nelderMeadMatrix", "contract violated: the requires"), "nelderMead from a start of rank 2 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "nelderMeadZeroTolerance", "contract violated: the requires"), "nelderMead to a tolerance of 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "bfgsMatrix", "contract violated: the requires"), "bfgs from a start of rank 2 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "bfgsZeroTolerance", "contract violated: the requires"), "bfgs to a tolerance of 0 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "fitting calls break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "fitting calls are taken");
+        return nil;
+    end;
+end module body.

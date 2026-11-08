@@ -1,0 +1,1315 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- After RFC 8878.  Bits are read one at a time: forward from the lowest
+-- bit of the first byte for the description of a table, backward from the
+-- highest set bit of the last byte for a stream of Huffman or fse codes.
+-- A table of fse is three buffers, symbol, bits and base, indexed by state;
+-- a table of Huffman two, symbol and bits, indexed by the next bits.  The
+-- output is its own window.
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, removeLast, destroyFree, length, lengthMut, nth, nthMut, storeNth, wholeSpan);
+import Standard.String (String, fromByteBuffer);
+
+module body Mirco.Zstd is
+    constant prime1: Nat64 := 11400714785074694791;
+    constant prime2: Nat64 := 14029467366897019727;
+    constant prime3: Nat64 := 1609587929392839161;
+    constant prime4: Nat64 := 9650029242287828579;
+    constant prime5: Nat64 := 2870177450012600261;
+
+    function wide(b: Nat8): Index is
+        case toIndex(b) of
+            when Some(value as w: Index) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function twoTo(k: Index): Index is
+        var v: Index := 1;
+        var i: Index := 0;
+        while i < k do
+            v := v * 2;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    -- The position of the highest set bit of v, v above 0.
+    function highBit(v: Index): Index is
+        var h: Index := 0;
+        var x: Index := v;
+        while x > 1 do
+            x := x / 2;
+            h := h + 1;
+        end while;
+        return h;
+    end;
+
+    -- Bit k of data, bit 0 the lowest of the first byte.
+    generic [R: Region]
+    function bitAt(data: Span[Nat8, R], k: Index): Index is
+        return rem(wide(data[k / 8]) / twoTo(rem(k, 8)), 2);
+    end;
+
+    -- A backward reader: the next bit to read is pos - 1, the stream ends
+    -- at low; over when more were read than there were.
+    record Back: Free is
+        pos: Index;
+        low: Index;
+        over: Bool;
+    end;
+
+    -- The reader of the bytes from start up to end: the bits below the
+    -- highest set bit of the last byte; over when that byte is 0.
+    generic [R: Region]
+    function backOf(data: Span[Nat8, R], start: Index, finish: Index): Back is
+        if (finish <= start) or (finish > spanLength(data)) then
+            return Back(pos => 0, low => 0, over => true);
+        end if;
+        let last: Index := wide(data[finish - 1]);
+        if last = 0 then
+            return Back(pos => 0, low => 0, over => true);
+        end if;
+        return Back(pos => ((finish - 1) * 8) + highBit(last), low => start * 8, over => false);
+    end;
+
+    record Read: Free is
+        value: Index;
+        reader: Back;
+    end;
+
+    -- n bits, the first read the highest; bits below the stream read as 0.
+    generic [R: Region]
+    function readBack(data: Span[Nat8, R], b: Back, n: Index): Read is
+        var v: Index := 0;
+        var pos: Index := b.pos;
+        var over: Bool := b.over;
+        var i: Index := 0;
+        while i < n do
+            v := 2 * v;
+            if pos > b.low then
+                pos := pos - 1;
+                v := v + bitAt(data, pos);
+            else
+                over := true;
+            end if;
+            i := i + 1;
+        end while;
+        return Read(value => v, reader => Back(pos => pos, low => b.low, over => over));
+    end;
+
+    -- The next n bits without reading them.
+    generic [R: Region]
+    function peekBack(data: Span[Nat8, R], b: Back, n: Index): Index is
+        let r: Read := readBack(data, b, n);
+        return r.value;
+    end;
+
+    function skipBack(b: Back, n: Index): Back is
+        if (b.pos - b.low) < n then
+            return Back(pos => b.low, low => b.low, over => true);
+        end if;
+        return Back(pos => b.pos - n, low => b.low, over => b.over);
+    end;
+
+    -- n bits forward from bit at, the first read the lowest.
+    generic [R: Region]
+    function readForward(data: Span[Nat8, R], at: Index, n: Index): Index is
+        var v: Index := 0;
+        var i: Index := 0;
+        while i < n do
+            if ((at + i) / 8) < spanLength(data) then
+                v := v + (bitAt(data, at + i) * twoTo(i));
+            end if;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    -- A table of fse built from normalized counts, -1 for less than one.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function buildFse(counts: &[Buffer[Int64], R], log: Index, symbols: &![Buffer[Index], S], bits: &![Buffer[Index], Q], bases: &![Buffer[Index], P]): Bool is
+        let size: Index := twoTo(log);
+        var table: Buffer[Index] := initialize(size, 0);
+        var next: Buffer[Index] := allocateEmpty();
+        var high: Index := size - 1;
+        var s: Index := 0;
+        while s < length(counts) do
+            let c: Int64 := nth(counts, s);
+            if c = -1 then
+                storeNth(&!table, high, s);
+                if high > 0 then
+                    high := high - 1;
+                end if;
+                insertBack(&!next, 1);
+            else
+                insertBack(&!next, indexOf(c));
+            end if;
+            s := s + 1;
+        end while;
+        let step: Index := ((size / 2) + (size / 8)) + 3;
+        var pos: Index := 0;
+        s := 0;
+        while s < length(counts) do
+            let c: Int64 := nth(counts, s);
+            var k: Int64 := 0;
+            while k < c do
+                storeNth(&!table, pos, s);
+                pos := rem(pos + step, size);
+                while pos > high do
+                    pos := rem(pos + step, size);
+                end while;
+                k := k + 1;
+            end while;
+            s := s + 1;
+        end while;
+        if pos /= 0 then
+            destroyFree(table);
+            destroyFree(next);
+            return false;
+        end if;
+        clearAll(&~symbols);
+        clearAll(&~bits);
+        clearAll(&~bases);
+        var state: Index := 0;
+        while state < size do
+            let sym: Index := nthMut(&!table, state);
+            let n: Index := nthMut(&!next, sym);
+            storeNth(&!next, sym, n + 1);
+            let nb: Index := log - highBit(n);
+            insertBack(&~symbols, sym);
+            insertBack(&~bits, nb);
+            insertBack(&~bases, (n * twoTo(nb)) - size);
+            state := state + 1;
+        end while;
+        destroyFree(table);
+        destroyFree(next);
+        return true;
+    end;
+
+    function indexOf(v: Int64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function clearAll(b: &![Buffer[Index], R]): Unit is
+        while lengthMut(&~b) > 0 do
+            let dropped: Index := removeLastOf(&~b);
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function removeLastOf(b: &![Buffer[Index], R]): Index is
+        return removeLast(b);
+    end;
+
+    -- The description of a table of fse from bit at: its accuracy, then a
+    -- count for each symbol in as many bits as the counts left need, a run
+    -- of zeros after a zero.  The log comes back with the counts in counts,
+    -- and the first byte after the description; 0 for the log on a fault.
+    record Described: Free is
+        log: Index;
+        next: Index;
+    end;
+
+    generic [R: Region, S: Region]
+    function describe(data: Span[Nat8, R], start: Index, finish: Index, max_log: Index, max_symbol: Index, counts: &![Buffer[Int64], S]): Described is
+        let bad: Described := Described(log => 0, next => start);
+        if start >= finish then
+            return bad;
+        end if;
+        var at: Index := start * 8;
+        let log: Index := readForward(data, at, 4) + 5;
+        at := at + 4;
+        if log > max_log then
+            return bad;
+        end if;
+        var remaining: Index := twoTo(log) + 1;
+        var threshold: Index := twoTo(log);
+        var nb: Index := log + 1;
+        var symbol: Index := 0;
+        while (remaining > 1) and (symbol <= max_symbol) do
+            let mx: Index := ((2 * threshold) - 1) - remaining;
+            let value: Index := readForward(data, at, nb);
+            var c: Index := 0;
+            if rem(value, threshold) < mx then
+                c := rem(value, threshold);
+                at := at + (nb - 1);
+            else
+                c := rem(value, 2 * threshold);
+                if c >= threshold then
+                    c := c - mx;
+                end if;
+                at := at + nb;
+            end if;
+            if c = 0 then
+                insertBack(&~counts, -1);
+                remaining := remaining - 1;
+            else
+                insertBack(&~counts, toCount(c - 1));
+                remaining := remaining - (c - 1);
+            end if;
+            symbol := symbol + 1;
+            if c = 1 then
+                var repeat: Index := readForward(data, at, 2);
+                at := at + 2;
+                var more: Bool := true;
+                while more do
+                    var z: Index := 0;
+                    while z < repeat do
+                        insertBack(&~counts, 0);
+                        symbol := symbol + 1;
+                        z := z + 1;
+                    end while;
+                    more := repeat = 3;
+                    if more then
+                        repeat := readForward(data, at, 2);
+                        at := at + 2;
+                    end if;
+                end while;
+            end if;
+            while (remaining < threshold) and (threshold > 1) do
+                nb := nb - 1;
+                threshold := threshold / 2;
+            end while;
+            if ((at + 7) / 8) > finish then
+                return bad;
+            end if;
+        end while;
+        if (remaining /= 1) or (symbol > (max_symbol + 1)) then
+            return bad;
+        end if;
+        return Described(log => log, next => (at + 7) / 8);
+    end;
+
+    function toCount(v: Index): Int64 is
+        case toInt64(v) of
+            when Some(value as c: Int64) do
+                return c;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The predefined distributions of literal lengths, match lengths and
+    -- offsets, written as text of comma separated counts.
+    function predefined(kind: Index): Span[Nat8, Static] is
+        if kind = 0 then
+            return "4,3,2,2,2,2,2,2,2,2,2,2,2,1,1,1,2,2,2,2,2,2,2,2,2,3,2,1,1,1,1,1,-1,-1,-1,-1";
+        end if;
+        if kind = 1 then
+            return "1,1,1,1,1,1,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1";
+        end if;
+        return "1,4,3,2,2,2,2,2,2,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,1,-1,-1,-1,-1,-1,-1,-1";
+    end;
+
+    generic [R: Region]
+    function parseCounts(text: Span[Nat8, Static], counts: &![Buffer[Int64], R]): Unit is
+        var v: Int64 := 0;
+        var negative: Bool := false;
+        var i: Index := 0;
+        while i <= spanLength(text) do
+            var ends: Bool := i = spanLength(text);
+            if not ends then
+                ends := text[i] = 44;
+            end if;
+            if ends then
+                if negative then
+                    insertBack(&~counts, 0 - v);
+                else
+                    insertBack(&~counts, v);
+                end if;
+                v := 0;
+                negative := false;
+            else if text[i] = 45 then
+                negative := true;
+            else
+                v := (v * 10) + toCount(wide(text[i]) - 48);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The base and the extra bits of a code of literal length or of match
+    -- length.
+    function literalBase(code: Index): Index is
+        if code < 16 then
+            return code;
+        end if;
+        return literalBaseHigh(code);
+    end;
+
+    function literalBaseHigh(code: Index): Index is
+        if code < 20 then
+            return 16 + (2 * (code - 16));
+        end if;
+        if code = 20 then
+            return 24;
+        end if;
+        if code = 21 then
+            return 28;
+        end if;
+        if code = 22 then
+            return 32;
+        end if;
+        if code = 23 then
+            return 40;
+        end if;
+        if code = 24 then
+            return 48;
+        end if;
+        return twoTo(code - 19);
+    end;
+
+    function literalExtra(code: Index): Index is
+        if code < 16 then
+            return 0;
+        end if;
+        if code < 20 then
+            return 1;
+        end if;
+        if code < 22 then
+            return 2;
+        end if;
+        if code < 24 then
+            return 3;
+        end if;
+        if code = 24 then
+            return 4;
+        end if;
+        return code - 19;
+    end;
+
+    function matchBase(code: Index): Index is
+        if code < 32 then
+            return code + 3;
+        end if;
+        if code < 36 then
+            return 35 + (2 * (code - 32));
+        end if;
+        if code = 36 then
+            return 43;
+        end if;
+        if code = 37 then
+            return 47;
+        end if;
+        if code = 38 then
+            return 51;
+        end if;
+        if code = 39 then
+            return 59;
+        end if;
+        if code = 40 then
+            return 67;
+        end if;
+        if code = 41 then
+            return 83;
+        end if;
+        if code = 42 then
+            return 99;
+        end if;
+        return twoTo(code - 36) + 3;
+    end;
+
+    function matchExtra(code: Index): Index is
+        if code < 32 then
+            return 0;
+        end if;
+        if code < 36 then
+            return 1;
+        end if;
+        if code < 38 then
+            return 2;
+        end if;
+        if code < 40 then
+            return 3;
+        end if;
+        if code < 42 then
+            return 4;
+        end if;
+        if code = 42 then
+            return 5;
+        end if;
+        return code - 36;
+    end;
+
+    -- A table of Huffman from the weights: the last weight follows from the
+    -- others, a code of weight w is maxBits + 1 - w bits long, and the
+    -- symbols of one weight take their slots in the order of the symbols.
+    generic [R: Region, S: Region, Q: Region]
+    function buildHuffman(weights: &![Buffer[Index], R], symbols: &![Buffer[Index], S], bits: &![Buffer[Index], Q]): Bool is
+        var total: Index := 0;
+        var i: Index := 0;
+        while i < lengthMut(&~weights) do
+            let w: Index := nthMut(&~weights, i);
+            if w > 11 then
+                return false;
+            end if;
+            if w > 0 then
+                total := total + twoTo(w - 1);
+            end if;
+            i := i + 1;
+        end while;
+        if total = 0 then
+            return false;
+        end if;
+        let max_bits: Index := highBit(total) + 1;
+        let rest: Index := twoTo(max_bits) - total;
+        if (rest = 0) or (twoTo(highBit(rest)) /= rest) or (max_bits > 11) then
+            return false;
+        end if;
+        insertBack(&~weights, highBit(rest) + 1);
+        let size: Index := twoTo(max_bits);
+        clearAll(&~symbols);
+        clearAll(&~bits);
+        var k: Index := 0;
+        while k < size do
+            insertBack(&~symbols, 0);
+            insertBack(&~bits, 0);
+            k := k + 1;
+        end while;
+        var start: Index := 0;
+        var w: Index := 1;
+        while w <= max_bits do
+            i := 0;
+            while i < lengthMut(&~weights) do
+                if nthMut(&~weights, i) = w then
+                    let span: Index := twoTo(w - 1);
+                    var j: Index := 0;
+                    while j < span do
+                        storeNth(&~symbols, start + j, i);
+                        storeNth(&~bits, start + j, (max_bits + 1) - w);
+                        j := j + 1;
+                    end while;
+                    start := start + span;
+                end if;
+                i := i + 1;
+            end while;
+            w := w + 1;
+        end while;
+        return start = size;
+    end;
+
+    -- The description of a Huffman tree at at: a byte, then 4 bits for each
+    -- weight when it is 128 or more, or a compressed size of weights coded
+    -- by fse with two states.  The first byte after it, or 0 on a fault.
+    generic [R: Region, S: Region, Q: Region]
+    function readHuffman(data: Span[Nat8, R], at: Index, finish: Index, symbols: &![Buffer[Index], S], bits: &![Buffer[Index], Q]): Index is
+        if at >= finish then
+            return 0;
+        end if;
+        let head: Index := wide(data[at]);
+        var weights: Buffer[Index] := allocateEmpty();
+        var next: Index := 0;
+        if head >= 128 then
+            let n: Index := head - 127;
+            let size: Index := (n + 1) / 2;
+            if (finish - (at + 1)) < size then
+                destroyFree(weights);
+                return 0;
+            end if;
+            var i: Index := 0;
+            while i < n do
+                let b: Index := wide(data[(at + 1) + (i / 2)]);
+                if rem(i, 2) = 0 then
+                    insertBack(&!weights, b / 16);
+                else
+                    insertBack(&!weights, rem(b, 16));
+                end if;
+                i := i + 1;
+            end while;
+            next := (at + 1) + size;
+        else
+            let limit: Index := (at + 1) + head;
+            if (head = 0) or (limit > finish) then
+                destroyFree(weights);
+                return 0;
+            end if;
+            var counts: Buffer[Int64] := allocateEmpty();
+            let d: Described := describe(data, at + 1, limit, 6, 255, &!counts);
+            var fs: Buffer[Index] := allocateEmpty();
+            var fb: Buffer[Index] := allocateEmpty();
+            var fbase: Buffer[Index] := allocateEmpty();
+            var good: Bool := d.log > 0;
+            if good then
+                good := buildFse(&counts, d.log, &!fs, &!fb, &!fbase);
+            end if;
+            if good then
+                var r: Back := backOf(data, d.next, limit);
+                let first: Read := readBack(data, r, d.log);
+                let second: Read := readBack(data, first.reader, d.log);
+                r := second.reader;
+                var s1: Index := first.value;
+                var s2: Index := second.value;
+                var done: Bool := r.over;
+                good := not r.over;
+                while (not done) and (lengthMut(&!weights) < 255) do
+                    insertBack(&!weights, nthMut(&!fs, s1));
+                    let u1: Read := readBack(data, r, nthMut(&!fb, s1));
+                    s1 := nthMut(&!fbase, s1) + u1.value;
+                    r := u1.reader;
+                    if r.over then
+                        insertBack(&!weights, nthMut(&!fs, s2));
+                        done := true;
+                    else
+                        insertBack(&!weights, nthMut(&!fs, s2));
+                        let u2: Read := readBack(data, r, nthMut(&!fb, s2));
+                        s2 := nthMut(&!fbase, s2) + u2.value;
+                        r := u2.reader;
+                        if r.over then
+                            insertBack(&!weights, nthMut(&!fs, s1));
+                            done := true;
+                        end if;
+                    end if;
+                end while;
+            end if;
+            destroyFree(counts);
+            destroyFree(fs);
+            destroyFree(fb);
+            destroyFree(fbase);
+            if not good then
+                destroyFree(weights);
+                return 0;
+            end if;
+            next := limit;
+        end if;
+        let built: Bool := buildHuffman(&!weights, &~symbols, &~bits);
+        destroyFree(weights);
+        if not built then
+            return 0;
+        end if;
+        return next;
+    end;
+
+    -- One stream of Huffman codes, count symbols into out.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function huffmanStream(data: Span[Nat8, R], start: Index, finish: Index, wanted: Index, symbols: &![Buffer[Index], S], bits: &![Buffer[Index], Q], out: &![Buffer[Nat8], P]): Bool is
+        let size: Index := lengthMut(&~symbols);
+        if size = 0 then
+            return false;
+        end if;
+        let max_bits: Index := highBit(size);
+        var r: Back := backOf(data, start, finish);
+        if r.over then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < wanted do
+            let slot: Index := peekBack(data, r, max_bits);
+            let sym: Index := nthMut(&~symbols, slot);
+            r := skipBack(r, nthMut(&~bits, slot));
+            insertBack(&~out, byteOf(sym));
+            k := k + 1;
+        end while;
+        return (not r.over) and (r.pos = r.low);
+    end;
+
+    function byteOf(v: Index): Nat8 is
+        case toNat8(v) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function streamCount(format: Index): Index is
+        if format = 0 then
+            return 1;
+        end if;
+        return 4;
+    end;
+
+    -- The literals section of a compressed block at at, into lits; the first
+    -- byte after it, or 0 on a fault.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function literals(data: Span[Nat8, R], at: Index, finish: Index, lits: &![Buffer[Nat8], S], symbols: &![Buffer[Index], Q], bits: &![Buffer[Index], P]): Index is
+        if at >= finish then
+            return 0;
+        end if;
+        let b0: Index := wide(data[at]);
+        let kind: Index := rem(b0, 4);
+        let format: Index := rem(b0 / 4, 4);
+        if kind <= 1 then
+            var size: Index := b0 / 8;
+            var head: Index := 1;
+            if format = 1 then
+                if (finish - at) < 2 then
+                    return 0;
+                end if;
+                size := (b0 / 16) + (wide(data[at + 1]) * 16);
+                head := 2;
+            else if format = 3 then
+                if (finish - at) < 3 then
+                    return 0;
+                end if;
+                size := ((b0 / 16) + (wide(data[at + 1]) * 16)) + (wide(data[at + 2]) * 4096);
+                head := 3;
+            end if;
+            if kind = 0 then
+                if (finish - (at + head)) < size then
+                    return 0;
+                end if;
+                var i: Index := 0;
+                while i < size do
+                    insertBack(&~lits, data[(at + head) + i]);
+                    i := i + 1;
+                end while;
+                return (at + head) + size;
+            end if;
+            if (finish - (at + head)) < 1 then
+                return 0;
+            end if;
+            var i: Index := 0;
+            while i < size do
+                insertBack(&~lits, data[at + head]);
+                i := i + 1;
+            end while;
+            return (at + head) + 1;
+        end if;
+        var head: Index := 3;
+        var size_bits: Index := 10;
+        if format = 2 then
+            head := 4;
+            size_bits := 14;
+        else if format = 3 then
+            head := 5;
+            size_bits := 18;
+        end if;
+        if (finish - at) < head then
+            return 0;
+        end if;
+        var h: Index := 0;
+        var i: Index := head;
+        while i > 0 do
+            i := i - 1;
+            h := (h * 256) + wide(data[at + i]);
+        end while;
+        let regenerated: Index := rem(h / 16, twoTo(size_bits));
+        let compressed: Index := h / twoTo(4 + size_bits);
+        let streams: Index := streamCount(format);
+        var p: Index := at + head;
+        let limit: Index := p + compressed;
+        if limit > finish then
+            return 0;
+        end if;
+        if kind = 2 then
+            p := readHuffman(data, p, limit, &~symbols, &~bits);
+            if p = 0 then
+                return 0;
+            end if;
+        end if;
+        if streams = 1 then
+            if not huffmanStream(data, p, limit, regenerated, &~symbols, &~bits, &~lits) then
+                return 0;
+            end if;
+            return limit;
+        end if;
+        if (limit - p) < 6 then
+            return 0;
+        end if;
+        let s1: Index := wide(data[p]) + (wide(data[p + 1]) * 256);
+        let s2: Index := wide(data[p + 2]) + (wide(data[p + 3]) * 256);
+        let s3: Index := wide(data[p + 4]) + (wide(data[p + 5]) * 256);
+        let first: Index := p + 6;
+        if (((first + s1) + s2) + s3) > limit then
+            return 0;
+        end if;
+        let each: Index := (regenerated + 3) / 4;
+        if (3 * each) > regenerated then
+            return 0;
+        end if;
+        let a: Bool := huffmanStream(data, first, first + s1, each, &~symbols, &~bits, &~lits);
+        let b: Bool := huffmanStream(data, first + s1, (first + s1) + s2, each, &~symbols, &~bits, &~lits);
+        let c: Bool := huffmanStream(data, (first + s1) + s2, ((first + s1) + s2) + s3, each, &~symbols, &~bits, &~lits);
+        let d: Bool := huffmanStream(data, ((first + s1) + s2) + s3, limit, regenerated - (3 * each), &~symbols, &~bits, &~lits);
+        if not (a and b and c and d) then
+            return 0;
+        end if;
+        return limit;
+    end;
+
+    -- The table of one of the three kinds by its mode: 0 predefined, 1 one
+    -- symbol, 2 described, 3 the one of the block before.  The first byte
+    -- after it, or 0 on a fault; log is the accuracy of the table.
+    record Mode: Free is
+        next: Index;
+        log: Index;
+    end;
+
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function tableFor(data: Span[Nat8, R], at: Index, finish: Index, mode: Index, kind: Index, previous_log: Index, symbols: &![Buffer[Index], S], bits: &![Buffer[Index], Q], bases: &![Buffer[Index], P]): Mode is
+        let bad: Mode := Mode(next => 0, log => 0);
+        var max_log: Index := 9;
+        var max_symbol: Index := 35;
+        var default_log: Index := 6;
+        if kind = 1 then
+            max_log := 8;
+            max_symbol := 31;
+            default_log := 5;
+        else if kind = 2 then
+            max_symbol := 52;
+        end if;
+        if mode = 3 then
+            if lengthMut(&~symbols) = 0 then
+                return bad;
+            end if;
+            return Mode(next => at, log => previous_log);
+        end if;
+        if mode = 1 then
+            if at >= finish then
+                return bad;
+            end if;
+            let symbol: Index := wide(data[at]);
+            if symbol > max_symbol then
+                return bad;
+            end if;
+            clearAll(&~symbols);
+            clearAll(&~bits);
+            clearAll(&~bases);
+            insertBack(&~symbols, symbol);
+            insertBack(&~bits, 0);
+            insertBack(&~bases, 0);
+            return Mode(next => at + 1, log => 0);
+        end if;
+        var counts: Buffer[Int64] := allocateEmpty();
+        var log: Index := default_log;
+        var next: Index := at;
+        if mode = 0 then
+            parseCounts(predefined(kind), &!counts);
+        else
+            let d: Described := describe(data, at, finish, max_log, max_symbol, &!counts);
+            if d.log = 0 then
+                destroyFree(counts);
+                return bad;
+            end if;
+            log := d.log;
+            next := d.next;
+        end if;
+        let built: Bool := buildFse(&counts, log, &~symbols, &~bits, &~bases);
+        destroyFree(counts);
+        if not built then
+            return bad;
+        end if;
+        return Mode(next => next, log => log);
+    end;
+
+    -- The state of a frame between its blocks: the three repeat offsets and
+    -- the accuracies of the tables of the block before.
+    record Frame: Free is
+        rep1: Index;
+        rep2: Index;
+        rep3: Index;
+        llLog: Index;
+        ofLog: Index;
+        mlLog: Index;
+        good: Bool;
+    end;
+
+    function failedFrame(f: Frame): Frame is
+        return Frame(rep1 => f.rep1, rep2 => f.rep2, rep3 => f.rep3, llLog => f.llLog, ofLog => f.ofLog, mlLog => f.mlLog, good => false);
+    end;
+
+    record Run: Free is
+        frame: Frame;
+        used: Index;
+    end;
+
+    function failedRun(f: Frame): Run is
+        return Run(frame => failedFrame(f), used => 0);
+    end;
+
+    -- The sequences of a block: three states read first, literal length,
+    -- offset and match length; for each sequence the extra bits of the
+    -- offset, the match length and the literal length, then the states
+    -- updated in the order literal length, match length, offset.  Literals
+    -- are copied from lits, a match from the output itself.
+    generic [R: Region, S: Region, Q: Region, A: Region, B: Region, C: Region, D: Region, E: Region, F: Region, G: Region, H: Region, I: Region]
+    function sequences(data: Span[Nat8, R], at: Index, finish: Index, n: Index, lits: &![Buffer[Nat8], S], out: &![Buffer[Nat8], Q], ll_s: &![Buffer[Index], A], ll_b: &![Buffer[Index], B], ll_base: &![Buffer[Index], C], of_s: &![Buffer[Index], D], of_b: &![Buffer[Index], E], of_base: &![Buffer[Index], F], ml_s: &![Buffer[Index], G], ml_b: &![Buffer[Index], H], ml_base: &![Buffer[Index], I], fr: Frame, limit: Index): Run is
+        var r: Back := backOf(data, at, finish);
+        if r.over then
+            return failedRun(fr);
+        end if;
+        let a: Read := readBack(data, r, fr.llLog);
+        let b: Read := readBack(data, a.reader, fr.ofLog);
+        let c: Read := readBack(data, b.reader, fr.mlLog);
+        r := c.reader;
+        var ll_state: Index := a.value;
+        var of_state: Index := b.value;
+        var ml_state: Index := c.value;
+        var rep1: Index := fr.rep1;
+        var rep2: Index := fr.rep2;
+        var rep3: Index := fr.rep3;
+        var used: Index := 0;
+        var k: Index := 0;
+        while k < n do
+            let of_code: Index := nthMut(&~of_s, of_state);
+            let ml_code: Index := nthMut(&~ml_s, ml_state);
+            let ll_code: Index := nthMut(&~ll_s, ll_state);
+            if (of_code > 31) or (ml_code > 52) or (ll_code > 35) then
+                return failedRun(fr);
+            end if;
+            let of_extra: Read := readBack(data, r, of_code);
+            let ml_extra: Read := readBack(data, of_extra.reader, matchExtra(ml_code));
+            let ll_extra: Read := readBack(data, ml_extra.reader, literalExtra(ll_code));
+            r := ll_extra.reader;
+            let offset_value: Index := twoTo(of_code) + of_extra.value;
+            let match_length: Index := matchBase(ml_code) + ml_extra.value;
+            let literal_length: Index := literalBase(ll_code) + ll_extra.value;
+            var offset: Index := 0;
+            if offset_value > 3 then
+                offset := offset_value - 3;
+                rep3 := rep2;
+                rep2 := rep1;
+                rep1 := offset;
+            else
+                var pick: Index := offset_value;
+                if literal_length = 0 then
+                    pick := pick + 1;
+                end if;
+                if pick = 1 then
+                    offset := rep1;
+                else if pick = 2 then
+                    offset := rep2;
+                    rep2 := rep1;
+                    rep1 := offset;
+                else if pick = 3 then
+                    offset := rep3;
+                    rep3 := rep2;
+                    rep2 := rep1;
+                    rep1 := offset;
+                else
+                    if rep1 <= 1 then
+                        return failedRun(fr);
+                    end if;
+                    offset := rep1 - 1;
+                    rep3 := rep2;
+                    rep2 := rep1;
+                    rep1 := offset;
+                end if;
+            end if;
+            if (k + 1) < n then
+                let u1: Read := readBack(data, r, nthMut(&~ll_b, ll_state));
+                ll_state := nthMut(&~ll_base, ll_state) + u1.value;
+                let u2: Read := readBack(data, u1.reader, nthMut(&~ml_b, ml_state));
+                ml_state := nthMut(&~ml_base, ml_state) + u2.value;
+                let u3: Read := readBack(data, u2.reader, nthMut(&~of_b, of_state));
+                of_state := nthMut(&~of_base, of_state) + u3.value;
+                r := u3.reader;
+                if (ll_state >= lengthMut(&~ll_s)) or (ml_state >= lengthMut(&~ml_s)) or (of_state >= lengthMut(&~of_s)) then
+                    return failedRun(fr);
+                end if;
+            end if;
+            let have: Index := lengthMut(&~lits);
+            let produced: Index := lengthMut(&~out);
+            if (literal_length > (have - used)) or ((literal_length + match_length) > (limit - produced)) then
+                return failedRun(fr);
+            end if;
+            var i: Index := 0;
+            while i < literal_length do
+                let lit: Nat8 := nthMut(&~lits, used + i);
+                insertBack(&~out, lit);
+                i := i + 1;
+            end while;
+            used := used + literal_length;
+            let now: Index := lengthMut(&~out);
+            if (offset = 0) or (offset > now) then
+                return failedRun(fr);
+            end if;
+            i := 0;
+            while i < match_length do
+                let here: Index := lengthMut(&~out);
+                let copied: Nat8 := nthMut(&~out, here - offset);
+                insertBack(&~out, copied);
+                i := i + 1;
+            end while;
+            k := k + 1;
+        end while;
+        if r.over or (r.pos /= r.low) then
+            return failedRun(fr);
+        end if;
+        return Run(frame => Frame(rep1 => rep1, rep2 => rep2, rep3 => rep3, llLog => fr.llLog, ofLog => fr.ofLog, mlLog => fr.mlLog, good => true), used => used);
+    end;
+
+    -- A compressed block from at to finish: its literals, the count of its
+    -- sequences, the modes and tables of the three kinds, the sequences,
+    -- and the literals left over.
+    generic [R: Region, S: Region, A: Region, B: Region, C: Region, D: Region, E: Region, F: Region, G: Region, H: Region, I: Region, J: Region, K: Region]
+    function compressedBlock(data: Span[Nat8, R], at: Index, finish: Index, out: &![Buffer[Nat8], S], ll_s: &![Buffer[Index], A], ll_b: &![Buffer[Index], B], ll_base: &![Buffer[Index], C], of_s: &![Buffer[Index], D], of_b: &![Buffer[Index], E], of_base: &![Buffer[Index], F], ml_s: &![Buffer[Index], G], ml_b: &![Buffer[Index], H], ml_base: &![Buffer[Index], I], h_s: &![Buffer[Index], J], h_b: &![Buffer[Index], K], fr: Frame, limit: Index): Frame is
+        var lits: Buffer[Nat8] := allocateEmpty();
+        var p: Index := literals(data, at, finish, &!lits, &~h_s, &~h_b);
+        if (p = 0) or (p >= finish) then
+            destroyFree(lits);
+            return failedFrame(fr);
+        end if;
+        let b0: Index := wide(data[p]);
+        var n: Index := b0;
+        if b0 >= 128 then
+            if b0 < 255 then
+                if (finish - p) < 2 then
+                    destroyFree(lits);
+                    return failedFrame(fr);
+                end if;
+                n := ((b0 - 128) * 256) + wide(data[p + 1]);
+                p := p + 2;
+            else
+                if (finish - p) < 3 then
+                    destroyFree(lits);
+                    return failedFrame(fr);
+                end if;
+                n := (wide(data[p + 1]) + (wide(data[p + 2]) * 256)) + 32512;
+                p := p + 3;
+            end if;
+        else
+            p := p + 1;
+        end if;
+        var f: Frame := fr;
+        var used: Index := 0;
+        if n > 0 then
+            if p >= finish then
+                destroyFree(lits);
+                return failedFrame(fr);
+            end if;
+            let modes: Index := wide(data[p]);
+            let ll: Mode := tableFor(data, p + 1, finish, modes / 64, 0, f.llLog, &~ll_s, &~ll_b, &~ll_base);
+            if ll.next = 0 then
+                destroyFree(lits);
+                return failedFrame(fr);
+            end if;
+            let off: Mode := tableFor(data, ll.next, finish, rem(modes / 16, 4), 1, f.ofLog, &~of_s, &~of_b, &~of_base);
+            if off.next = 0 then
+                destroyFree(lits);
+                return failedFrame(fr);
+            end if;
+            let ml: Mode := tableFor(data, off.next, finish, rem(modes / 4, 4), 2, f.mlLog, &~ml_s, &~ml_b, &~ml_base);
+            if ml.next = 0 then
+                destroyFree(lits);
+                return failedFrame(fr);
+            end if;
+            f := Frame(rep1 => f.rep1, rep2 => f.rep2, rep3 => f.rep3, llLog => ll.log, ofLog => off.log, mlLog => ml.log, good => true);
+            let run: Run := sequences(data, ml.next, finish, n, &!lits, &~out, &~ll_s, &~ll_b, &~ll_base, &~of_s, &~of_b, &~of_base, &~ml_s, &~ml_b, &~ml_base, f, limit);
+            if not run.frame.good then
+                destroyFree(lits);
+                return failedFrame(fr);
+            end if;
+            f := run.frame;
+            used := run.used;
+        end if;
+        let rest: Index := length(&lits) - used;
+        if rest > (limit - lengthMut(&~out)) then
+            destroyFree(lits);
+            return failedFrame(fr);
+        end if;
+        var i: Index := used;
+        while i < length(&lits) do
+            let lit: Nat8 := nthMut(&!lits, i);
+            insertBack(&~out, lit);
+            i := i + 1;
+        end while;
+        destroyFree(lits);
+        return f;
+    end;
+
+    -- n bytes from at, little endian.
+    generic [R: Region]
+    function littleAt(data: Span[Nat8, R], at: Index, n: Index): Index is
+        var v: Index := 0;
+        var i: Index := n;
+        while i > 0 do
+            i := i - 1;
+            v := (v * 256) + wide(data[at + i]);
+        end while;
+        return v;
+    end;
+
+    -- One frame from at: its header, its blocks and its checksum; the first
+    -- byte after it, or 0 on a fault.
+    generic [R: Region, S: Region]
+    function frame(data: Span[Nat8, R], at: Index, out: &![Buffer[Nat8], S], limit: Index): Index is
+        let n: Index := spanLength(data);
+        if (n - at) < 6 then
+            return 0;
+        end if;
+        let descriptor: Index := wide(data[at + 4]);
+        let size_flag: Index := descriptor / 64;
+        let single: Bool := rem(descriptor / 32, 2) = 1;
+        let checksum: Bool := rem(descriptor / 4, 2) = 1;
+        let dictionary_flag: Index := rem(descriptor, 4);
+        if rem(descriptor / 8, 2) = 1 then
+            return 0;
+        end if;
+        var p: Index := at + 5;
+        if not single then
+            p := p + 1;
+        end if;
+        var dictionary_size: Index := dictionary_flag;
+        if dictionary_flag = 3 then
+            dictionary_size := 4;
+        end if;
+        if (n - p) < dictionary_size then
+            return 0;
+        end if;
+        if littleAt(data, p, dictionary_size) /= 0 then
+            return 0;
+        end if;
+        p := p + dictionary_size;
+        var size_bytes: Index := 0;
+        if size_flag = 0 then
+            if single then
+                size_bytes := 1;
+            end if;
+        else
+            size_bytes := twoTo(size_flag);
+        end if;
+        if (n - p) < size_bytes then
+            return 0;
+        end if;
+        p := p + size_bytes;
+        let start: Index := lengthMut(&~out);
+        var ll_s: Buffer[Index] := allocateEmpty();
+        var ll_b: Buffer[Index] := allocateEmpty();
+        var ll_base: Buffer[Index] := allocateEmpty();
+        var of_s: Buffer[Index] := allocateEmpty();
+        var of_b: Buffer[Index] := allocateEmpty();
+        var of_base: Buffer[Index] := allocateEmpty();
+        var ml_s: Buffer[Index] := allocateEmpty();
+        var ml_b: Buffer[Index] := allocateEmpty();
+        var ml_base: Buffer[Index] := allocateEmpty();
+        var h_s: Buffer[Index] := allocateEmpty();
+        var h_b: Buffer[Index] := allocateEmpty();
+        var f: Frame := Frame(rep1 => 1, rep2 => 4, rep3 => 8, llLog => 0, ofLog => 0, mlLog => 0, good => true);
+        var last: Bool := false;
+        while f.good and (not last) do
+            if (n - p) < 3 then
+                f := failedFrame(f);
+            else
+                let header: Index := littleAt(data, p, 3);
+                last := rem(header, 2) = 1;
+                let kind: Index := rem(header / 2, 4);
+                let size: Index := header / 8;
+                p := p + 3;
+                if kind = 0 then
+                    if ((n - p) < size) or (size > (limit - lengthMut(&~out))) then
+                        f := failedFrame(f);
+                    else
+                        var i: Index := 0;
+                        while i < size do
+                            insertBack(&~out, data[p + i]);
+                            i := i + 1;
+                        end while;
+                        p := p + size;
+                    end if;
+                else if kind = 1 then
+                    if ((n - p) < 1) or (size > (limit - lengthMut(&~out))) then
+                        f := failedFrame(f);
+                    else
+                        var i: Index := 0;
+                        while i < size do
+                            insertBack(&~out, data[p]);
+                            i := i + 1;
+                        end while;
+                        p := p + 1;
+                    end if;
+                else if kind = 2 then
+                    if (n - p) < size then
+                        f := failedFrame(f);
+                    else
+                        f := compressedBlock(data, p, p + size, &~out, &!ll_s, &!ll_b, &!ll_base, &!of_s, &!of_b, &!of_base, &!ml_s, &!ml_b, &!ml_base, &!h_s, &!h_b, f, limit);
+                        p := p + size;
+                    end if;
+                else
+                    f := failedFrame(f);
+                end if;
+            end if;
+        end while;
+        destroyFree(ll_s);
+        destroyFree(ll_b);
+        destroyFree(ll_base);
+        destroyFree(of_s);
+        destroyFree(of_b);
+        destroyFree(of_base);
+        destroyFree(ml_s);
+        destroyFree(ml_b);
+        destroyFree(ml_base);
+        destroyFree(h_s);
+        destroyFree(h_b);
+        if not f.good then
+            return 0;
+        end if;
+        if checksum then
+            if (n - p) < 4 then
+                return 0;
+            end if;
+            let sum: Nat64 := xxh64Of(&~out, start);
+            if rem(sum, 4294967296) /= count(littleAt(data, p, 4)) then
+                return 0;
+            end if;
+            p := p + 4;
+        end if;
+        return p;
+    end;
+
+    function count(i: Index): Nat64 is
+        case toNat64(i) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region]
+    function xxh64Of(out: &![Buffer[Nat8], R], start: Index): Nat64 is
+        return xxh64Mut(&~out, start);
+    end;
+
+    -- XXH64 of the bytes of out from start on, with the seed 0.
+    generic [R: Region]
+    function xxh64Mut(out: &![Buffer[Nat8], R], start: Index): Nat64 is
+        var copy: Buffer[Nat8] := allocateEmpty();
+        var i: Index := start;
+        while i < lengthMut(&~out) do
+            let b: Nat8 := nthMut(&~out, i);
+            insertBack(&!copy, b);
+            i := i + 1;
+        end while;
+        let sum: Nat64 := xxh64(wholeSpan(&copy));
+        destroyFree(copy);
+        return sum;
+    end;
+
+    function nat(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function powerOfTwo(k: Nat64): Nat64 is
+        var v: Nat64 := 1;
+        var i: Nat64 := 0;
+        while i < k do
+            v := v * 2;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    function rotateLeft(x: Nat64, r: Nat64): Nat64 is
+        return bitwiseOr(modularMultiply(x, powerOfTwo(r)), x / powerOfTwo(64 - r));
+    end;
+
+    function xxRound(acc: Nat64, lane: Nat64): Nat64 is
+        return modularMultiply(rotateLeft(modularAdd(acc, modularMultiply(lane, prime2)), 31), prime1);
+    end;
+
+    function xxMerge(acc: Nat64, v: Nat64): Nat64 is
+        return modularAdd(modularMultiply(bitwiseXor(acc, xxRound(0, v)), prime1), prime4);
+    end;
+
+    generic [R: Region]
+    function word(data: Span[Nat8, R], at: Index, n: Index): Nat64 is
+        var v: Nat64 := 0;
+        var i: Index := n;
+        while i > 0 do
+            i := i - 1;
+            v := modularAdd(modularMultiply(v, 256), nat(data[at + i]));
+        end while;
+        return v;
+    end;
+
+    generic [R: Region]
+    function xxh64(data: Span[Nat8, R]): Nat64 is
+        let n: Index := spanLength(data);
+        var i: Index := 0;
+        var h: Nat64 := prime5;
+        if n >= 32 then
+            var v1: Nat64 := modularAdd(prime1, prime2);
+            var v2: Nat64 := prime2;
+            var v3: Nat64 := 0;
+            var v4: Nat64 := modularSubtract(0, prime1);
+            while (i + 32) <= n do
+                v1 := xxRound(v1, word(data, i, 8));
+                v2 := xxRound(v2, word(data, i + 8, 8));
+                v3 := xxRound(v3, word(data, i + 16, 8));
+                v4 := xxRound(v4, word(data, i + 24, 8));
+                i := i + 32;
+            end while;
+            h := modularAdd(modularAdd(rotateLeft(v1, 1), rotateLeft(v2, 7)), modularAdd(rotateLeft(v3, 12), rotateLeft(v4, 18)));
+            h := xxMerge(h, v1);
+            h := xxMerge(h, v2);
+            h := xxMerge(h, v3);
+            h := xxMerge(h, v4);
+        end if;
+        h := modularAdd(h, count(n));
+        while (i + 8) <= n do
+            h := modularAdd(modularMultiply(rotateLeft(bitwiseXor(h, xxRound(0, word(data, i, 8))), 27), prime1), prime4);
+            i := i + 8;
+        end while;
+        if (i + 4) <= n then
+            h := modularAdd(modularMultiply(rotateLeft(bitwiseXor(h, modularMultiply(word(data, i, 4), prime1)), 23), prime2), prime3);
+            i := i + 4;
+        end if;
+        while i < n do
+            h := modularMultiply(rotateLeft(bitwiseXor(h, modularMultiply(nat(data[i]), prime5)), 11), prime1);
+            i := i + 1;
+        end while;
+        h := modularMultiply(bitwiseXor(h, h / powerOfTwo(33)), prime2);
+        h := modularMultiply(bitwiseXor(h, h / powerOfTwo(29)), prime3);
+        return bitwiseXor(h, h / powerOfTwo(32));
+    end;
+
+    -- Frames one after the other; a skippable frame, magic 0x184D2A50 to
+    -- 0x184D2A5F, is passed over by its length.
+    generic [R: Region]
+    function unzstd(data: Span[Nat8, R], limit: Index): Option[String] is
+        let n: Index := spanLength(data);
+        var out: Buffer[Nat8] := allocateEmpty();
+        var p: Index := 0;
+        if n < 4 then
+            destroyFree(out);
+            return None();
+        end if;
+        while p < n do
+            if (n - p) < 8 then
+                destroyFree(out);
+                return None();
+            end if;
+            let magic: Index := littleAt(data, p, 4);
+            if magic = 4247762216 then
+                let next: Index := frame(data, p, &!out, limit);
+                if next = 0 then
+                    destroyFree(out);
+                    return None();
+                end if;
+                p := next;
+            else if (magic >= 407710288) and (magic <= 407710303) then
+                let size: Index := littleAt(data, p + 4, 4);
+                if (n - (p + 8)) < size then
+                    destroyFree(out);
+                    return None();
+                end if;
+                p := (p + 8) + size;
+            else
+                destroyFree(out);
+                return None();
+            end if;
+        end while;
+        return Some(value => fromByteBuffer(out));
+    end;
+end module body.

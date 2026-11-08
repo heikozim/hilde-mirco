@@ -1,0 +1,369 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, count, flatGet);
+import Mirco.Stats (
+    variance,
+    standardDeviation,
+    median,
+    percentile,
+    histogram,
+    covariance,
+    correlation
+);
+import Mirco.Math (absolute, exponential);
+import Standard.Bits (float64FromBits);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Stats.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) < 0.000000000001;
+    end;
+
+    -- A vector of the elements of values.
+    generic [R: Region]
+    function vectorOf(values: &[Buffer[Float64], R]): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, lengthOf(values));
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    generic [R: Region]
+    function lengthOf(values: &[Buffer[Float64], R]): Index is
+        return spanLength(wholeSpan(values));
+    end;
+
+    -- 5 9 2 4 7 4 5 4, unsorted: mean 5, variance 4 and 32 / 7.
+    function sample(): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 5.0);
+        insertBack(&!values, 9.0);
+        insertBack(&!values, 2.0);
+        insertBack(&!values, 4.0);
+        insertBack(&!values, 7.0);
+        insertBack(&!values, 4.0);
+        insertBack(&!values, 5.0);
+        insertBack(&!values, 4.0);
+        let made: NdArray[Float64] := vectorOf(&values);
+        destroyFree(values);
+        return made;
+    end;
+
+    function testSpread(): Unit is
+        let d: NdArray[Float64] := sample();
+        assertTrue(variance(&d, 0) = 4.0, "population variance");
+        assertTrue(near(variance(&d, 1), 4.571428571428571), "sample variance");
+        assertTrue(standardDeviation(&d, 0) = 2.0, "population deviation");
+        destroyNdArray(d);
+        return nil;
+    end;
+
+    function testMedianAndPercentiles(): Unit is
+        let d: NdArray[Float64] := sample();
+        assertTrue(median(&d) = 4.5, "the mean of 4 and 5");
+        assertTrue(percentile(&d, 25.0) = 4.0, "position 1.75 between two fours");
+        assertTrue(near(percentile(&d, 90.0), 7.6), "position 6.3 between 7 and 9");
+        assertTrue(percentile(&d, 0.0) = 2.0, "the smallest");
+        assertTrue(percentile(&d, 100.0) = 9.0, "the largest");
+        destroyNdArray(d);
+        return nil;
+    end;
+
+    function testNaN(): Unit is
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.0);
+        insertBack(&!values, float64FromBits(9221120237041090560));
+        let d: NdArray[Float64] := vectorOf(&values);
+        destroyFree(values);
+        let m: Float64 := median(&d);
+        assertTrue(m /= m, "a median over a NaN");
+        destroyNdArray(d);
+        return nil;
+    end;
+
+    -- Bins of width 2 from 1 to 9: 2 | 4 4 4 | 5 5 | 7 9, the 9 in the last.
+    function testHistogram(): Unit is
+        let d: NdArray[Float64] := sample();
+        let h: NdArray[Int64] := histogram(&d, 4, 1.0, 9.0);
+        assertTrue(count(&h) = 4, "four bins");
+        assertTrue(flatGet(&h, 0) = 1, "bin 1 to 3");
+        assertTrue(flatGet(&h, 1) = 3, "bin 3 to 5");
+        assertTrue(flatGet(&h, 2) = 2, "bin 5 to 7");
+        assertTrue(flatGet(&h, 3) = 2, "bin 7 to 9 with 9");
+        let narrow: NdArray[Int64] := histogram(&d, 2, 4.0, 5.0);
+        assertTrue((flatGet(&narrow, 0) = 3) and (flatGet(&narrow, 1) = 2), "outside is not counted");
+        destroyNdArray(narrow);
+        destroyNdArray(h);
+        destroyNdArray(d);
+        return nil;
+    end;
+
+    function testRelation(): Unit is
+        var xs: Buffer[Float64] := allocateEmpty();
+        var ys: Buffer[Float64] := allocateEmpty();
+        insertBack(&!xs, 1.0);
+        insertBack(&!xs, 2.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 4.0);
+        insertBack(&!ys, 2.0);
+        insertBack(&!ys, 4.0);
+        insertBack(&!ys, 6.0);
+        insertBack(&!ys, 9.0);
+        let x: NdArray[Float64] := vectorOf(&xs);
+        let y: NdArray[Float64] := vectorOf(&ys);
+        assertTrue(near(covariance(&x, &y, 1), 3.8333333333333335), "sample covariance");
+        assertTrue(near(correlation(&x, &y), 0.9943767126843689), "Pearson");
+        destroyFree(xs);
+        destroyFree(ys);
+        destroyNdArray(x);
+        destroyNdArray(y);
+        return nil;
+    end;
+
+    -- An array that does not vary has no correlation.
+    function testConstant(): Unit is
+        var xs: Buffer[Float64] := allocateEmpty();
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        insertBack(&!xs, 3.0);
+        let x: NdArray[Float64] := vectorOf(&xs);
+        destroyFree(xs);
+        let d: NdArray[Float64] := sample();
+        let r: Float64 := correlation(&x, &d);
+        assertTrue(r /= r, "no spread, no correlation");
+        destroyNdArray(d);
+        destroyNdArray(x);
+        return nil;
+    end;
+
+    -- A vector of the n values 1, 2, ..., n.
+    function rising(n: Index): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        var v: Float64 := 1.0;
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!values, v);
+            v := v + 1.0;
+            at := at + 1;
+        end while;
+        let made: NdArray[Float64] := vectorOf(&values);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- The functions of one array over the sample: 0 variance, 1
+    -- standardDeviation, 2 percentile; the result is not asked for.
+    function spreadOf(which: Index, ddof: Index, q: Float64): Unit is
+        let x: NdArray[Float64] := sample();
+        if which = 0 then
+            let v: Float64 := variance(&x, ddof);
+        end if;
+        if which = 1 then
+            let d: Float64 := standardDeviation(&x, ddof);
+        end if;
+        if which = 2 then
+            let p: Float64 := percentile(&x, q);
+        end if;
+        destroyNdArray(x);
+        return nil;
+    end;
+
+    function histogramOf(bins: Index, low: Float64, high: Float64): Unit is
+        let x: NdArray[Float64] := sample();
+        let counts: NdArray[Int64] := histogram(&x, bins, low, high);
+        destroyNdArray(counts);
+        destroyNdArray(x);
+        return nil;
+    end;
+
+    -- covariance when ddof is below the count, else correlation, of
+    -- vectors of xs and ys elements.
+    function relationOf(xs: Index, ys: Index, ddof: Index, covarying: Bool): Unit is
+        let x: NdArray[Float64] := rising(xs);
+        let y: NdArray[Float64] := rising(ys);
+        if covarying then
+            let c: Float64 := covariance(&x, &y, ddof);
+        else
+            let r: Float64 := correlation(&x, &y);
+        end if;
+        destroyNdArray(y);
+        destroyNdArray(x);
+        return nil;
+    end;
+
+    -- Each call in a child of its own, over the sample of 8 elements: a
+    -- ddof of 8 for variance, standardDeviation and covariance, a q of -1
+    -- and of 101 for percentile, 0 and 1000001 bins, bounds the wrong way
+    -- round, an infinite and a NaN bound for histogram, arrays of 8 and 7
+    -- elements for covariance and correlation and a correlation of one
+    -- element are refused by the requires.  The fitting calls are taken.
+    function testRefusals(): Unit is
+        let infinity: Float64 := exponential(1000.0);
+        let nan: Float64 := infinity - infinity;
+        if asChild("varianceDdof") then
+            spreadOf(0, 8, 0.0);
+            return nil;
+        end if;
+        if asChild("deviationDdof") then
+            spreadOf(1, 8, 0.0);
+            return nil;
+        end if;
+        if asChild("percentileBelow") then
+            spreadOf(2, 0, -1.0);
+            return nil;
+        end if;
+        if asChild("percentileAbove") then
+            spreadOf(2, 0, 101.0);
+            return nil;
+        end if;
+        if asChild("histogramNoBins") then
+            histogramOf(0, 0.0, 10.0);
+            return nil;
+        end if;
+        if asChild("histogramTooManyBins") then
+            histogramOf(1000001, 0.0, 10.0);
+            return nil;
+        end if;
+        if asChild("histogramReversed") then
+            histogramOf(4, 10.0, 0.0);
+            return nil;
+        end if;
+        if asChild("histogramInfinite") then
+            histogramOf(4, 0.0 - infinity, 10.0);
+            return nil;
+        end if;
+        if asChild("histogramNaN") then
+            histogramOf(4, 0.0, nan);
+            return nil;
+        end if;
+        if asChild("covarianceOtherCount") then
+            relationOf(8, 7, 1, true);
+            return nil;
+        end if;
+        if asChild("covarianceDdof") then
+            relationOf(8, 8, 8, true);
+            return nil;
+        end if;
+        if asChild("correlationOtherCount") then
+            relationOf(8, 7, 0, false);
+            return nil;
+        end if;
+        if asChild("correlationOneElement") then
+            relationOf(1, 1, 0, false);
+            return nil;
+        end if;
+        if asChild("fits") then
+            spreadOf(0, 7, 0.0);
+            spreadOf(1, 7, 0.0);
+            spreadOf(2, 0, 0.0);
+            spreadOf(2, 0, 100.0);
+            histogramOf(1, 0.0, 10.0);
+            histogramOf(1000000, 0.0, 10.0);
+            relationOf(8, 8, 7, true);
+            relationOf(2, 2, 0, false);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "varianceDdof", "contract violated: the requires"), "variance with a ddof of 8 over 8 elements is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "deviationDdof", "contract violated: the requires"), "standardDeviation with a ddof of 8 over 8 elements is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "percentileBelow", "contract violated: the requires"), "the percentile -1 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "percentileAbove", "contract violated: the requires"), "the percentile 101 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramNoBins", "contract violated: the requires"), "a histogram of 0 bins is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramTooManyBins", "contract violated: the requires"), "a histogram of 1000001 bins is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramReversed", "contract violated: the requires"), "a histogram from 10 to 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramInfinite", "contract violated: the requires"), "a histogram from an infinity is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramNaN", "contract violated: the requires"), "a histogram to a NaN is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "covarianceOtherCount", "contract violated: the requires"), "a covariance of 8 and 7 elements is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "covarianceDdof", "contract violated: the requires"), "a covariance with a ddof of 8 over 8 elements is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "correlationOtherCount", "contract violated: the requires"), "a correlation of 8 and 7 elements is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "correlationOneElement", "contract violated: the requires"), "a correlation of one element is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "fitting calls break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "fitting calls are taken");
+        return nil;
+    end;
+end module body.

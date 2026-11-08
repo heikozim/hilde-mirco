@@ -1,0 +1,72 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reads a table of numbers in CSV into a matrix of Float64 and writes a vector or a matrix as CSV.
+
+- The text is read by Standard.Csv, which refuses rather than guesses; each field must be a number.
+- An empty field is a NaN, as NumPy's genfromtxt reads it; a field that is no number is refused.
+- Every refusal names its line, counting from 1, and its column, counting from 0; nothing aborts on bad input.
+- Each number is written as the shortest text that reads back as the same number.
+
+    let m: Either[MatrixError, NdArray[Float64]] := readMatrix(text, true);
+"""
+import Standard.String (String);
+import Standard.Csv (CsvFault);
+import Mirco.Array (NdArray, rank);
+
+module Mirco.Csv is
+    """
+    Why readMatrix refused a text.
+    """
+    union MatrixFault: Free is
+        """
+        The text is no table of CSV; the fault of Standard.Csv says why.
+        """
+        case NotCsv is
+            csv: CsvFault;
+        """
+        A field that is no number.
+        """
+        case NotANumber;
+        """
+        A table without a row of numbers.
+        """
+        case NoRows;
+    end;
+
+    """
+    A refusal: what was wrong, its line from 1 and its column from 0; the column is 0 for a fault of CSV.
+    """
+    record MatrixError: Free is
+        fault: MatrixFault;
+        line: Index;
+        column: Index;
+    end;
+
+    """
+    The numbers of a table of CSV with the comma as a matrix, a row for each row; a first row of names is
+    skipped when header is true.
+    No contract: no precondition, since a text that is no table of numbers gives a MatrixError.
+    """
+    generic [R: Region]
+    function readMatrix(text: Span[Nat8, R], header: Bool): Either[MatrixError, NdArray[Float64]];
+
+    """
+    readMatrix with the separator given.
+    No contract: no precondition, since a text that is no table of numbers, or a separator that cannot be one, gives a MatrixError.
+    """
+    generic [R: Region]
+    function readMatrixWith(text: Span[Nat8, R], separator: Nat8, header: Bool): Either[MatrixError, NdArray[Float64]];
+
+    """
+    A vector as one column or a matrix as rows of CSV with the comma; None only when Standard.Csv refuses.
+    """
+    generic [R: Region]
+    function writeMatrix(a: &[NdArray[Float64], R]): Option[String]
+        requires (rank(a) = 1) or (rank(a) = 2);
+end module.

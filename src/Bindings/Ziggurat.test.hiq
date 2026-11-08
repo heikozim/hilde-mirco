@@ -1,0 +1,141 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The tests of the tables alone: the first and the last entry of each, and
+-- an index past the last refused by the requires of each.
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Bindings.Ziggurat (ki, wi, fi);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Bindings.Ziggurat.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The first and the last entries, as NumPy 1.26.4 gives them in
+    -- ziggurat_constants.h.
+    function testEnds(): Unit is
+        assertTrue(ki(0) = 4208095142473578, "ki at 0");
+        assertTrue(ki(1) = 0, "ki at 1");
+        assertTrue(ki(255) = 4251099761679434, "ki at 255");
+        assertTrue(fi(0) = 1.0, "fi at 0");
+        assertTrue((wi(255) > wi(254)) and (wi(0) > wi(1)), "wi grows towards the top and is widest at the base");
+        return nil;
+    end;
+
+    -- Every entry of the three tables, each call checking its ensures.
+    function testEveryEntryInsideItsRange(): Unit is
+        var i: Index := 0;
+        var inside: Index := 0;
+        while i <= 255 do
+            if (ki(i) < 4503599627370496) and (wi(i) > 0.0) and (fi(i) > 0.0) and (fi(i) <= 1.0) then
+                inside := inside + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue(inside = 256, "all 256 entries of each table lie inside the ensures");
+        return nil;
+    end;
+
+    -- Each call in a child of its own: the index 256, one past the last
+    -- entry, is refused by the requires of ki, wi and fi; the last entry
+    -- 255 is taken.
+    function testRefusals(): Unit is
+        if asChild("kiPast") then
+            let k: Nat64 := ki(256);
+            return nil;
+        end if;
+        if asChild("wiPast") then
+            let w: Float64 := wi(256);
+            return nil;
+        end if;
+        if asChild("fiPast") then
+            let f: Float64 := fi(256);
+            return nil;
+        end if;
+        if asChild("fits") then
+            let k: Nat64 := ki(255);
+            let w: Float64 := wi(255);
+            let f: Float64 := fi(255);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "kiPast", "contract violated: the requires"), "ki at 256 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "wiPast", "contract violated: the requires"), "wi at 256 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "fiPast", "contract violated: the requires"), "fi at 256 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "the entries at 255 break no contract");
+        return nil;
+    end;
+end module body.

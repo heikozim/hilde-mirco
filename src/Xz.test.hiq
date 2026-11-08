@@ -1,0 +1,120 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The streams are those tools/make-xz-vectors.py prints, written by
+-- liblzma; each with the length and the CRC32 of the bytes it holds.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan, storeNth, nth, length);
+import Standard.String (String, asSpan, destroyString, length as stringLength);
+import Standard.Gzip (crc32);
+import Mirco.Xz (unxz);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Xz.Test is
+    function nibble(c: Nat8): Nat8 is
+        if (c >= 48) and (c <= 57) then
+            return c - 48;
+        else if (c >= 97) and (c <= 102) then
+            return c - 87;
+        end if;
+        abort("Mirco.Xz.Test: a vector holds a character that is no hex digit");
+    end;
+
+    function fromHex(text: Span[Nat8, Static]): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 0;
+        while (at + 1) < spanLength(text) do
+            let high: Nat8 := nibble(text[at]);
+            let low: Nat8 := nibble(text[at + 1]);
+            insertBack(&!out, (high * 16) + low);
+            at := at + 2;
+        end while;
+        return out;
+    end;
+
+    -- True when the stream unpacks to size bytes of the CRC32 sum.
+    generic [R: Region]
+    function unpacksTo(stream: &[Buffer[Nat8], R], size: Index, sum: Nat32): Bool is
+        case unxz(wholeSpan(stream), 100000) of
+            when Some(value as text: String) do
+                let good: Bool := (stringLength(&text) = size) and (crc32(asSpan(&text)) = sum);
+                destroyString(text);
+                return good;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function refused(stream: &[Buffer[Nat8], R]): Bool is
+        case unxz(wholeSpan(stream), 100000) of
+            when Some(value as text: String) do
+                destroyString(text);
+                return false;
+            when None do
+                return true;
+        end case;
+    end;
+
+    function testMixed(): Unit is
+        let s: Buffer[Nat8] := fromHex("fd377a585a0000016922de360200210116000000742fe5a3e0031f00245d00309888ad4b3712a2a29f87170d1ec32e7b6e0093198d33379fa924ec905f9dfe6355200000cea7eb7b00013ca00600000041d3a1e53e300d8b020000000001595a");
+        assertTrue(unpacksTo(&s, 800, 2079041486), "800 bytes of repeats");
+        destroyFree(s);
+        return nil;
+    end;
+
+    function testWords(): Unit is
+        let s: Buffer[Nat8] := fromHex("fd377a585a0000016922de360200210116000000742fe5a3e0176f038b5d00391bece8202c0ddb6ab1f4109f08949f5583b132049648b33465162597fb15ae58ca04a9d80010ecbdfacb59dc93090a8f892a5194f7c6f851167367bcb4a9af711ed15ce5389d2e1419800e1cde2b32fd88e5c5d2d0362866bce1d1f4381c8e1232d3d750024271bbe5a8940a0fe48ba1812460d12977371badb903db08fc670bb61f41ceb775638b672bdfd2a6ff2073f83ce9b56f2f8a890ddba406b78cb9672c6e04bfc3b228282daba3ef8980d907c197ac3eb327fe25ed3261335c202e5fb050344638867f5f9d296c7296268eb86c99f179b22f1cc1f507a44282671a8bcfcec02b6282b07f0157d0dbd0827d10c41f3b3b2de7051c36ebbaeeb97b98dee9e95d4688c26eb3cf34977076edab05259577fa9d8a74a867b330c7e9b81db13c5932962acb984a86cb56dd9b44db56acfcf9db2b976d1dce3424b0c3fdeeeb79639e9724a3ef3535d3e521b3517922ca5698ffcba149d3656d4da13007d5a399519e089c23e2a2a015acc03a2a7f6b3975294780c49d69f48eb2c0ab8b4b1c821e168965eef7c31c864e2edf1c5b294f4c9f46f800a244f7048ace80847ddc412374a7186f4a6f2fa7b87ac8c0a700898cee7d460f272311bf48410fdfca04d5ee058ef591c3a3e7641a1439a57a38417c408cee252b37987feb8996a98963a87346816a42de58818265c1c995c47e62147a88d1f66ae1cec0687e717584ab1faf04644d11cec2b722e808b2e7b220282081d2336b5fb92802c8f0b685e611d11fdd8b9d96ad83182bf5c9be9a4186f068103d55591a35a681e35be51f099644d1667147e3509aaee162709e7dc9ff482a066d0ac64765dd63927377de944e7de939880d853a2df2d49f6927c8660a8900194eae6e978d04318097fec0c01b9f6393c7dbe4ce3ff200b039aff7a8aba8ede0106517f56afebb0c1d93920c127642970c24a33899d9a05737c5fd2daf0a955f9763ffdbd69924cb4419c01b2f4435fca523b227ff96fcacab87fb6b2dd46e5868712442624c52b1b721db10263b3f78a1de5abec0baf897aefbb86009fb5ee467866389283c3d2fadc9fb18b2f28446a2038671db905206751c40aaee3098cef9243a84152e88b06348f41552d0b6c5db8aef8a8abc1342422937897e782fa2d7028fceb2f1da7482647565699ded1d1d939c75d1a31081dcfb3e830fad03bf77e5ba9ff62200798588e2580e93265ea1599069d6eb89e37ba3645ace2833cb0d1a4d4bdbafe9d8cd934a0120361b2d8b35b63245b85c0000b2d739560001a307f02e0000c016485a3e300d8b020000000001595a");
+        assertTrue(unpacksTo(&s, 6000, 1446631346), "6000 bytes of words, matches near and far");
+        destroyFree(s);
+        return nil;
+    end;
+
+    function testChecks(): Unit is
+        let none: Buffer[Nat8] := fromHex("fd377a585a000000ff12d9410200210116000000742fe5a3e0012b00765d00391bece8202c0ddb6ab1f4109f08949f5583b132049648b33465162597fb15ae58ca04a9d80010ecbdfacb59dc93090a8f892a5194f7c6f851167367bcb4a9af711ed15ce5389d2e1419800e1cde2b32fd88e5c5d2d0362866bce1d1f4381c8e1232d3d750024271bbe5a8940a0fe48ba181eb99403c00000000018a01ac02000000b82745a8000afc020000000000595a");
+        assertTrue(unpacksTo(&none, 300, 2636948943), "a stream without check");
+        let wide: Buffer[Nat8] := fromHex("fd377a585a000004e6d6b4460200210116000000742fe5a3e001f3009e5d00391bece8202c0ddb6ab1f4109f08949f5583b132049648b33465162597fb15ae58ca04a9d80010ecbdfacb59dc93090a8f892a5194f7c6f851167367bcb4a9af711ed15ce5389d2e1419800e1cde2b32fd88e5c5d2d0362866bce1d1f4381c8e1232d3d750024271bbe5a8940a0fe48ba1812460d12977371badb903db08fc670bb61f41ceb775638b672bdfd2a6ff2073f83ce9b56f2f8a89167531e226000000d0a99d7d72a52d5b0001ba01f4030000d7f2264eb1c467fb020000000004595a");
+        assertTrue(unpacksTo(&wide, 500, 1445831745), "a stream with a CRC64, skipped");
+        let empty: Buffer[Nat8] := fromHex("fd377a585a0000016922de36000000001cdf44219042990d010000000001595a");
+        assertTrue(unpacksTo(&empty, 0, 0), "the empty stream");
+        destroyFree(none);
+        destroyFree(wide);
+        destroyFree(empty);
+        return nil;
+    end;
+
+    -- A changed byte in the header, in the data and in the check, a cut
+    -- stream and a limit below the size are each refused.
+    function testRefusals(): Unit is
+        var header: Buffer[Nat8] := fromHex("fd377a585a0000016922de360200210116000000742fe5a3e0031f00245d00309888ad4b3712a2a29f87170d1ec32e7b6e0093198d33379fa924ec905f9dfe6355200000cea7eb7b00013ca00600000041d3a1e53e300d8b020000000001595a");
+        storeNth(&!header, 7, 4);
+        assertTrue(refused(&header), "the flags of the stream changed against their CRC32");
+        var content: Buffer[Nat8] := fromHex("fd377a585a0000016922de360200210116000000742fe5a3e0176f038b5d00391bece8202c0ddb6ab1f4109f08949f5583b132049648b33465162597fb15ae58ca04a9d80010ecbdfacb59dc93090a8f892a5194f7c6f851167367bcb4a9af711ed15ce5389d2e1419800e1cde2b32fd88e5c5d2d0362866bce1d1f4381c8e1232d3d750024271bbe5a8940a0fe48ba1812460d12977371badb903db08fc670bb61f41ceb775638b672bdfd2a6ff2073f83ce9b56f2f8a890ddba406b78cb9672c6e04bfc3b228282daba3ef8980d907c197ac3eb327fe25ed3261335c202e5fb050344638867f5f9d296c7296268eb86c99f179b22f1cc1f507a44282671a8bcfcec02b6282b07f0157d0dbd0827d10c41f3b3b2de7051c36ebbaeeb97b98dee9e95d4688c26eb3cf34977076edab05259577fa9d8a74a867b330c7e9b81db13c5932962acb984a86cb56dd9b44db56acfcf9db2b976d1dce3424b0c3fdeeeb79639e9724a3ef3535d3e521b3517922ca5698ffcba149d3656d4da13007d5a399519e089c23e2a2a015acc03a2a7f6b3975294780c49d69f48eb2c0ab8b4b1c821e168965eef7c31c864e2edf1c5b294f4c9f46f800a244f7048ace80847ddc412374a7186f4a6f2fa7b87ac8c0a700898cee7d460f272311bf48410fdfca04d5ee058ef591c3a3e7641a1439a57a38417c408cee252b37987feb8996a98963a87346816a42de58818265c1c995c47e62147a88d1f66ae1cec0687e717584ab1faf04644d11cec2b722e808b2e7b220282081d2336b5fb92802c8f0b685e611d11fdd8b9d96ad83182bf5c9be9a4186f068103d55591a35a681e35be51f099644d1667147e3509aaee162709e7dc9ff482a066d0ac64765dd63927377de944e7de939880d853a2df2d49f6927c8660a8900194eae6e978d04318097fec0c01b9f6393c7dbe4ce3ff200b039aff7a8aba8ede0106517f56afebb0c1d93920c127642970c24a33899d9a05737c5fd2daf0a955f9763ffdbd69924cb4419c01b2f4435fca523b227ff96fcacab87fb6b2dd46e5868712442624c52b1b721db10263b3f78a1de5abec0baf897aefbb86009fb5ee467866389283c3d2fadc9fb18b2f28446a2038671db905206751c40aaee3098cef9243a84152e88b06348f41552d0b6c5db8aef8a8abc1342422937897e782fa2d7028fceb2f1da7482647565699ded1d1d939c75d1a31081dcfb3e830fad03bf77e5ba9ff62200798588e2580e93265ea1599069d6eb89e37ba3645ace2833cb0d1a4d4bdbafe9d8cd934a0120361b2d8b35b63245b85c0000b2d739560001a307f02e0000c016485a3e300d8b020000000001595a");
+        let changed: Nat8 := nth(&content, 300) + 1;
+        storeNth(&!content, 300, changed);
+        assertTrue(refused(&content), "a byte of the data changed");
+        var short: Buffer[Nat8] := allocateEmpty();
+        let whole: Buffer[Nat8] := fromHex("fd377a585a0000016922de360200210116000000742fe5a3e0176f038b5d00391bece8202c0ddb6ab1f4109f08949f5583b132049648b33465162597fb15ae58ca04a9d80010ecbdfacb59dc93090a8f892a5194f7c6f851167367bcb4a9af711ed15ce5389d2e1419800e1cde2b32fd88e5c5d2d0362866bce1d1f4381c8e1232d3d750024271bbe5a8940a0fe48ba1812460d12977371badb903db08fc670bb61f41ceb775638b672bdfd2a6ff2073f83ce9b56f2f8a890ddba406b78cb9672c6e04bfc3b228282daba3ef8980d907c197ac3eb327fe25ed3261335c202e5fb050344638867f5f9d296c7296268eb86c99f179b22f1cc1f507a44282671a8bcfcec02b6282b07f0157d0dbd0827d10c41f3b3b2de7051c36ebbaeeb97b98dee9e95d4688c26eb3cf34977076edab05259577fa9d8a74a867b330c7e9b81db13c5932962acb984a86cb56dd9b44db56acfcf9db2b976d1dce3424b0c3fdeeeb79639e9724a3ef3535d3e521b3517922ca5698ffcba149d3656d4da13007d5a399519e089c23e2a2a015acc03a2a7f6b3975294780c49d69f48eb2c0ab8b4b1c821e168965eef7c31c864e2edf1c5b294f4c9f46f800a244f7048ace80847ddc412374a7186f4a6f2fa7b87ac8c0a700898cee7d460f272311bf48410fdfca04d5ee058ef591c3a3e7641a1439a57a38417c408cee252b37987feb8996a98963a87346816a42de58818265c1c995c47e62147a88d1f66ae1cec0687e717584ab1faf04644d11cec2b722e808b2e7b220282081d2336b5fb92802c8f0b685e611d11fdd8b9d96ad83182bf5c9be9a4186f068103d55591a35a681e35be51f099644d1667147e3509aaee162709e7dc9ff482a066d0ac64765dd63927377de944e7de939880d853a2df2d49f6927c8660a8900194eae6e978d04318097fec0c01b9f6393c7dbe4ce3ff200b039aff7a8aba8ede0106517f56afebb0c1d93920c127642970c24a33899d9a05737c5fd2daf0a955f9763ffdbd69924cb4419c01b2f4435fca523b227ff96fcacab87fb6b2dd46e5868712442624c52b1b721db10263b3f78a1de5abec0baf897aefbb86009fb5ee467866389283c3d2fadc9fb18b2f28446a2038671db905206751c40aaee3098cef9243a84152e88b06348f41552d0b6c5db8aef8a8abc1342422937897e782fa2d7028fceb2f1da7482647565699ded1d1d939c75d1a31081dcfb3e830fad03bf77e5ba9ff62200798588e2580e93265ea1599069d6eb89e37ba3645ace2833cb0d1a4d4bdbafe9d8cd934a0120361b2d8b35b63245b85c0000b2d739560001a307f02e0000c016485a3e300d8b020000000001595a");
+        var at: Index := 0;
+        while at < (length(&whole) - 40) do
+            insertBack(&!short, nth(&whole, at));
+            at := at + 1;
+        end while;
+        assertTrue(refused(&short), "a stream cut before its index");
+        case unxz(wholeSpan(&whole), 1000) of
+            when Some(value as text: String) do
+                destroyString(text);
+                assertTrue(false, "6000 bytes above a limit of 1000");
+            when None do
+                assertTrue(true, "6000 bytes above a limit of 1000");
+        end case;
+        destroyFree(header);
+        destroyFree(content);
+        destroyFree(short);
+        destroyFree(whole);
+        return nil;
+    end;
+end module body.

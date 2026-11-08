@@ -1,0 +1,122 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, wholeSpan, getSpanMut, nth, length as bufferLength);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, count, flatGet, fromSpan, destroyNdArray);
+import Mirco.Fft (Signal, signal, signalLength, realAt, imaginaryAt);
+import Mirco.Bindings.Pocketfft (complexTransform, realTransform);
+
+module body Mirco.Pocketfft is
+    function toFloat(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                abort("Mirco.Pocketfft: a length that is no Float64");
+        end case;
+    end;
+
+    generic [R: Region]
+    function vectorOf(values: &[Buffer[Float64], R]): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, bufferLength(values));
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    -- The signal of the interleaved pairs of real and imaginary parts.
+    generic [R: Region]
+    function signalOfPairs(pairs: &[Buffer[Float64], R], n: Index): Signal is
+        var re: Buffer[Float64] := allocateEmpty();
+        var im: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!re, nth(pairs, 2 * k));
+            insertBack(&!im, nth(pairs, (2 * k) + 1));
+            k := k + 1;
+        end while;
+        let a: NdArray[Float64] := vectorOf(&re);
+        let b: NdArray[Float64] := vectorOf(&im);
+        let made: Signal := signal(&a, &b);
+        destroyNdArray(a);
+        destroyNdArray(b);
+        destroyFree(re);
+        destroyFree(im);
+        return made;
+    end;
+
+    generic [R: Region]
+    function transformed(s: &[Signal, R], forward: Bool): Signal is
+        let n: Index := signalLength(s);
+        var pairs: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!pairs, realAt(s, k));
+            insertBack(&!pairs, imaginaryAt(s, k));
+            k := k + 1;
+        end while;
+        var scale: Float64 := 1.0;
+        if not forward then
+            scale := 1.0 / toFloat(n);
+        end if;
+        let done: Int32 := complexTransform(getSpanMut(&!pairs, 0, (2 * n) - 1), n, forward, scale);
+        if done /= 0 then
+            abort("Mirco.Pocketfft: no memory for the plan of a transform");
+        end if;
+        let made: Signal := signalOfPairs(&pairs, n);
+        destroyFree(pairs);
+        return made;
+    end;
+
+    generic [R: Region]
+    function fft(s: &[Signal, R]): Signal is
+        return transformed(s, true);
+    end;
+
+    generic [R: Region]
+    function inverseFft(s: &[Signal, R]): Signal is
+        return transformed(s, false);
+    end;
+
+    -- pocketfft gives r0, r1, i1, r2, i2 and so on, the last real part alone
+    -- when n is even; the imaginary part of r0, and of the last one for an
+    -- even n, is zero.
+    generic [R: Region]
+    function realFft(real: &[NdArray[Float64], R]): Signal is
+        let n: Index := count(real);
+        var values: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!values, flatGet(real, k));
+            k := k + 1;
+        end while;
+        let done: Int32 := realTransform(getSpanMut(&!values, 0, n - 1), n, 1.0);
+        if done /= 0 then
+            abort("Mirco.Pocketfft: no memory for the plan of a transform");
+        end if;
+        let half: Index := (n / 2) + 1;
+        var pairs: Buffer[Float64] := allocateEmpty();
+        insertBack(&!pairs, nth(&values, 0));
+        insertBack(&!pairs, 0.0);
+        var j: Index := 1;
+        while j < half do
+            insertBack(&!pairs, nth(&values, (2 * j) - 1));
+            if (2 * j) < n then
+                insertBack(&!pairs, nth(&values, 2 * j));
+            else
+                insertBack(&!pairs, 0.0);
+            end if;
+            j := j + 1;
+        end while;
+        destroyFree(values);
+        let made: Signal := signalOfPairs(&pairs, half);
+        destroyFree(pairs);
+        return made;
+    end;
+end module body.

@@ -1,0 +1,118 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The element types of a Mirco array: Float64, Float32, Int64, Int32, Nat8 and Bool, each with its code, its width and its bytes.
+
+- Codes: Float64 1, Float32 2, Int64 3, Int32 4, Nat8 5, Bool 6.
+- Widths in bytes: 8, 4, 8, 4, 1 and 1.
+- Bytes are little endian; a Bool is one byte, 0 or 1, and any other byte is refused.
+
+    let code: Nat8 := elementCode(0.0);
+"""
+import Standard.Buffer (Buffer);
+
+module Mirco.Element is
+    """
+    The code of Float64 in the wire format.
+    """
+    function codeFloat64(): Nat8
+        ensures result = 1;
+
+    """
+    The code of Float32 in the wire format.
+    """
+    function codeFloat32(): Nat8
+        ensures result = 2;
+
+    """
+    The code of Int64 in the wire format.
+    """
+    function codeInt64(): Nat8
+        ensures result = 3;
+
+    """
+    The code of Int32 in the wire format.
+    """
+    function codeInt32(): Nat8
+        ensures result = 4;
+
+    """
+    The code of Nat8 in the wire format.
+    """
+    function codeNat8(): Nat8
+        ensures result = 5;
+
+    """
+    The code of Bool in the wire format.
+    """
+    function codeBool(): Nat8
+        ensures result = 6;
+
+    """
+    Whether code names one of the six element types.
+    """
+    function knownCode(code: Nat8): Bool
+        ensures result = ((code >= 1) and (code <= 6));
+
+    """
+    The width in bytes of the element type of a known code, 0 for any other.
+    """
+    function widthOfCode(code: Nat8): Index
+        ensures (result <= 8) and ((result = 0) = (not knownCode(code)));
+
+    """
+    A type that a Mirco array holds.
+    """
+    typeclass Element(T: Free) is
+        """
+        The code of the type of value.
+        No contract: a method takes no requires or ensures in the language; it has no precondition, the code is the instance's constant, and knownCode holds its range.
+        """
+        method elementCode(value: T): Nat8;
+
+        """
+        The width in bytes of the type of value.
+        No contract: a method takes no requires or ensures in the language; it has no precondition, the width is the instance's constant, and widthOfCode holds its range.
+        """
+        method elementWidth(value: T): Index;
+
+        """
+        The zero of the type: 0, 0.0 or false.
+        No contract: a method takes no requires or ensures in the language; it has no argument and so no precondition; the result is the zero of its type.
+        """
+        method zeroElement(): T;
+
+        """
+        Appends the bytes of value to out, lowest first.
+        No contract: a method takes no requires or ensures in the language; it has no precondition, any value has its bytes, and out grows by elementWidth(value).
+        """
+        generic [R: Region]
+        method appendLittleEndian(value: T, out: &![Buffer[Nat8], R]): Unit;
+
+        """
+        Reads one element from bytes at the position at, lowest byte first.
+        No contract: a method takes no requires or ensures in the language; at plus the width of the type must lie within bytes, which the index check of the instance holds by stopping the programme.
+        """
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): T;
+
+        """
+        Whether the bytes at the position at are an element of the type of witness: false only for a Bool other than 0 or 1.
+        No contract: a method takes no requires or ensures in the language; at plus the width of the type must lie within bytes, which the index check of the instance holds by stopping the programme.
+        """
+        generic [R: Region]
+        method validLittleEndian(witness: T, bytes: Span[Nat8, R], at: Index): Bool;
+    end;
+
+    instance Element(Float64);
+    instance Element(Float32);
+    instance Element(Int64);
+    instance Element(Int32);
+    instance Element(Nat8);
+    instance Element(Bool);
+end module.

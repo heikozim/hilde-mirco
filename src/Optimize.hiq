@@ -1,0 +1,174 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Mirco.Math (absolute, squareRoot);
+
+module body Mirco.Optimize is
+    constant maximum_steps: Index := 200;
+
+    -- True when x and y lie on different sides of zero, or one is zero.
+    function opposite(x: Float64, y: Float64): Bool is
+        return ((x <= 0.0) and (y >= 0.0)) or ((x >= 0.0) and (y <= 0.0));
+    end;
+
+    function bisect(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Option[Float64] is
+        var low: Float64 := a;
+        var high: Float64 := b;
+        var f_low: Float64 := f(low);
+        let f_high: Float64 := f(high);
+        if not opposite(f_low, f_high) then
+            return None();
+        end if;
+        if f_low = 0.0 then
+            return Some(value => low);
+        end if;
+        if f_high = 0.0 then
+            return Some(value => high);
+        end if;
+        var steps: Index := 0;
+        while ((high - low) > tolerance) and (steps < maximum_steps) do
+            let middle: Float64 := (low + high) / 2.0;
+            let f_middle: Float64 := f(middle);
+            if f_middle = 0.0 then
+                return Some(value => middle);
+            end if;
+            if opposite(f_low, f_middle) then
+                high := middle;
+            else
+                low := middle;
+                f_low := f_middle;
+            end if;
+            steps := steps + 1;
+        end while;
+        return Some(value => (low + high) / 2.0);
+    end;
+
+    -- The method of Brent as in his book Algorithms for Minimization
+    -- without Derivatives, chapter 4: b is the best guess, a the previous
+    -- one, c the point with the other sign.
+    function brentRoot(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Option[Float64] is
+        var pa: Float64 := a;
+        var pb: Float64 := b;
+        var fa: Float64 := f(pa);
+        var fb: Float64 := f(pb);
+        if not opposite(fa, fb) then
+            return None();
+        end if;
+        var pc: Float64 := pa;
+        var fc: Float64 := fa;
+        var d: Float64 := pb - pa;
+        var e: Float64 := d;
+        var steps: Index := 0;
+        while steps < maximum_steps do
+            if ((fb > 0.0) and (fc > 0.0)) or ((fb < 0.0) and (fc < 0.0)) then
+                pc := pa;
+                fc := fa;
+                d := pb - pa;
+                e := d;
+            end if;
+            if absolute(fc) < absolute(fb) then
+                pa := pb;
+                pb := pc;
+                pc := pa;
+                fa := fb;
+                fb := fc;
+                fc := fa;
+            end if;
+            let limit: Float64 := tolerance / 2.0;
+            let m: Float64 := (pc - pb) / 2.0;
+            if (absolute(m) <= limit) or (fb = 0.0) then
+                return Some(value => pb);
+            end if;
+            if (absolute(e) >= limit) and (absolute(fa) > absolute(fb)) then
+                let s: Float64 := fb / fa;
+                var p: Float64 := 0.0;
+                var q: Float64 := 0.0;
+                if pa = pc then
+                    p := 2.0 * m * s;
+                    q := 1.0 - s;
+                else
+                    let qa: Float64 := fa / fc;
+                    let r: Float64 := fb / fc;
+                    p := s * (((2.0 * m * qa) * (qa - r)) - ((pb - pa) * (r - 1.0)));
+                    q := (qa - 1.0) * (r - 1.0) * (s - 1.0);
+                end if;
+                if p > 0.0 then
+                    q := 0.0 - q;
+                else
+                    p := 0.0 - p;
+                end if;
+                let bound1: Float64 := (3.0 * m * q) - absolute(limit * q);
+                let bound2: Float64 := absolute(e * q);
+                var smaller: Float64 := bound1;
+                if bound2 < bound1 then
+                    smaller := bound2;
+                end if;
+                if (2.0 * p) < smaller then
+                    e := d;
+                    d := p / q;
+                else
+                    d := m;
+                    e := m;
+                end if;
+            else
+                d := m;
+                e := m;
+            end if;
+            pa := pb;
+            fa := fb;
+            if absolute(d) > limit then
+                pb := pb + d;
+            else
+                if m > 0.0 then
+                    pb := pb + limit;
+                else
+                    pb := pb - limit;
+                end if;
+            end if;
+            fb := f(pb);
+            steps := steps + 1;
+        end while;
+        return Some(value => pb);
+    end;
+
+    -- The interval shrinks by the golden ratio each step and keeps the
+    -- side of the smaller of the two inner values.
+    function minimizeGolden(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Float64 is
+        let ratio: Float64 := (squareRoot(5.0) - 1.0) / 2.0;
+        var low: Float64 := a;
+        var high: Float64 := b;
+        var x1: Float64 := high - (ratio * (high - low));
+        var x2: Float64 := low + (ratio * (high - low));
+        var f1: Float64 := f(x1);
+        var f2: Float64 := f(x2);
+        var steps: Index := 0;
+        while ((high - low) > tolerance) and (steps < maximum_steps) do
+            if f1 < f2 then
+                high := x2;
+                x2 := x1;
+                f2 := f1;
+                x1 := high - (ratio * (high - low));
+                f1 := f(x1);
+            else
+                low := x1;
+                x1 := x2;
+                f1 := f2;
+                x2 := low + (ratio * (high - low));
+                f2 := f(x2);
+            end if;
+            steps := steps + 1;
+        end while;
+        let middle: Float64 := (low + high) / 2.0;
+        if middle < a then
+            return a;
+        end if;
+        if middle > b then
+            return b;
+        end if;
+        return middle;
+    end;
+end module body.

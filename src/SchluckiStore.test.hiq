@@ -1,0 +1,313 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- The suite of Mirco.SchluckiStore.Suite, run against SQLite: the default
+-- backend, and the one this test file names.  The suite names no backend of
+-- its own, so the same assertions run against DuckDB from a test of that
+-- module.
+--
+-- The test of the concurrency of SQLite opens a file in the root of the
+-- package beside a second process: testdata/sqlite_hold.py holds the write
+-- lock of the file for some seconds and says so on its standard output.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, destroyString);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readExactly,
+    closeFile,
+    removeFileIfThere
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray);
+import Mirco.Schlucki (
+    Table,
+    table,
+    destroyTable,
+    addFloatColumnWith,
+    addIntColumn,
+    addBoolColumn,
+    addTextColumn,
+    intAt,
+    kindInt
+);
+import Mirco.SchluckiStore (
+    Store,
+    StoreError,
+    backendSqlite,
+    openStore,
+    closeStore,
+    createTable,
+    query,
+    append,
+    statementFailed,
+    readOnly
+);
+import Mirco.SchluckiStore.Suite (
+    roundTrip,
+    allOrNothing,
+    nullRoundTrip,
+    strictColumnTypes,
+    defaultIsSqlite,
+    createPlacesTable,
+    appendPlaces
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.SchluckiStore.Test is
+    -- The three values of one column of the row of the refused append.
+    function vector3(a: Float64, b: Float64, c: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        return made;
+    end;
+
+    function ints3(a: Int64, b: Int64, c: Int64): NdArray[Int64] is
+        var v: Buffer[Int64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        return made;
+    end;
+
+    function bools3(a: Bool, b: Bool, c: Bool): NdArray[Bool] is
+        var v: Buffer[Bool] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Bool] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        return made;
+    end;
+
+    function testRoundTripSqlite(): Unit is
+        roundTrip(backendSqlite());
+        return nil;
+    end;
+
+    function testAllOrNothingSqlite(): Unit is
+        allOrNothing(backendSqlite());
+        return nil;
+    end;
+
+    function testNullRoundTripSqlite(): Unit is
+        nullRoundTrip(backendSqlite());
+        return nil;
+    end;
+
+    function testStrictColumnTypesSqlite(): Unit is
+        strictColumnTypes(backendSqlite());
+        return nil;
+    end;
+
+    function testDefaultIsSqlite(): Unit is
+        defaultIsSqlite();
+        return nil;
+    end;
+
+    function removeSqliteFile(): Unit is
+        let gone: Bool := removeFileIfThere("mirco-store-lock.sqlite");
+        let wal_gone: Bool := removeFileIfThere("mirco-store-lock.sqlite-wal");
+        let shm_gone: Bool := removeFileIfThere("mirco-store-lock.sqlite-shm");
+        return nil;
+    end;
+
+    -- The count of rows of places of a store.
+    generic [R: Region]
+    function placeCount(store: &![Store, R]): Int64 is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, kindInt());
+        var found: Int64 := -1;
+        case query(store, "SELECT CAST(count(*) AS BIGINT) FROM places", wholeSpan(&kinds), "count") of
+            when Right(right as back: Table) do
+                case intAt(&back, 0, 0) of
+                    when Some(value as v: Int64) do
+                        found := v;
+                    when None do
+                        skip;
+                end case;
+                destroyTable(back);
+            when Left(left as e: StoreError) do
+                skip;
+        end case;
+        destroyFree(kinds);
+        return found;
+    end;
+
+    -- testdata/sqlite_hold.py holding the write lock of the file of SQLite
+    -- for the seconds given while it inserts the place of the key given;
+    -- None unless it started and wrote that it holds the lock.
+    function holdSqlite(seconds: Span[Nat8, Static], key: Span[Nat8, Static]): Option[Running] is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"),
+            "PATH=\"$PATH:/usr/local/bin\" exec python3 -I testdata/sqlite_hold.py mirco-store-lock.sqlite \"$0\" \"$1\""),
+            seconds), key);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                var out: FileDescriptor := output;
+                let said: Option[String] := readExactly(&!out, 7);
+                let started: Running := Running(process => process, input => input, output => out, errors => errors);
+                case said of
+                    when Some(value as line: String) do
+                        destroyString(line);
+                        return Some(value => started);
+                    when None do
+                        let ended: Int32 := heldExit(started);
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- The exit code of the process of holdSqlite, once it ended.
+    function heldExit(running: Running): Int32 is
+        let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+        let closed_input: Bool := closeFile(input);
+        let status: ProcessStatus := waitProcess(process);
+        let closed_output: Bool := closeFile(output);
+        let closed_errors: Bool := closeFile(errors);
+        return exitCode(status);
+    end;
+
+    -- One writer at a time for each file of SQLite: a second writer, in the
+    -- programme or in another process, waits for the write lock of the
+    -- first, up to the busy timeout of five seconds of Standard.Sqlite, and
+    -- is refused after it with statementFailed and SQLITE_BUSY, nothing of
+    -- its rows written.  Readers read beside a writer that holds the lock.
+    function testOneWriterPerFileSqlite(): Unit is
+        removeSqliteFile();
+        case openStore(backendSqlite(), "mirco-store-lock.sqlite", true) of
+            when Right(right as opened: Store) do
+                var writer: Store := opened;
+                createPlacesTable(&!writer, backendSqlite());
+                appendPlaces(&!writer, 1, 2, 3);
+                assertTrue(placeCount(&!writer) = 3, "the first writer wrote its rows");
+                case openStore(backendSqlite(), "mirco-store-lock.sqlite", true) of
+                    when Right(right as other: Store) do
+                        var second: Store := other;
+                        appendPlaces(&!second, 4, 5, 6);
+                        closeStore(second);
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "a second writer of the programme is opened");
+                end case;
+                assertTrue(placeCount(&!writer) = 6, "the rows of both writers are there");
+                case openStore(backendSqlite(), "mirco-store-lock.sqlite", false) of
+                    when Right(right as reader_opened: Store) do
+                        var reader: Store := reader_opened;
+                        case holdSqlite("2", "100") of
+                            when Some(value as waited: Running) do
+                                assertTrue(placeCount(&!reader) = 6, "a reader reads beside a process that holds the lock");
+                                assertTrue(heldExit(waited) = 0, "the process that held the lock committed");
+                            when None do
+                                assertTrue(false, "a second process holds the lock");
+                        end case;
+                        assertTrue(placeCount(&!reader) = 7, "the reader reads the row of the other process");
+                        closeStore(reader);
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "a reader is opened beside the writer");
+                end case;
+                case holdSqlite("7", "101") of
+                    when Some(value as held: Running) do
+                        var t: Table := table(3);
+                        let masses: NdArray[Float64] := vector3(1.0, 1.0, 1.0);
+                        let there: NdArray[Bool] := bools3(true, true, true);
+                        let keys: NdArray[Int64] := ints3(11, 12, 13);
+                        let flags: NdArray[Bool] := bools3(true, true, true);
+                        let named: Bool := addTextColumn(&!t, "city", "bonn,koeln,ulm", 44);
+                        let weighed: Bool := addFloatColumnWith(&!t, "mass", &masses, &there);
+                        let counted: Bool := addIntColumn(&!t, "n", &keys);
+                        let flagged: Bool := addBoolColumn(&!t, "ok", &flags);
+                        assertTrue(named and weighed and counted and flagged, "the row of the refused append");
+                        destroyNdArray(masses);
+                        destroyNdArray(there);
+                        destroyNdArray(keys);
+                        destroyNdArray(flags);
+                        case append(&!writer, "INSERT INTO places (city, mass, n, ok) VALUES (?, ?, ?, ?)", &t) of
+                            when Right(right as n: Nat64) do
+                                assertTrue(false, "a writer is refused once the busy timeout ran out");
+                            when Left(left as e: StoreError) do
+                                assertTrue((e.code = statementFailed()) and (e.detail = 5), "a writer is refused with SQLITE_BUSY once the busy timeout ran out");
+                        end case;
+                        destroyTable(t);
+                        assertTrue(heldExit(held) = 0, "the process that held the lock committed");
+                    when None do
+                        assertTrue(false, "a second process holds the lock");
+                end case;
+                assertTrue(placeCount(&!writer) = 8, "none of the refused rows is written");
+                closeStore(writer);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "the file of SQLite is opened for writing");
+        end case;
+        removeSqliteFile();
+        return nil;
+    end;
+
+    -- A store opened for reading writes nothing, and says so.
+    function testReadOnlySqlite(): Unit is
+        removeSqliteFile();
+        case openStore(backendSqlite(), "mirco-store-lock.sqlite", true) of
+            when Right(right as opened: Store) do
+                var writer: Store := opened;
+                createPlacesTable(&!writer, backendSqlite());
+                closeStore(writer);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "the file of SQLite is opened for writing");
+        end case;
+        case openStore(backendSqlite(), "mirco-store-lock.sqlite", false) of
+            when Right(right as opened: Store) do
+                var reader: Store := opened;
+                case createTable(&!reader, "CREATE TABLE more (n INTEGER) STRICT") of
+                    when Right(right as done: Unit) do
+                        assertTrue(false, "a reader makes no table");
+                    when Left(left as e: StoreError) do
+                        assertTrue(e.code = readOnly(), "a reader makes no table");
+                end case;
+                var t: Table := table(3);
+                let keys: NdArray[Int64] := ints3(1, 2, 3);
+                let counted: Bool := addIntColumn(&!t, "n", &keys);
+                assertTrue(counted, "the column of the refused append");
+                destroyNdArray(keys);
+                case append(&!reader, "INSERT INTO places (n) VALUES (?)", &t) of
+                    when Right(right as n: Nat64) do
+                        assertTrue(false, "a reader writes no row");
+                    when Left(left as e: StoreError) do
+                        assertTrue(e.code = readOnly(), "a reader writes no row");
+                end case;
+                destroyTable(t);
+                closeStore(reader);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "the file of SQLite is opened for reading");
+        end case;
+        removeSqliteFile();
+        return nil;
+    end;
+end module body.

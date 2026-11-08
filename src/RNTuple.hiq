@@ -1,0 +1,1631 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, destroyEmpty, removeLast, lengthMut, nth, nthMut, storeNth, wholeSpan, length as bufferLength);
+import Standard.String (String, fromSpan, fromByteBuffer, asSpan, destroyString, length as stringLength);
+import Standard.Text (equal);
+import Standard.Bits (float64FromBits, float32FromBits);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan as arrayOf);
+import Mirco.Root (RootError, RootFault, BadObject, Truncated, UnknownVersion, BadChecksum, RootKey, objectBytes, regionBytes, className);
+import Mirco.Xxh3 (xxh3);
+
+-- The anchor is an object of the file, big endian: its count of bytes and
+-- version, four numbers of two bytes for the format, then seven of eight
+-- bytes: the seek, the stored and the unpacked length of the header and of
+-- the footer, and the largest key.  Header, footer and page lists are
+-- envelopes, little endian: a word of eight bytes with the type in its low
+-- 16 bits and the length above, then their frames.  A frame begins with a
+-- signed size of eight bytes; a negative size is a list frame, followed by
+-- the count of its items in four bytes.  Each envelope ends with the XXH3
+-- of the bytes before it; the footer and each page list repeat the XXH3
+-- of the header, and a page whose count of elements is negative is
+-- followed by the XXH3 of its bytes as they are stored.
+module body Mirco.RNTuple is
+    constant byte_count_mask: Nat64 := 1073741824;
+    constant two_to63: Nat64 := 9223372036854775808;
+    constant two_to56: Nat64 := 72057594037927936;
+
+    function failed(fault: RootFault, at: Index): RootError is
+        return RootError(fault => fault, at => at);
+    end;
+
+    generic [R: Region]
+    function fits(o: Span[Nat8, R], at: Index, n: Index): Bool is
+        return (at <= spanLength(o)) and (n <= (spanLength(o) - at));
+    end;
+
+    function wide(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function place(v: Nat64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    record Step: Free is
+        value: Nat64;
+        next: Index;
+        good: Bool;
+    end;
+
+    function badStep(at: Index): Step is
+        return Step(value => 0, next => at, good => false);
+    end;
+
+    -- n bytes from at, little endian, n at most 8.
+    generic [R: Region]
+    function le(o: Span[Nat8, R], at: Index, n: Index): Step is
+        if not fits(o, at, n) then
+            return badStep(at);
+        end if;
+        var v: Nat64 := 0;
+        var i: Index := n;
+        while i > 0 do
+            v := (v * 256) + wide(o[(at + i) - 1]);
+            i := i - 1;
+        end while;
+        return Step(value => v, next => at + n, good => true);
+    end;
+
+    -- n bytes from at, big endian, for the anchor.
+    generic [R: Region]
+    function be(o: Span[Nat8, R], at: Index, n: Index): Step is
+        if not fits(o, at, n) then
+            return badStep(at);
+        end if;
+        var v: Nat64 := 0;
+        var i: Index := 0;
+        while i < n do
+            v := (v * 256) + wide(o[at + i]);
+            i := i + 1;
+        end while;
+        return Step(value => v, next => at + n, good => true);
+    end;
+
+    -- 256 to the power n, n at most 7.
+    function scale(n: Index): Nat64 is
+        var t: Nat64 := 1;
+        var i: Index := 0;
+        while i < n do
+            t := t * 256;
+            i := i + 1;
+        end while;
+        return t;
+    end;
+
+    -- The two's complement of a number of n bytes as Int64.
+    function signedOf(v: Nat64, n: Index): Int64 is
+        if n >= 8 then
+            if v >= two_to63 then
+                case toInt64(v - two_to63) of
+                    when Some(value as w: Int64) do
+                        return (w - 9223372036854775807) - 1;
+                    when None do
+                        return 0;
+                end case;
+            end if;
+            case toInt64(v) of
+                when Some(value as w: Int64) do
+                    return w;
+                when None do
+                    return 0;
+            end case;
+        end if;
+        let top: Nat64 := scale(n);
+        case toInt64(v) of
+            when Some(value as w: Int64) do
+                if v >= (top / 2) then
+                    case toInt64(top) of
+                        when Some(value as t: Int64) do
+                            return w - t;
+                        when None do
+                            return 0;
+                    end case;
+                end if;
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The zigzag code of the split signed columns: 0, -1, 1, -2, 2 as 0, 1,
+    -- 2, 3, 4.
+    function unzigzag(v: Nat64): Int64 is
+        if rem(v, 2) = 0 then
+            case toInt64(v / 2) of
+                when Some(value as w: Int64) do
+                    return w;
+                when None do
+                    return 0;
+            end case;
+        end if;
+        case toInt64((v - 1) / 2) of
+            when Some(value as w: Int64) do
+                return (0 - w) - 1;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    record Piece: Free is
+        start: Index;
+        size: Index;
+        next: Index;
+        good: Bool;
+    end;
+
+    function badPiece(at: Index): Piece is
+        return Piece(start => at, size => 0, next => at, good => false);
+    end;
+
+    -- A string of an envelope: four bytes of length, then the bytes.
+    generic [R: Region]
+    function textAt(o: Span[Nat8, R], at: Index): Piece is
+        let n: Step := le(o, at, 4);
+        if (not n.good) or (not fits(o, at + 4, place(n.value))) then
+            return badPiece(at);
+        end if;
+        return Piece(start => at + 4, size => place(n.value), next => (at + 4) + place(n.value), good => true);
+    end;
+
+    -- A frame: where it ends, the count of items of a list frame, the place
+    -- after its preamble, and whether it is a list.
+    record Frame: Free is
+        finish: Index;
+        items: Index;
+        next: Index;
+        list: Bool;
+        good: Bool;
+    end;
+
+    function badFrame(at: Index): Frame is
+        return Frame(finish => at, items => 0, next => at, list => false, good => false);
+    end;
+
+    generic [R: Region]
+    function frameAt(o: Span[Nat8, R], at: Index): Frame is
+        let size: Step := le(o, at, 8);
+        if not size.good then
+            return badFrame(at);
+        end if;
+        if size.value >= two_to63 then
+            let length: Index := place((18446744073709551615 - size.value) + 1);
+            let n: Step := le(o, at + 8, 4);
+            if (not n.good) or (length < 12) or (not fits(o, at, length)) then
+                return badFrame(at);
+            end if;
+            return Frame(finish => at + length, items => place(n.value), next => at + 12, list => true, good => true);
+        end if;
+        let length: Index := place(size.value);
+        if (length < 8) or (not fits(o, at, length)) then
+            return badFrame(at);
+        end if;
+        return Frame(finish => at + length, items => 0, next => at + 8, list => false, good => true);
+    end;
+
+    -- The place after the feature flags at at: words of eight bytes, the
+    -- last without its highest bit.
+    generic [R: Region]
+    function afterFlags(o: Span[Nat8, R], at: Index): Step is
+        var p: Index := at;
+        while true do
+            let w: Step := le(o, p, 8);
+            if not w.good then
+                return badStep(p);
+            end if;
+            p := w.next;
+            if w.value < two_to63 then
+                return Step(value => 0, next => p, good => true);
+            end if;
+        end while;
+    end;
+
+    -- The envelope begins with its type and its length, which must be the
+    -- length of the bytes.
+    generic [R: Region]
+    function envelopeIs(o: Span[Nat8, R], kind: Nat64): Bool is
+        let w: Step := le(o, 0, 8);
+        return w.good and ((rem(w.value, 65536) = kind) and (place(w.value / 65536) = spanLength(o)));
+    end;
+
+    -- The checksum the envelope ends with, good when it is the XXH3 of the
+    -- bytes before it.
+    generic [R: Region]
+    function sealOf(o: Span[Nat8, R]): Step is
+        let n: Index := spanLength(o);
+        if n < 16 then
+            return badStep(0);
+        end if;
+        let stored: Step := le(o, n - 8, 8);
+        return Step(value => stored.value, next => n, good => stored.good and (stored.value = xxh3(spanPart(o, 0, n - 8))));
+    end;
+
+    -- Whether the page of size bytes at at is followed by the XXH3 of them.
+    generic [R: Region]
+    function pageSealed(bytes: Span[Nat8, R], at: Index, size: Index): Bool is
+        if not fits(bytes, at, size + 8) then
+            return false;
+        end if;
+        let stored: Step := le(bytes, at + size, 8);
+        return stored.value = xxh3(spanPart(bytes, at, size));
+    end;
+
+    record FieldRec: Free is
+        nameStart: Index;
+        nameSize: Index;
+        typeStart: Index;
+        typeSize: Index;
+        top: Bool;
+        parent: Index;
+        role: Nat64;
+        repetition: Index;
+    end;
+
+    record ColumnRec: Free is
+        kind: Nat64;
+        bits: Index;
+        field: Index;
+        physical: Index;
+    end;
+
+    record PageRec: Free is
+        column: Index;
+        cluster: Index;
+        elements: Index;
+        size: Index;
+        offset: Index;
+        sealed: Bool;
+    end;
+
+    record Ntuple: Linear is
+        header: String;
+        fields: Buffer[FieldRec];
+        columns: Buffer[ColumnRec];
+        pages: Buffer[PageRec];
+        entries: Index;
+        tops: Index;
+        handles: Index;
+        sizes: Buffer[Index];
+        clusters: Index;
+        invariant tops <= handles;
+    end;
+
+    -- The fields and columns of the header: after the flags the name, the
+    -- description and the writer, then the list of fields and the list of
+    -- columns.  A field of the top has itself as its parent.
+    generic [R: Region, S: Region, Q: Region]
+    function readHeaderEnvelope(o: Span[Nat8, R], fields: &![Buffer[FieldRec], S], columns: &![Buffer[ColumnRec], Q]): Option[Index] is
+        if not envelopeIs(o, 1) then
+            return Some(value => 0);
+        end if;
+        let flags: Step := afterFlags(o, 8);
+        let name: Piece := textAt(o, flags.next);
+        let description: Piece := textAt(o, name.next);
+        let writer: Piece := textAt(o, description.next);
+        if not (flags.good and name.good and description.good and writer.good) then
+            return Some(value => 8);
+        end if;
+        let list: Frame := frameAt(o, writer.next);
+        if (not list.good) or (not list.list) then
+            return Some(value => writer.next);
+        end if;
+        var p: Index := list.next;
+        var k: Index := 0;
+        while k < list.items do
+            -- After the versions, the parent, the role and the flags come the
+            -- name, the type, its alias and the description, then the count
+            -- of an array when the flags hold 1.
+            let item: Frame := frameAt(o, p);
+            let parent: Step := le(o, item.next + 8, 4);
+            let role: Step := le(o, item.next + 12, 2);
+            let field_flags: Step := le(o, item.next + 14, 2);
+            let named: Piece := textAt(o, item.next + 16);
+            let typed: Piece := textAt(o, named.next);
+            let alias: Piece := textAt(o, typed.next);
+            let described: Piece := textAt(o, alias.next);
+            if not (item.good and (parent.good and (role.good and field_flags.good)) and (named.good and typed.good)) then
+                return Some(value => p);
+            end if;
+            var repetition: Index := 0;
+            if rem(field_flags.value, 2) = 1 then
+                let times: Step := le(o, described.next, 8);
+                if not (alias.good and (described.good and times.good)) then
+                    return Some(value => p);
+                end if;
+                repetition := place(times.value);
+            end if;
+            insertBack(&~fields, FieldRec(nameStart => named.start, nameSize => named.size, typeStart => typed.start, typeSize => typed.size, top => (place(parent.value) = k), parent => place(parent.value), role => role.value, repetition => repetition));
+            p := item.finish;
+            k := k + 1;
+        end while;
+        let cols: Frame := frameAt(o, list.finish);
+        if (not cols.good) or (not cols.list) then
+            return Some(value => list.finish);
+        end if;
+        p := cols.next;
+        k := 0;
+        while k < cols.items do
+            let item: Frame := frameAt(o, p);
+            let kind: Step := le(o, item.next, 2);
+            let bits: Step := le(o, item.next + 2, 2);
+            let field: Step := le(o, item.next + 4, 4);
+            if not (item.good and kind.good and bits.good and field.good) then
+                return Some(value => p);
+            end if;
+            insertBack(&~columns, ColumnRec(kind => kind.value, bits => place(bits.value), field => place(field.value), physical => k));
+            p := item.finish;
+            k := k + 1;
+        end while;
+        -- The alias columns: a field of a projection reads the column of
+        -- another field; each alias becomes a column of its own field with
+        -- the kind and the pages of the physical one.
+        let aliases: Frame := frameAt(o, cols.finish);
+        if (not aliases.good) or (not aliases.list) then
+            return None();
+        end if;
+        let physicals: Index := lengthMut(&~columns);
+        p := aliases.next;
+        k := 0;
+        while k < aliases.items do
+            let item: Frame := frameAt(o, p);
+            let target: Step := le(o, item.next, 4);
+            let owner: Step := le(o, item.next + 4, 4);
+            if not (item.good and target.good and owner.good) then
+                return Some(value => p);
+            end if;
+            let at: Index := place(target.value);
+            if at >= physicals then
+                return Some(value => p);
+            end if;
+            let c: ColumnRec := nthMut(&~columns, at);
+            insertBack(&~columns, ColumnRec(kind => c.kind, bits => c.bits, field => place(owner.value), physical => at));
+            p := item.finish;
+            k := k + 1;
+        end while;
+        return None();
+    end;
+
+    -- One page list: the summaries of its clusters, which give the entries,
+    -- then for each cluster a list of columns, for each column a list of
+    -- pages, each the count of its elements, negative when a checksum
+    -- follows it, and its locator of a size and an offset.
+    generic [R: Region, S: Region]
+    function readPageList(o: Span[Nat8, R], first_cluster: Index, pages: &![Buffer[PageRec], S]): Option[Index] is
+        if not envelopeIs(o, 3) then
+            return Some(value => 0);
+        end if;
+        let sums: Frame := frameAt(o, 16);
+        if (not sums.good) or (not sums.list) then
+            return Some(value => 16);
+        end if;
+        let clusters: Frame := frameAt(o, sums.finish);
+        if (not clusters.good) or (not clusters.list) or (clusters.items /= sums.items) then
+            return Some(value => sums.finish);
+        end if;
+        var p: Index := clusters.next;
+        var c: Index := 0;
+        while c < clusters.items do
+            let cols: Frame := frameAt(o, p);
+            if (not cols.good) or (not cols.list) then
+                return Some(value => p);
+            end if;
+            var q: Index := cols.next;
+            var col: Index := 0;
+            while col < cols.items do
+                let list: Frame := frameAt(o, q);
+                if (not list.good) or (not list.list) then
+                    return Some(value => q);
+                end if;
+                var r: Index := list.next;
+                var pg: Index := 0;
+                while pg < list.items do
+                    let stored: Step := le(o, r, 4);
+                    let size: Step := le(o, r + 4, 4);
+                    let offset: Step := le(o, r + 8, 8);
+                    if (not (stored.good and size.good and offset.good)) or (size.value >= 2147483648) then
+                        return Some(value => r);
+                    end if;
+                    var elements: Nat64 := stored.value;
+                    let sealed: Bool := elements >= 2147483648;
+                    if sealed then
+                        elements := 4294967296 - elements;
+                    end if;
+                    insertBack(&~pages, PageRec(column => col, cluster => first_cluster + c, elements => place(elements), size => place(size.value), offset => place(offset.value), sealed => sealed));
+                    r := r + 16;
+                    pg := pg + 1;
+                end while;
+                q := list.finish;
+                col := col + 1;
+            end while;
+            p := cols.finish;
+            c := c + 1;
+        end while;
+        return None();
+    end;
+
+    -- The entries the summaries of a page list count, the count of each
+    -- cluster also put into sizes.
+    generic [R: Region, S: Region]
+    function entriesOf(o: Span[Nat8, R], sizes: &![Buffer[Index], S]): Index is
+        let sums: Frame := frameAt(o, 16);
+        var total: Index := 0;
+        var p: Index := sums.next;
+        var k: Index := 0;
+        while k < sums.items do
+            let item: Frame := frameAt(o, p);
+            let flagged: Step := le(o, item.next + 8, 8);
+            let here: Index := place(rem(flagged.value, two_to56));
+            insertBack(&~sizes, here);
+            total := total + here;
+            p := item.finish;
+            k := k + 1;
+        end while;
+        return total;
+    end;
+
+    -- The footer: the flags, the checksum of the header, the extension of
+    -- the schema, then the list of cluster groups, each the first entry,
+    -- the span of entries, the count of clusters and the link to its page
+    -- list: the unpacked length and the locator.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function readFooter(bytes: Span[Nat8, R], o: Span[Nat8, S], limit: Index, header_sum: Nat64, pages: &![Buffer[PageRec], Q], sizes: &![Buffer[Index], P]): Either[RootError, Index] is
+        if not envelopeIs(o, 2) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        let flags: Step := afterFlags(o, 8);
+        let extension: Frame := frameAt(o, flags.next + 8);
+        if not (flags.good and extension.good) then
+            return Left(left => failed(BadObject(), 8));
+        end if;
+        let named: Step := le(o, flags.next, 8);
+        if named.value /= header_sum then
+            return Left(left => failed(BadChecksum(), flags.next));
+        end if;
+        let groups: Frame := frameAt(o, extension.finish);
+        if (not groups.good) or (not groups.list) then
+            return Left(left => failed(BadObject(), extension.finish));
+        end if;
+        var entries: Index := 0;
+        var clusters: Index := 0;
+        var p: Index := groups.next;
+        var g: Index := 0;
+        while g < groups.items do
+            let item: Frame := frameAt(o, p);
+            let clustered: Step := le(o, item.next + 16, 4);
+            let length: Step := le(o, item.next + 20, 8);
+            let size: Step := le(o, item.next + 28, 4);
+            let offset: Step := le(o, item.next + 32, 8);
+            if (not (item.good and clustered.good and length.good and size.good and offset.good)) or (size.value >= 2147483648) then
+                return Left(left => failed(BadObject(), p));
+            end if;
+            case regionBytes(bytes, place(offset.value), place(size.value), place(length.value), limit) of
+                when Left(left as e: RootError) do
+                    return Left(left => e);
+                when Right(right as list: String) do
+                    let list_seal: Step := sealOf(asSpan(&list));
+                    let list_named: Step := le(asSpan(&list), 8, 8);
+                    if (not list_seal.good) or (list_named.value /= header_sum) then
+                        destroyString(list);
+                        return Left(left => failed(BadChecksum(), place(offset.value)));
+                    end if;
+                    case readPageList(asSpan(&list), clusters, &~pages) of
+                        when Some(value as at: Index) do
+                            destroyString(list);
+                            return Left(left => failed(BadObject(), place(offset.value) + at));
+                        when None do
+                            entries := entries + entriesOf(asSpan(&list), &~sizes);
+                            destroyString(list);
+                    end case;
+            end case;
+            clusters := clusters + place(clustered.value);
+            if lengthMut(&~sizes) /= clusters then
+                return Left(left => failed(BadObject(), p));
+            end if;
+            p := item.finish;
+            g := g + 1;
+        end while;
+        return Right(right => entries);
+    end;
+
+    record Anchor: Free is
+        seekHeader: Index;
+        storedHeader: Index;
+        header: Index;
+        seekFooter: Index;
+        storedFooter: Index;
+        footer: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region]
+    function anchorOf(a: Span[Nat8, R]): Anchor is
+        let bad: Anchor := Anchor(seekHeader => 0, storedHeader => 0, header => 0, seekFooter => 0, storedFooter => 0, footer => 0, good => false);
+        let word: Step := be(a, 0, 4);
+        let epoch: Step := be(a, 6, 2);
+        if (not (word.good and epoch.good)) or (word.value < byte_count_mask) or (epoch.value /= 1) or (not fits(a, 14, 48)) then
+            return bad;
+        end if;
+        let seek_header: Step := be(a, 14, 8);
+        let stored_header: Step := be(a, 22, 8);
+        let header: Step := be(a, 30, 8);
+        let seek_footer: Step := be(a, 38, 8);
+        let stored_footer: Step := be(a, 46, 8);
+        let footer: Step := be(a, 54, 8);
+        return Anchor(seekHeader => place(seek_header.value), storedHeader => place(stored_header.value), header => place(header.value),
+            seekFooter => place(seek_footer.value), storedFooter => place(stored_footer.value), footer => place(footer.value), good => true);
+    end;
+
+    generic [R: Region]
+    function readNtuple(bytes: Span[Nat8, R], key: RootKey, limit: Index): Either[RootError, Ntuple] is
+        if not equal(className(bytes, key), "ROOT::RNTuple") then
+            return Left(left => failed(BadObject(), key.seekKey));
+        end if;
+        case objectBytes(bytes, key, limit) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as raw: String) do
+                let anchor: Anchor := anchorOf(asSpan(&raw));
+                destroyString(raw);
+                if not anchor.good then
+                    return Left(left => failed(UnknownVersion(), key.seekKey));
+                end if;
+                return readParts(bytes, anchor, limit);
+        end case;
+    end;
+
+    generic [R: Region]
+    function readParts(bytes: Span[Nat8, R], anchor: Anchor, limit: Index): Either[RootError, Ntuple] is
+        case regionBytes(bytes, anchor.seekHeader, anchor.storedHeader, anchor.header, limit) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as header: String) do
+                let header_seal: Step := sealOf(asSpan(&header));
+                if not header_seal.good then
+                    destroyString(header);
+                    return Left(left => failed(BadChecksum(), anchor.seekHeader));
+                end if;
+                var fields: Buffer[FieldRec] := allocateEmpty();
+                var columns: Buffer[ColumnRec] := allocateEmpty();
+                case readHeaderEnvelope(asSpan(&header), &!fields, &!columns) of
+                    when Some(value as at: Index) do
+                        destroyFree(fields);
+                        destroyFree(columns);
+                        destroyString(header);
+                        return Left(left => failed(BadObject(), anchor.seekHeader + at));
+                    when None do
+                        skip;
+                end case;
+                case regionBytes(bytes, anchor.seekFooter, anchor.storedFooter, anchor.footer, limit) of
+                    when Left(left as e: RootError) do
+                        destroyFree(fields);
+                        destroyFree(columns);
+                        destroyString(header);
+                        return Left(left => e);
+                    when Right(right as footer: String) do
+                        let footer_seal: Step := sealOf(asSpan(&footer));
+                        if not footer_seal.good then
+                            destroyFree(fields);
+                            destroyFree(columns);
+                            destroyString(header);
+                            destroyString(footer);
+                            return Left(left => failed(BadChecksum(), anchor.seekFooter));
+                        end if;
+                        var pages: Buffer[PageRec] := allocateEmpty();
+                        var sizes: Buffer[Index] := allocateEmpty();
+                        case readFooter(bytes, asSpan(&footer), limit, header_seal.value, &!pages, &!sizes) of
+                            when Left(left as e: RootError) do
+                                destroyFree(pages);
+                                destroyFree(sizes);
+                                destroyFree(fields);
+                                destroyFree(columns);
+                                destroyString(header);
+                                destroyString(footer);
+                                return Left(left => e);
+                            when Right(right as entries: Index) do
+                                destroyString(footer);
+                                let tops: Index := topsOf(&fields);
+                                let handles: Index := tops + bufferLength(&fields);
+                                let clusters: Index := bufferLength(&sizes);
+                                return Right(right => Ntuple(header => header, fields => fields, columns => columns, pages => pages, entries => entries, tops => tops, handles => handles, sizes => sizes, clusters => clusters));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function destroyNtuple(tuple: Ntuple): Unit is
+        let { header: String, fields: Buffer[FieldRec], columns: Buffer[ColumnRec], pages: Buffer[PageRec], entries: Index, tops: Index, handles: Index, sizes: Buffer[Index], clusters: Index } := tuple;
+        destroyFree(sizes);
+        destroyString(header);
+        destroyFree(fields);
+        destroyFree(columns);
+        destroyFree(pages);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function ntupleEntries(tuple: &[Ntuple, R]): Index is
+        return tuple->entries;
+    end;
+
+    generic [R: Region]
+    function clusterCount(tuple: &[Ntuple, R]): Index is
+        return tuple->clusters;
+    end;
+
+    generic [R: Region]
+    function clusterEntries(tuple: &[Ntuple, R], c: Index): Index is
+        return nth(&(tuple->sizes), c);
+    end;
+
+    function narrowClusters(tuple: Ntuple, first: Index, count: Index): Ntuple is
+        let { header: String, fields: Buffer[FieldRec], columns: Buffer[ColumnRec], pages: Buffer[PageRec], entries: Index, tops: Index, handles: Index, sizes: Buffer[Index], clusters: Index } := tuple;
+        var start: Index := first;
+        if start > clusters then
+            start := clusters;
+        end if;
+        var span: Index := count;
+        if span > (clusters - start) then
+            span := clusters - start;
+        end if;
+        -- The kept pages are numbered from the first kept cluster on, as the
+        -- sizes are, so a narrowed RNTuple can be narrowed again.
+        var kept: Buffer[PageRec] := allocateEmpty();
+        var k: Index := 0;
+        while k < bufferLength(&pages) do
+            let p: PageRec := nth(&pages, k);
+            if (p.cluster >= start) and (p.cluster < (start + span)) then
+                insertBack(&!kept, PageRec(column => p.column, cluster => p.cluster - start, elements => p.elements, size => p.size, offset => p.offset, sealed => p.sealed));
+            end if;
+            k := k + 1;
+        end while;
+        var part: Buffer[Index] := allocateEmpty();
+        var total: Index := 0;
+        var c: Index := start;
+        while c < (start + span) do
+            let here: Index := nth(&sizes, c);
+            insertBack(&!part, here);
+            total := total + here;
+            c := c + 1;
+        end while;
+        destroyFree(pages);
+        destroyFree(sizes);
+        return Ntuple(header => header, fields => fields, columns => columns, pages => kept, entries => total, tops => tops, handles => handles, sizes => part, clusters => span);
+    end;
+
+    function rankFirst(clusters: Index, rank: Index, ranks: Index): Index is
+        let share: Index := clusters / ranks;
+        let rest: Index := rem(clusters, ranks);
+        if rank < rest then
+            return (share + 1) * rank;
+        end if;
+        return (share * rank) + rest;
+    end;
+
+    function rankCount(clusters: Index, rank: Index, ranks: Index): Index is
+        let share: Index := clusters / ranks;
+        if rank < rem(clusters, ranks) then
+            return share + 1;
+        end if;
+        return share;
+    end;
+
+    -- The index among all fields of the top field at i, or the count of all
+    -- fields when there is none. A number from the count of top fields on
+    -- names the field at that number less the count among all fields, as
+    -- fieldPath gives it.
+    generic [R: Region]
+    function topField(tuple: &[Ntuple, R], i: Index): Index is
+        if i >= tuple->tops then
+            let node: Index := i - tuple->tops;
+            if node < bufferLength(&(tuple->fields)) then
+                return node;
+            end if;
+            return bufferLength(&(tuple->fields));
+        end if;
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(&(tuple->fields)) do
+            let f: FieldRec := nth(&(tuple->fields), k);
+            if f.top then
+                if seen = i then
+                    return k;
+                end if;
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return k;
+    end;
+
+    generic [R: Region]
+    function topsOf(fields: &[Buffer[FieldRec], R]): Index is
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(fields) do
+            let f: FieldRec := nth(fields, k);
+            if f.top then
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return seen;
+    end;
+
+    generic [R: Region]
+    function fieldCount(tuple: &[Ntuple, R]): Index is
+        return tuple->tops;
+    end;
+
+    generic [R: Region]
+    function fieldHandles(tuple: &[Ntuple, R]): Index is
+        return tuple->handles;
+    end;
+
+    generic [R: Region, S: Region]
+    function fieldPath(tuple: &[Ntuple, R], path: Span[Nat8, S]): Option[Index] is
+        let none: Option[Index] := None();
+        let n: Index := spanLength(path);
+        var node: Index := bufferLength(&(tuple->fields));
+        var start: Index := 0;
+        var at: Index := 0;
+        while at <= n do
+            var cut: Bool := at = n;
+            if not cut then
+                cut := path[at] = 46;
+            end if;
+            if cut then
+                if at = start then
+                    return none;
+                end if;
+                let found: Index := namedBelow(tuple, node, spanPart(path, start, at - start));
+                if found >= bufferLength(&(tuple->fields)) then
+                    return none;
+                end if;
+                node := found;
+                start := at + 1;
+            end if;
+            at := at + 1;
+        end while;
+        if node >= bufferLength(&(tuple->fields)) then
+            return none;
+        end if;
+        return Some(value => tuple->tops + node);
+    end;
+
+    -- The field named name whose parent is parent, other than parent itself;
+    -- a parent of the count of all fields stands for the top. The count of
+    -- all fields when there is none.
+    generic [R: Region, S: Region]
+    function namedBelow(tuple: &[Ntuple, R], parent: Index, name: Span[Nat8, S]): Index is
+        let all: Index := bufferLength(&(tuple->fields));
+        var k: Index := 0;
+        while k < all do
+            let f: FieldRec := nth(&(tuple->fields), k);
+            let below: Bool := (f.top and (parent = all)) or ((not f.top) and (f.parent = parent));
+            if below and equal(spanPart(asSpan(&(tuple->header)), f.nameStart, f.nameSize), name) then
+                return k;
+            end if;
+            k := k + 1;
+        end while;
+        return all;
+    end;
+
+    generic [R: Region]
+    function fieldName(tuple: &[Ntuple, R], i: Index): String is
+        let f: FieldRec := nth(&(tuple->fields), topField(tuple, i));
+        return fromSpan(spanPart(asSpan(&(tuple->header)), f.nameStart, f.nameSize));
+    end;
+
+    generic [R: Region]
+    function fieldTypeName(tuple: &[Ntuple, R], i: Index): String is
+        let f: FieldRec := nth(&(tuple->fields), topField(tuple, i));
+        return fromSpan(spanPart(asSpan(&(tuple->header)), f.typeStart, f.typeSize));
+    end;
+
+    -- The column at position which among those of the field, or the count
+    -- of the columns.
+    generic [R: Region]
+    function columnOf(tuple: &[Ntuple, R], field: Index, which: Index): Index is
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(&(tuple->columns)) do
+            let c: ColumnRec := nth(&(tuple->columns), k);
+            if c.field = field then
+                if seen = which then
+                    return k;
+                end if;
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return k;
+    end;
+
+    -- The elements of a page unpacked: of width bytes each, split pages
+    -- put back into their order, each as its bits. With deltas each element
+    -- is the difference to the one before it in the same page, the first to
+    -- 0, and the sums are given; a sum of 2 to the 62 or more is refused.
+    -- An element wider than 8 bytes is refused, but for a switch, whose 12
+    -- bytes are an index of 8 and a tag of 4, given as packedSwitch packs
+    -- them.
+    generic [R: Region, S: Region]
+    function pageWords(data: Span[Nat8, R], elements: Index, width: Index, split: Bool, deltas: Bool, switched: Bool, out: &![Buffer[Nat64], S]): Bool is
+        if not fits(data, 0, elements * width) then
+            return false;
+        end if;
+        if switched then
+            return switchWords(data, elements, out);
+        end if;
+        if width > 8 then
+            return false;
+        end if;
+        let ceiling: Nat64 := 4611686018427387904;
+        var sum: Nat64 := 0;
+        var e: Index := 0;
+        while e < elements do
+            var v: Nat64 := 0;
+            var k: Index := width;
+            while k > 0 do
+                var at: Index := (e * width) + (k - 1);
+                if split then
+                    at := ((k - 1) * elements) + e;
+                end if;
+                v := (v * 256) + wide(data[at]);
+                k := k - 1;
+            end while;
+            if deltas then
+                if (v >= ceiling) or (sum >= (ceiling - v)) then
+                    return false;
+                end if;
+                sum := sum + v;
+                v := sum;
+            end if;
+            insertBack(&~out, v);
+            e := e + 1;
+        end while;
+        return true;
+    end;
+
+    -- The elements of a page of a switch column, 12 bytes each, little
+    -- endian: the index among the values of its alternative in the cluster,
+    -- then the tag, 0 for no value and k for the alternative k counted from
+    -- 1. Refused for an index of 2 to the 40 or more or a tag of 2 to the 20
+    -- or more.
+    generic [R: Region, S: Region]
+    function switchWords(data: Span[Nat8, R], elements: Index, out: &![Buffer[Nat64], S]): Bool is
+        let index_ceiling: Nat64 := 1099511627776;
+        let tag_ceiling: Nat64 := 1048576;
+        var e: Index := 0;
+        while e < elements do
+            let index: Step := le(data, e * 12, 8);
+            let tag: Step := le(data, (e * 12) + 8, 4);
+            if not (index.good and tag.good) then
+                return false;
+            end if;
+            if (index.value >= index_ceiling) or (tag.value >= tag_ceiling) then
+                return false;
+            end if;
+            insertBack(&~out, (tag.value * index_ceiling) + index.value);
+            e := e + 1;
+        end while;
+        return true;
+    end;
+
+    -- The tag of a word of a switch column.
+    function switchTag(word: Nat64): Nat64 is
+        return word / 1099511627776;
+    end;
+
+    -- The index of a word of a switch column.
+    function switchIndex(word: Nat64): Nat64 is
+        return rem(word, 1099511627776);
+    end;
+
+    -- The words of a column, page after page, with the cluster of each
+    -- word; refused when a page is not where its locator says. The split
+    -- indices hold differences, which begin again with each page, so they
+    -- are summed here and every index column gives the ends within its
+    -- cluster.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function columnWords(bytes: Span[Nat8, R], tuple: &[Ntuple, S], column: Index, limit: Index, words: &![Buffer[Nat64], Q], clusters: &![Buffer[Index], P]): Option[RootError] is
+        let c: ColumnRec := nth(&(tuple->columns), column);
+        let width: Index := c.bits / 8;
+        let split: Bool := (c.kind >= 17) and (c.kind <= 27);
+        let deltas: Bool := (c.kind = 26) or (c.kind = 27);
+        let switched: Bool := c.kind = 16;
+        var k: Index := 0;
+        while k < bufferLength(&(tuple->pages)) do
+            let p: PageRec := nth(&(tuple->pages), k);
+            if p.column = c.physical then
+                if p.elements > limit then
+                    return Some(value => failed(BadObject(), p.offset));
+                end if;
+                if p.sealed then
+                    let intact: Bool := pageSealed(bytes, p.offset, p.size);
+                    if not intact then
+                        return Some(value => failed(BadChecksum(), p.offset));
+                    end if;
+                end if;
+                case regionBytes(bytes, p.offset, p.size, p.elements * width, limit) of
+                    when Left(left as e: RootError) do
+                        return Some(value => e);
+                    when Right(right as data: String) do
+                        let fine: Bool := pageWords(asSpan(&data), p.elements, width, split, deltas, switched, &~words);
+                        destroyString(data);
+                        if not fine then
+                            return Some(value => failed(Truncated(), p.offset));
+                        end if;
+                        var j: Index := 0;
+                        while j < p.elements do
+                            insertBack(&~clusters, p.cluster);
+                            j := j + 1;
+                        end while;
+                end case;
+            end if;
+            k := k + 1;
+        end while;
+        return None();
+    end;
+
+    -- The kinds of columns by number: 3 to 10 the plain integers Int8,
+    -- UInt8, Int16, UInt16, Int32, UInt32, Int64 and UInt64; 17 to 22 the
+    -- split ones of 16, 32 and 64 bits, signed and unsigned in turn; 12 and
+    -- 13 binary32 and binary64, 24 and 25 split; 14 and 15 the plain
+    -- indices of 32 and 64 bits, 26 and 27 split; 2 the chars.
+    function integerKind(kind: Nat64): Bool is
+        return ((kind >= 3) and (kind <= 10)) or ((kind >= 17) and (kind <= 22));
+    end;
+
+    function signedKind(kind: Nat64): Bool is
+        return rem(kind, 2) = 1;
+    end;
+
+    function indexKind(kind: Nat64): Bool is
+        return ((kind = 14) or (kind = 15)) or ((kind = 26) or (kind = 27));
+    end;
+
+    -- The first field whose parent is field, or the count of the fields.
+    generic [R: Region]
+    function childOf(tuple: &[Ntuple, R], field: Index): Index is
+        var k: Index := 0;
+        while k < bufferLength(&(tuple->fields)) do
+            let f: FieldRec := nth(&(tuple->fields), k);
+            if (f.parent = field) and (k /= field) then
+                return k;
+            end if;
+            k := k + 1;
+        end while;
+        return k;
+    end;
+
+    -- The column that holds the values of field, the first column of the
+    -- field leafOf finds.
+    generic [R: Region]
+    function valueColumn(tuple: &[Ntuple, R], field: Index): Index is
+        return columnOf(tuple, leafOf(tuple, field), 0);
+    end;
+
+    -- The field whose columns hold the values of field: field itself when its
+    -- first column holds no index, when it has no column and no repetition,
+    -- as a record, or when no field lies below it; for a collection, whose
+    -- first column is an index, and for an array of a repetition, the field
+    -- of its items, and so on down, at most 16 steps.
+    generic [R: Region]
+    function leafOf(tuple: &[Ntuple, R], field: Index): Index is
+        let all: Index := bufferLength(&(tuple->fields));
+        var node: Index := field;
+        var steps: Index := 0;
+        while (node < all) and (steps < 16) do
+            let child: Index := childOf(tuple, node);
+            if child >= all then
+                return node;
+            end if;
+            let column: Index := columnOf(tuple, node, 0);
+            if column < bufferLength(&(tuple->columns)) then
+                let c: ColumnRec := nth(&(tuple->columns), column);
+                if not indexKind(c.kind) then
+                    return node;
+                end if;
+            else
+                let f: FieldRec := nth(&(tuple->fields), node);
+                if f.repetition = 0 then
+                    return node;
+                end if;
+            end if;
+            node := child;
+            steps := steps + 1;
+        end while;
+        return node;
+    end;
+
+    -- The count of values field holds over all entries: the entries for a
+    -- top field, times the repetition of each array above it, and below a
+    -- collection the count of its items, its last offset. Refused above the
+    -- limit, for a broken chain of parents and deeper than depth allows.
+    generic [R: Region, S: Region]
+    function countOf(bytes: Span[Nat8, R], tuple: &[Ntuple, S], field: Index, limit: Index, depth: Index): Either[RootError, Index] is
+        let all: Index := bufferLength(&(tuple->fields));
+        var node: Index := field;
+        var times: Index := 1;
+        var steps: Index := 0;
+        while (steps < 16) and (depth < 16) do
+            if node >= all then
+                return Left(left => failed(BadObject(), 0));
+            end if;
+            let f: FieldRec := nth(&(tuple->fields), node);
+            if f.top then
+                return scaled(tuple->entries, times, limit);
+            end if;
+            if f.parent >= all then
+                return Left(left => failed(BadObject(), 0));
+            end if;
+            let p: FieldRec := nth(&(tuple->fields), f.parent);
+            if p.repetition > 0 then
+                case scaled(times, p.repetition, limit) of
+                    when Right(right as more: Index) do
+                        times := more;
+                    when Left(left as e: RootError) do
+                        return Left(left => e);
+                end case;
+            end if;
+            let column: Index := columnOf(tuple, f.parent, 0);
+            if column < bufferLength(&(tuple->columns)) then
+                let c: ColumnRec := nth(&(tuple->columns), column);
+                if c.kind = 16 then
+                    case variantWords(bytes, tuple, f.parent, limit, depth + 1) of
+                        when Left(left as e: RootError) do
+                            return Left(left => e);
+                        when Right(right as words: Buffer[Nat64]) do
+                            let chosen: Index := tagged(&words, ordinalBelow(tuple, f.parent, node));
+                            destroyFree(words);
+                            return scaled(chosen, times, limit);
+                    end case;
+                end if;
+                if indexKind(c.kind) then
+                    case offsetsAt(bytes, tuple, f.parent, limit, depth + 1) of
+                        when Left(left as e: RootError) do
+                            return Left(left => e);
+                        when Right(right as out: Buffer[Int64]) do
+                            let last: Int64 := nth(&out, bufferLength(&out) - 1);
+                            destroyFree(out);
+                            case toIndex(last) of
+                                when Some(value as items: Index) do
+                                    return scaled(items, times, limit);
+                                when None do
+                                    return Left(left => failed(BadObject(), 0));
+                            end case;
+                    end case;
+                end if;
+            end if;
+            node := f.parent;
+            steps := steps + 1;
+        end while;
+        return Left(left => failed(BadObject(), 0));
+    end;
+
+    -- The count of the fields whose parent is field, other than field itself.
+    generic [R: Region]
+    function childCount(tuple: &[Ntuple, R], field: Index): Index is
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(&(tuple->fields)) do
+            let f: FieldRec := nth(&(tuple->fields), k);
+            if (f.parent = field) and (k /= field) then
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return seen;
+    end;
+
+    -- The place of node among the fields below parent, counted from 1, as
+    -- the tag of a switch counts the alternatives of a variant.
+    generic [R: Region]
+    function ordinalBelow(tuple: &[Ntuple, R], parent: Index, node: Index): Index is
+        var seen: Index := 0;
+        var k: Index := 0;
+        while (k <= node) and (k < bufferLength(&(tuple->fields))) do
+            let f: FieldRec := nth(&(tuple->fields), k);
+            if (f.parent = parent) and (k /= parent) then
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return seen;
+    end;
+
+    -- The words of the switch column of a variant field, as switchWords
+    -- packs them, one for each value of the field. Refused when the column
+    -- is no switch, a tag names no alternative, or the indices of an
+    -- alternative do not count up from 0 within each cluster.
+    generic [R: Region, S: Region]
+    function variantWords(bytes: Span[Nat8, R], tuple: &[Ntuple, S], field: Index, limit: Index, depth: Index): Either[RootError, Buffer[Nat64]] is
+        let column: Index := columnOf(tuple, field, 0);
+        if column >= bufferLength(&(tuple->columns)) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        let c: ColumnRec := nth(&(tuple->columns), column);
+        if c.kind /= 16 then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        var expected: Index := 0;
+        case countOf(bytes, tuple, field, limit, depth) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as n: Index) do
+                expected := n;
+        end case;
+        var words: Buffer[Nat64] := allocateEmpty();
+        var clusters: Buffer[Index] := allocateEmpty();
+        case columnWords(bytes, tuple, column, limit, &!words, &!clusters) of
+            when Some(value as e: RootError) do
+                destroyFree(words);
+                destroyFree(clusters);
+                return Left(left => e);
+            when None do
+                skip;
+        end case;
+        let alternatives: Index := childCount(tuple, field);
+        var counters: Buffer[Index] := allocateEmpty();
+        let zero: Index := 0;
+        var a: Index := 0;
+        while a < alternatives do
+            insertBack(&!counters, zero);
+            a := a + 1;
+        end while;
+        var good: Bool := bufferLength(&words) = expected;
+        var cluster: Index := 0;
+        var k: Index := 0;
+        while good and (k < bufferLength(&words)) do
+            let here: Index := nth(&clusters, k);
+            if (k > 0) and (here /= cluster) then
+                var r: Index := 0;
+                while r < alternatives do
+                    storeNth(&!counters, r, zero);
+                    r := r + 1;
+                end while;
+            end if;
+            cluster := here;
+            let tag: Index := place(switchTag(nth(&words, k)));
+            if tag > alternatives then
+                good := false;
+            end if;
+            if good and (tag > 0) then
+                let next: Index := nth(&counters, tag - 1);
+                good := place(switchIndex(nth(&words, k))) = next;
+                storeNth(&!counters, tag - 1, next + 1);
+            end if;
+            k := k + 1;
+        end while;
+        destroyFree(counters);
+        destroyFree(clusters);
+        if not good then
+            destroyFree(words);
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        return Right(right => words);
+    end;
+
+    -- The count of the words of a switch whose tag is tag.
+    generic [R: Region]
+    function tagged(words: &[Buffer[Nat64], R], tag: Index): Index is
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(words) do
+            if place(switchTag(nth(words, k))) = tag then
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return seen;
+    end;
+
+    generic [R: Region, S: Region]
+    function fieldTags(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]] is
+        case variantWords(bytes, tuple, topField(tuple, i), limit, 0) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as words: Buffer[Nat64]) do
+                var tags: Buffer[Int64] := allocateEmpty();
+                var k: Index := 0;
+                while k < bufferLength(&words) do
+                    case toInt64(switchTag(nth(&words, k))) of
+                        when Some(value as t: Int64) do
+                            insertBack(&!tags, t - 1);
+                        when None do
+                            let empty: Int64 := -1;
+                            insertBack(&!tags, empty);
+                    end case;
+                    k := k + 1;
+                end while;
+                destroyFree(words);
+                let made: NdArray[Int64] := vectorOf(&tags);
+                destroyFree(tags);
+                return Right(right => made);
+        end case;
+    end;
+
+    -- The product of n and times, refused above limit.
+    function scaled(n: Index, times: Index, limit: Index): Either[RootError, Index] is
+        if (times > 0) and (n > (limit / times)) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        return Right(right => n * times);
+    end;
+
+    generic [R: Region, S: Region]
+    function wordsOfField(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index, wanted: Nat64, other: Nat64): Either[RootError, Buffer[Nat64]] is
+        let leaf: Index := leafOf(tuple, topField(tuple, i));
+        let column: Index := columnOf(tuple, leaf, 0);
+        if column >= bufferLength(&(tuple->columns)) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        let c: ColumnRec := nth(&(tuple->columns), column);
+        if (c.kind /= wanted) and (c.kind /= other) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        var expected: Index := 0;
+        case countOf(bytes, tuple, leaf, limit, 0) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as n: Index) do
+                expected := n;
+        end case;
+        var words: Buffer[Nat64] := allocateEmpty();
+        var clusters: Buffer[Index] := allocateEmpty();
+        case columnWords(bytes, tuple, column, limit, &!words, &!clusters) of
+            when Some(value as e: RootError) do
+                destroyFree(words);
+                destroyFree(clusters);
+                return Left(left => e);
+            when None do
+                destroyFree(clusters);
+        end case;
+        if bufferLength(&words) /= expected then
+            destroyFree(words);
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        return Right(right => words);
+    end;
+
+    -- The offsets of a field whose first column is an index: one for each
+    -- entry and one more, from 0, counted over all clusters: the words of
+    -- the index column are the ends of the entries within their cluster.
+    generic [R: Region, S: Region]
+    function offsetsOf(bytes: Span[Nat8, R], tuple: &[Ntuple, S], field: Index, limit: Index): Either[RootError, Buffer[Int64]] is
+        return offsetsAt(bytes, tuple, field, limit, 0);
+    end;
+
+    -- As offsetsOf, one level of collections deeper than depth: the count
+    -- of the words is that of the entries of field, which countOf finds.
+    generic [R: Region, S: Region]
+    function offsetsAt(bytes: Span[Nat8, R], tuple: &[Ntuple, S], field: Index, limit: Index, depth: Index): Either[RootError, Buffer[Int64]] is
+        let column: Index := columnOf(tuple, field, 0);
+        if column >= bufferLength(&(tuple->columns)) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        let c: ColumnRec := nth(&(tuple->columns), column);
+        if not indexKind(c.kind) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        var expected: Index := 0;
+        case countOf(bytes, tuple, field, limit, depth) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as n: Index) do
+                expected := n;
+        end case;
+        var words: Buffer[Nat64] := allocateEmpty();
+        var clusters: Buffer[Index] := allocateEmpty();
+        case columnWords(bytes, tuple, column, limit, &!words, &!clusters) of
+            when Some(value as e: RootError) do
+                destroyFree(words);
+                destroyFree(clusters);
+                return Left(left => e);
+            when None do
+                skip;
+        end case;
+        var out: Buffer[Int64] := allocateEmpty();
+        let zero: Int64 := 0;
+        insertBack(&!out, zero);
+        var base: Nat64 := 0;
+        var previous: Nat64 := 0;
+        var cluster: Index := 0;
+        var good: Bool := bufferLength(&words) = expected;
+        var k: Index := 0;
+        while good and (k < bufferLength(&words)) do
+            let here: Index := nth(&clusters, k);
+            if (k > 0) and (here /= cluster) then
+                base := base + previous;
+                previous := 0;
+            end if;
+            cluster := here;
+            let finish: Nat64 := nth(&words, k);
+            if finish < previous then
+                good := false;
+            end if;
+            case toInt64(base + finish) of
+                when Some(value as w: Int64) do
+                    insertBack(&!out, w);
+                when None do
+                    good := false;
+            end case;
+            previous := finish;
+            k := k + 1;
+        end while;
+        destroyFree(words);
+        destroyFree(clusters);
+        if not good then
+            destroyFree(out);
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        return Right(right => out);
+    end;
+
+    generic [R: Region, S: Region]
+    function fieldOffsets(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]] is
+        case offsetsOf(bytes, tuple, topField(tuple, i), limit) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as out: Buffer[Int64]) do
+                let made: NdArray[Int64] := vectorOf(&out);
+                destroyFree(out);
+                return Right(right => made);
+        end case;
+    end;
+
+    -- A cardinality: the count of items of each entry, the differences of
+    -- the offsets of its index column.
+    generic [R: Region, S: Region]
+    function cardinality(bytes: Span[Nat8, R], tuple: &[Ntuple, S], field: Index, limit: Index): Either[RootError, NdArray[Int64]] is
+        case offsetsOf(bytes, tuple, field, limit) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as out: Buffer[Int64]) do
+                var counts: Buffer[Int64] := allocateEmpty();
+                var k: Index := 1;
+                while k < bufferLength(&out) do
+                    insertBack(&!counts, nth(&out, k) - nth(&out, k - 1));
+                    k := k + 1;
+                end while;
+                destroyFree(out);
+                let made: NdArray[Int64] := vectorOf(&counts);
+                destroyFree(counts);
+                return Right(right => made);
+        end case;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function vectorOf(values: &[Buffer[T], R]): NdArray[T] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, bufferLength(values));
+        let made: NdArray[T] := arrayOf(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function fieldInt64(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]] is
+        let leaf: Index := leafOf(tuple, topField(tuple, i));
+        let column: Index := columnOf(tuple, leaf, 0);
+        if column >= bufferLength(&(tuple->columns)) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        let c: ColumnRec := nth(&(tuple->columns), column);
+        if indexKind(c.kind) then
+            return cardinality(bytes, tuple, leaf, limit);
+        end if;
+        if not integerKind(c.kind) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        case wordsOfField(bytes, tuple, i, limit, c.kind, c.kind) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as words: Buffer[Nat64]) do
+                let width: Index := c.bits / 8;
+                let split: Bool := c.kind >= 17;
+                var values: Buffer[Int64] := allocateEmpty();
+                var fitting: Bool := true;
+                var k: Index := 0;
+                while k < bufferLength(&words) do
+                    let v: Nat64 := nth(&words, k);
+                    if signedKind(c.kind) then
+                        if split then
+                            insertBack(&!values, unzigzag(v));
+                        else
+                            insertBack(&!values, signedOf(v, width));
+                        end if;
+                    else
+                        case toInt64(v) of
+                            when Some(value as w: Int64) do
+                                insertBack(&!values, w);
+                            when None do
+                                fitting := false;
+                                insertBack(&!values, 0);
+                        end case;
+                    end if;
+                    k := k + 1;
+                end while;
+                destroyFree(words);
+                if not fitting then
+                    destroyFree(values);
+                    return Left(left => failed(BadObject(), 0));
+                end if;
+                let made: NdArray[Int64] := vectorOf(&values);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function fieldFloat64(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Float64]] is
+        case wordsOfField(bytes, tuple, i, limit, 13, 25) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as words: Buffer[Nat64]) do
+                var values: Buffer[Float64] := allocateEmpty();
+                var k: Index := 0;
+                while k < bufferLength(&words) do
+                    insertBack(&!values, float64FromBits(nth(&words, k)));
+                    k := k + 1;
+                end while;
+                destroyFree(words);
+                let made: NdArray[Float64] := vectorOf(&values);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+
+    function bits32(v: Nat64): Nat32 is
+        case toNat32(v) of
+            when Some(value as w: Nat32) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function fieldFloat32(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, NdArray[Float32]] is
+        case wordsOfField(bytes, tuple, i, limit, 12, 24) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as words: Buffer[Nat64]) do
+                var values: Buffer[Float32] := allocateEmpty();
+                var k: Index := 0;
+                while k < bufferLength(&words) do
+                    insertBack(&!values, float32FromBits(bits32(nth(&words, k))));
+                    k := k + 1;
+                end while;
+                destroyFree(words);
+                let made: NdArray[Float32] := vectorOf(&values);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+
+    -- A field of strings has an index column, whose values are the ends of
+    -- the strings in the chars of their cluster, and a column of chars.
+    -- The index column gives those ends for plain and split indices alike.
+    generic [R: Region, S: Region]
+    function fieldStrings(bytes: Span[Nat8, R], tuple: &[Ntuple, S], i: Index, limit: Index): Either[RootError, Buffer[String]] is
+        let field: Index := leafOf(tuple, topField(tuple, i));
+        let ends: Index := columnOf(tuple, field, 0);
+        let chars: Index := columnOf(tuple, field, 1);
+        if (chars >= bufferLength(&(tuple->columns))) or (ends >= bufferLength(&(tuple->columns))) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        var expected: Index := 0;
+        case countOf(bytes, tuple, field, limit, 0) of
+            when Left(left as x: RootError) do
+                return Left(left => x);
+            when Right(right as n: Index) do
+                expected := n;
+        end case;
+        let e: ColumnRec := nth(&(tuple->columns), ends);
+        let c: ColumnRec := nth(&(tuple->columns), chars);
+        if (c.kind /= 2) or ((e.kind < 14) or ((e.kind > 15) and ((e.kind < 26) or (e.kind > 27)))) then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        var offsets: Buffer[Nat64] := allocateEmpty();
+        var offset_clusters: Buffer[Index] := allocateEmpty();
+        var text: Buffer[Nat64] := allocateEmpty();
+        var text_clusters: Buffer[Index] := allocateEmpty();
+        let first: Option[RootError] := columnWords(bytes, tuple, ends, limit, &!offsets, &!offset_clusters);
+        let second: Option[RootError] := columnWords(bytes, tuple, chars, limit, &!text, &!text_clusters);
+        var refusal: Option[RootError] := first;
+        case first of
+            when Some(value as x: RootError) do
+                skip;
+            when None do
+                refusal := second;
+        end case;
+        var out: Buffer[String] := allocateEmpty();
+        var fault: Bool := false;
+        case refusal of
+            when Some(value as x: RootError) do
+                fault := true;
+            when None do
+                fault := not cutStrings(&offsets, &offset_clusters, &text, &text_clusters, &!out);
+        end case;
+        destroyFree(offsets);
+        destroyFree(offset_clusters);
+        destroyFree(text);
+        destroyFree(text_clusters);
+        case refusal of
+            when Some(value as x: RootError) do
+                destroyStrings(out);
+                return Left(left => x);
+            when None do
+                skip;
+        end case;
+        if fault or (bufferLength(&out) /= expected) then
+            destroyStrings(out);
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        return Right(right => out);
+    end;
+
+    function destroyStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while lengthMut(&!rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region, P: Region, O: Region]
+    function cutStrings(offsets: &[Buffer[Nat64], R], offset_clusters: &[Buffer[Index], S], text: &[Buffer[Nat64], Q], text_clusters: &[Buffer[Index], P], out: &![Buffer[String], O]): Bool is
+        var t: Index := 0;
+        var base: Index := 0;
+        var previous: Index := 0;
+        var cluster: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(offsets) do
+            let here: Index := nth(offset_clusters, k);
+            if (k = 0) or (here /= cluster) then
+                cluster := here;
+                previous := 0;
+                while (t < bufferLength(text)) and (nth(text_clusters, t) < cluster) do
+                    t := t + 1;
+                end while;
+                base := t;
+            end if;
+            let finish: Index := place(nth(offsets, k));
+            if (finish < previous) or ((base + finish) > bufferLength(text)) then
+                return false;
+            end if;
+            var bytes: Buffer[Nat8] := allocateEmpty();
+            var j: Index := previous;
+            while j < finish do
+                case toNat8(nth(text, base + j)) of
+                    when Some(value as b: Nat8) do
+                        insertBack(&!bytes, b);
+                    when None do
+                        insertBack(&!bytes, 0);
+                end case;
+                j := j + 1;
+            end while;
+            insertBack(&~out, fromByteBuffer(bytes));
+            previous := finish;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+end module body.

@@ -1,0 +1,122 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The functions of Mirco.Linalg and the product of matrices computed by Lapack and blis, the backend a programme selects by importing this module.
+
+- The library mircoblis of the package mirco-blis must be built; pkg-config finds it through PKG_CONFIG_PATH.
+- Each function has the name, the arguments and the result of the one in Mirco.Linalg, or for dot, matvec, gemv, gemm and matmul in Mirco.Compute, within rounding.
+- A matrix is an array of rank 2; a dimension that does not fit stops the programme with a message.
+- A singular matrix gives None where Mirco.Linalg gives None, as Lapack reports it.
+
+    let x: Option[NdArray[Float64]] := solve(&a, &b);
+"""
+import Mirco.Array (NdArray, rank, dimension, count);
+import Mirco.Linalg (Decomposition, parts);
+
+module Mirco.Lapack is
+    """
+    The product a b of an m by k and a k by n matrix, by dgemm of blis.
+    """
+    generic [R: Region, S: Region]
+    function matmul(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): NdArray[Float64]
+        requires (rank(a) = 2) and (rank(b) = 2) and (dimension(a, 1) = dimension(b, 0))
+        ensures (rank(&result) = 2) and (dimension(&result, 0) = dimension(a, 0)) and (dimension(&result, 1) = dimension(b, 1));
+
+    """
+    The dot product of two vectors of the same length, by dgemm of blis as a 1 by k times a k by 1 matrix.
+    """
+    generic [R: Region, S: Region]
+    function dot(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Float64
+        requires (rank(a) = 1) and (rank(b) = 1) and (count(a) = count(b));
+
+    """
+    The product of the matrix m and the vector x, by dgemm of blis; the columns of m are the length of x, the result has a position for each row.
+    """
+    generic [R: Region, S: Region]
+    function matvec(m: &[NdArray[Float64], R], x: &[NdArray[Float64], S]): NdArray[Float64]
+        requires (rank(m) = 2) and (rank(x) = 1) and (dimension(m, 1) = count(x))
+        ensures (rank(&result) = 1) and (count(&result) = dimension(m, 0));
+
+    """
+    y := alpha times m times x plus beta times y, by dgemm of blis; the columns of m are the length of x and its rows the length of y.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function gemv(alpha: Float64, m: &[NdArray[Float64], R], x: &[NdArray[Float64], S], beta: Float64, y: &![NdArray[Float64], Q]): Unit
+        requires (rank(m) = 2) and (rank(x) = 1) and (rank(&y) = 1) and (dimension(m, 1) = count(x)) and (dimension(m, 0) = count(&y))
+        ensures (rank(&y) = 1) and (count(&y) = old(count(&y)));
+
+    """
+    c := alpha times a times b plus beta times c, by dgemm of blis; the columns of a are the rows of b, and c has the rows of a and the columns of b.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function gemm(alpha: Float64, a: &[NdArray[Float64], R], b: &[NdArray[Float64], S], beta: Float64, c: &![NdArray[Float64], Q]): Unit
+        requires (rank(a) = 2) and (rank(b) = 2) and (rank(&c) = 2) and (dimension(a, 1) = dimension(b, 0)) and (dimension(&c, 0) = dimension(a, 0)) and (dimension(&c, 1) = dimension(b, 1))
+        ensures (rank(&c) = 2) and (count(&c) = old(count(&c)));
+
+    """
+    The x with a x = b, for a square a and b a vector or a matrix of as many rows; None when a is singular.
+    """
+    generic [R: Region, S: Region]
+    function solve(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and ((rank(b) = 1) or (rank(b) = 2)) and (dimension(a, 0) = dimension(a, 1)) and (dimension(b, 0) = dimension(a, 0));
+
+    """
+    The determinant of a square matrix, from the triangles of dgetrf.
+    """
+    generic [R: Region]
+    function determinant(a: &[NdArray[Float64], R]): Float64
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1));
+
+    """
+    The inverse of a square matrix; None when it is singular.
+    """
+    generic [R: Region]
+    function inverse(a: &[NdArray[Float64], R]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1));
+
+    """
+    The lower triangular l with l times its transpose a, for a symmetric positive definite a; None otherwise.
+    """
+    generic [R: Region]
+    function cholesky(a: &[NdArray[Float64], R]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1));
+
+    """
+    q with orthonormal columns and an upper triangular r with q r = a, for a of m rows and n columns, m at least
+    n: q is m by n and r n by n, by dgeqrf and dorgqr.
+    """
+    generic [R: Region]
+    function qr(a: &[NdArray[Float64], R]): Decomposition
+        requires (rank(a) = 2) and (dimension(a, 0) >= dimension(a, 1))
+        ensures parts(&result) = 2;
+
+    """
+    The x of least squares, the smallest norm of a x - b, for a of full column rank; None otherwise.
+    """
+    generic [R: Region, S: Region]
+    function lstsq(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and (rank(b) = 1) and (dimension(b, 0) = dimension(a, 0));
+
+    """
+    The eigenvalues of a symmetric matrix in ascending order and its eigenvectors as the columns of a matrix,
+    by dsyevd.
+    """
+    generic [R: Region]
+    function eigenSymmetric(a: &[NdArray[Float64], R]): Decomposition
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1))
+        ensures parts(&result) = 2;
+
+    """
+    u, s and vt with a = u diag(s) vt, for a of m rows and n columns, m at least n: u is m by n, s the n
+    singular values in descending order, vt n by n, by dgesdd.
+    """
+    generic [R: Region]
+    function svd(a: &[NdArray[Float64], R]): Decomposition
+        requires (rank(a) = 2) and (dimension(a, 0) >= dimension(a, 1))
+        ensures parts(&result) = 3;
+end module.

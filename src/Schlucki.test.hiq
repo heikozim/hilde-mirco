@@ -1,0 +1,740 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal, contains);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Standard.Sqlite (Connection, Writing, SqlError, openWriter, closeDatabase, execute, noValues);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, flatGet);
+import Mirco.Schlucki (
+    Table,
+    TableError,
+    table,
+    destroyTable,
+    rowCount,
+    columnCount,
+    columnIndex,
+    columnKind,
+    columnName,
+    columnsExist,
+    kindsKnown,
+    addFloatColumn,
+    addFloatColumnWith,
+    addIntColumn,
+    addBoolColumn,
+    addTextColumn,
+    floatAt,
+    intAt,
+    textAt,
+    boolAt,
+    floatColumn,
+    present,
+    select,
+    filter,
+    whereBetween,
+    whereText,
+    sortBy,
+    groupBy,
+    join,
+    readCsv,
+    writeCsv,
+    fromQuery,
+    insertRows,
+    kindFloat,
+    kindInt,
+    kindText,
+    kindBool,
+    Rows,
+    rowsFor,
+    gatheredRows,
+    putFloat,
+    putInt,
+    putText,
+    putBool,
+    finishRows,
+    aggregateSum,
+    aggregateMean
+);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Schlucki.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function bools(a: Bool, b: Bool, c: Bool, d: Bool): NdArray[Bool] is
+        var v: Buffer[Bool] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        insertBack(&!v, d);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 4);
+        let made: NdArray[Bool] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    function floats(a: Float64, b: Float64, c: Float64, d: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        insertBack(&!v, d);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 4);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    function ints(a: Int64, b: Int64, c: Int64, d: Int64): NdArray[Int64] is
+        var v: Buffer[Int64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        insertBack(&!v, d);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 4);
+        let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- city, mass and n of four rows.
+    function cities(): Table is
+        var t: Table := table(4);
+        let mass: NdArray[Float64] := floats(1.0, 2.0, 3.0, 4.0);
+        let n: NdArray[Int64] := ints(10, 20, 30, 40);
+        let a: Bool := addTextColumn(&!t, "city", "berlin,bonn,berlin,koeln", 44);
+        let b: Bool := addFloatColumn(&!t, "mass", &mass);
+        let c: Bool := addIntColumn(&!t, "n", &n);
+        if not (a and b and c) then
+            abort("Mirco.Schlucki.Test: the table of cities was not built");
+        end if;
+        destroyNdArray(mass);
+        destroyNdArray(n);
+        return t;
+    end;
+
+    generic [R: Region]
+    function textIs(t: &[Table, R], c: Index, r: Index, want: Span[Nat8, Static]): Bool is
+        case textAt(t, c, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                return equal(v, want);
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function floatIs(t: &[Table, R], c: Index, r: Index, want: Float64): Bool is
+        case floatAt(t, c, r) of
+            when Some(value as v: Float64) do
+                return v = want;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function columnOf(t: &[Table, R], name: Span[Nat8, Static]): Index is
+        case columnIndex(t, name) of
+            when Some(value as c: Index) do
+                return c;
+            when None do
+                abort("Mirco.Schlucki.Test: a column that is not there");
+        end case;
+    end;
+
+    -- The contract of select asks for columnsExist: every position below the count of columns.
+    function testSelectRefusesAColumnTheTableLacks(): Unit is
+        var t: Table := cities();
+        var good: Buffer[Index] := allocateEmpty();
+        insertBack(&!good, 2);
+        insertBack(&!good, 0);
+        var bad: Buffer[Index] := allocateEmpty();
+        insertBack(&!bad, 0);
+        insertBack(&!bad, 3);
+        assertTrue(columnsExist(&t, wholeSpan(&good)), "columns 2 and 0 of three are there");
+        assertFalse(columnsExist(&t, wholeSpan(&bad)), "column 3 of three is not");
+        destroyFree(good);
+        destroyFree(bad);
+        destroyTable(t);
+        return nil;
+    end;
+
+    -- The contract of rowsFor and of queryTable asks for kindsKnown: every
+    -- code one of kindFloat, kindInt, kindText and kindBool.
+    function testKindsKnownRefusesAnUnknownCode(): Unit is
+        var good: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!good, 1);
+        insertBack(&!good, 2);
+        insertBack(&!good, 3);
+        insertBack(&!good, 4);
+        var zero: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!zero, 1);
+        insertBack(&!zero, 0);
+        var five: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!five, 5);
+        assertTrue(kindsKnown(wholeSpan(&good)), "the four kinds are known");
+        assertFalse(kindsKnown(wholeSpan(&zero)), "a code of 0 is no kind");
+        assertFalse(kindsKnown(wholeSpan(&five)), "a code of 5 is no kind");
+        destroyFree(good);
+        destroyFree(zero);
+        destroyFree(five);
+        return nil;
+    end;
+
+    function testBuild(): Unit is
+        var t: Table := cities();
+        assertTrue((rowCount(&t) = 4) and (columnCount(&t) = 3), "four rows, three columns");
+        assertTrue((columnOf(&t, "mass") = 1) and (columnKind(&t, 1) = kindFloat()), "mass is of Float64");
+        assertTrue(equal(columnName(&t, 2), "n") and (columnKind(&t, 2) = kindInt()), "n is of Int64");
+        assertTrue(textIs(&t, 0, 3, "koeln"), "the fourth city");
+        let three: NdArray[Float64] := floats(1.0, 2.0, 3.0, 4.0);
+        assertTrue(not addFloatColumn(&!t, "mass", &three), "a name taken");
+        let short: Table := table(2);
+        destroyTable(short);
+        assertTrue(columnCount(&t) = 3, "nothing added");
+        destroyNdArray(three);
+        destroyTable(t);
+        return nil;
+    end;
+
+    function testFilterAndSort(): Unit is
+        let t: Table := cities();
+        let keep: NdArray[Bool] := whereBetween(&t, 1, 2.0, 3.0);
+        let middle: Table := filter(&t, &keep);
+        assertTrue(rowCount(&middle) = 2, "mass from 2 to 3");
+        assertTrue(textIs(&middle, 0, 0, "bonn") and textIs(&middle, 0, 1, "berlin"), "in their order");
+        let berlin: NdArray[Bool] := whereText(&t, 0, "berlin");
+        let only: Table := filter(&t, &berlin);
+        assertTrue(rowCount(&only) = 2, "two rows of berlin");
+        let sorted: Table := sortBy(&t, 1, false);
+        assertTrue(textIs(&sorted, 0, 0, "koeln") and floatIs(&sorted, 1, 3, 1.0), "descending by mass");
+        var cols: Buffer[Index] := allocateEmpty();
+        insertBack(&!cols, 2);
+        insertBack(&!cols, 0);
+        let picked: Table := select(&t, wholeSpan(&cols));
+        assertTrue((columnCount(&picked) = 2) and equal(columnName(&picked, 0), "n"), "n first, then city");
+        destroyFree(cols);
+        destroyTable(picked);
+        destroyTable(sorted);
+        destroyTable(only);
+        destroyNdArray(berlin);
+        destroyTable(middle);
+        destroyNdArray(keep);
+        destroyTable(t);
+        return nil;
+    end;
+
+    function testGroupBy(): Unit is
+        let t: Table := cities();
+        let sums: Table := groupBy(&t, 0, 1, aggregateSum());
+        assertTrue(rowCount(&sums) = 3, "three cities");
+        assertTrue(textIs(&sums, 0, 0, "berlin") and floatIs(&sums, 1, 0, 4.0), "berlin: 1 + 3");
+        assertTrue(textIs(&sums, 0, 2, "koeln") and floatIs(&sums, 1, 2, 4.0), "koeln: 4, in the order of first sight");
+        let means: Table := groupBy(&t, 0, 2, aggregateMean());
+        assertTrue(floatIs(&means, 1, 0, 20.0), "the mean n of berlin from Int64");
+        destroyTable(means);
+        destroyTable(sums);
+        destroyTable(t);
+        return nil;
+    end;
+
+    function testJoin(): Unit is
+        let left: Table := cities();
+        var right: Table := table(3);
+        let mass: NdArray[Float64] := floats(7.0, 8.0, 9.0, 0.0);
+        let a: Bool := addTextColumn(&!right, "city", "berlin,bonn,paris", 44);
+        let b: Bool := addTextColumn(&!right, "country", "de,de,fr", 44);
+        assertTrue(a and b, "the right table");
+        case join(&left, &right, 0, 0) of
+            when Some(value as j: Table) do
+                assertTrue(rowCount(&j) = 3, "berlin twice, bonn once, koeln not at all");
+                assertTrue(columnCount(&j) = 4, "three of the left, the country");
+                assertTrue(textIs(&j, 3, 0, "de") and textIs(&j, 0, 2, "berlin"), "the rows paired");
+                destroyTable(j);
+            when None do
+                assertTrue(false, "keys of one kind join");
+        end case;
+        case join(&left, &right, 1, 0) of
+            when Some(value as j: Table) do
+                destroyTable(j);
+                assertTrue(false, "a Float64 key and a text key do not join");
+            when None do
+                assertTrue(true, "no conversion");
+        end case;
+        destroyNdArray(mass);
+        destroyTable(right);
+        destroyTable(left);
+        return nil;
+    end;
+
+    function testCsv(): Unit is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 1);
+        insertBack(&!kinds, 2);
+        insertBack(&!kinds, 4);
+        case readCsv("name,x,n,ok\nab,1.5,3,true\ncd,,7,false\n", wholeSpan(&kinds)) of
+            when Right(right as t: Table) do
+                assertTrue(rowCount(&t) = 2, "two rows below the names");
+                assertTrue(floatIs(&t, 1, 0, 1.5), "a Float64");
+                case floatAt(&t, 1, 1) of
+                    when Some(value as v: Float64) do
+                        assertTrue(false, "an empty field is missing");
+                    when None do
+                        assertTrue(true, "an empty field is missing");
+                end case;
+                let column: NdArray[Float64] := floatColumn(&t, 1);
+                let x: Float64 := flatGet(&column, 1);
+                assertTrue(x /= x, "a NaN in the vector of the column");
+                let mask: NdArray[Bool] := present(&t, 1);
+                assertTrue(flatGet(&mask, 0) and (not flatGet(&mask, 1)), "present tells which");
+                destroyNdArray(column);
+                destroyNdArray(mask);
+                destroyTable(t);
+            when Left(left as e: TableError) do
+                assertTrue(false, "a table of four kinds");
+        end case;
+        case readCsv("name,x,n,ok\nab,1.5,x,true\n", wholeSpan(&kinds)) of
+            when Right(right as t: Table) do
+                destroyTable(t);
+                assertTrue(false, "x is no Int64");
+            when Left(left as e: TableError) do
+                assertTrue((e.code = 3) and (e.line = 2) and (e.column = 2), "line 2, column 2");
+        end case;
+        destroyFree(kinds);
+        return nil;
+    end;
+
+    -- writeCsv gives what readCsv reads back with the same kinds: a quoted
+    -- text, the shortest Float64, the smallest Int64, a missing value of
+    -- each kind as an empty field.
+    function testCsvWrittenAndBack(): Unit is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 1);
+        insertBack(&!kinds, 2);
+        insertBack(&!kinds, 4);
+        let smallest: Int64 := (0 - 9223372036854775807) - 1;
+        case readCsv("name,x,n,ok\n\"a,b\",0.1,-9223372036854775808,true\n,,,\n", wholeSpan(&kinds)) of
+            when Right(right as t: Table) do
+                case intAt(&t, 2, 0) of
+                    when Some(value as v: Int64) do
+                        assertTrue(v = smallest, "the smallest Int64 is read");
+                    when None do
+                        assertTrue(false, "the smallest Int64 is present");
+                end case;
+                case writeCsv(&t) of
+                    when Some(value as text: String) do
+                        assertTrue(equal(asSpan(&text), "name,x,n,ok\r\n\"a,b\",0.1,-9223372036854775808,true\r\n,,,\r\n"), "the text of writeCsv");
+                        case readCsv(asSpan(&text), wholeSpan(&kinds)) of
+                            when Right(right as back: Table) do
+                                assertTrue((rowCount(&back) = 2) and (columnCount(&back) = 4), "two rows of four columns back");
+                                assertTrue(equal(columnName(&back, 3), "ok"), "the names back");
+                                assertTrue(textIs(&back, 0, 0, "a,b"), "the text with a comma back");
+                                assertTrue(floatIs(&back, 1, 0, 0.1), "0.1 back");
+                                case intAt(&back, 2, 0) of
+                                    when Some(value as v: Int64) do
+                                        assertTrue(v = smallest, "the smallest Int64 back");
+                                    when None do
+                                        assertTrue(false, "the Int64 is present");
+                                end case;
+                                case boolAt(&back, 3, 0) of
+                                    when Some(value as v: Bool) do
+                                        assertTrue(v, "true back");
+                                    when None do
+                                        assertTrue(false, "the Bool is present");
+                                end case;
+                                assertTrue(missingRow(&back, 1), "every value of the second row missing back");
+                                destroyTable(back);
+                            when Left(left as e: TableError) do
+                                assertTrue(false, "readCsv takes what writeCsv wrote");
+                        end case;
+                        destroyString(text);
+                    when None do
+                        assertTrue(false, "a table of UTF-8 is written");
+                end case;
+                destroyTable(t);
+            when Left(left as e: TableError) do
+                assertTrue(false, "a table of four kinds with the smallest Int64");
+        end case;
+        case readCsv("n\n-9223372036854775809\n", wholeSpan(&kinds)) of
+            when Right(right as t: Table) do
+                destroyTable(t);
+                assertTrue(false, "one kind for four columns");
+            when Left(left as e: TableError) do
+                assertTrue(e.code = 2, "another count of columns than of kinds");
+        end case;
+        destroyFree(kinds);
+        var one: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!one, 2);
+        case readCsv("n\n-9223372036854775809\n", wholeSpan(&one)) of
+            when Right(right as t: Table) do
+                destroyTable(t);
+                assertTrue(false, "below the smallest Int64");
+            when Left(left as e: TableError) do
+                assertTrue((e.code = 3) and (e.line = 2), "below the smallest Int64 is refused");
+        end case;
+        destroyFree(one);
+        return nil;
+    end;
+
+    -- Whether every value of row r, of the four kinds of testCsvWrittenAndBack, is missing.
+    generic [R: Region]
+    function missingRow(t: &[Table, R], r: Index): Bool is
+        var none: Bool := true;
+        case textAt(t, 0, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                none := false;
+            when None do
+                skip;
+        end case;
+        case floatAt(t, 1, r) of
+            when Some(value as v: Float64) do
+                none := false;
+            when None do
+                skip;
+        end case;
+        case intAt(t, 2, r) of
+            when Some(value as v: Int64) do
+                none := false;
+            when None do
+                skip;
+        end case;
+        case boolAt(t, 3, r) of
+            when Some(value as v: Bool) do
+                none := false;
+            when None do
+                skip;
+        end case;
+        return none;
+    end;
+
+    function testSqlite(): Unit is
+        case openWriter(":memory:") of
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                case execute(&!db, "CREATE TABLE places (city TEXT, mass REAL, n INTEGER) STRICT", noValues()) of
+                    when Right(right as n: Nat64) do
+                        skip;
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "the table is made");
+                end case;
+                let t: Table := cities();
+                case insertRows(&!db, "INSERT INTO places (city, mass, n) VALUES (?, ?, ?)", &t) of
+                    when Right(right as n: Nat64) do
+                        assertTrue(n = 4, "four rows written");
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "the rows are written");
+                end case;
+                var kinds: Buffer[Nat8] := allocateEmpty();
+                insertBack(&!kinds, kindText());
+                insertBack(&!kinds, kindFloat());
+                insertBack(&!kinds, kindInt());
+                case fromQuery(&!db, "SELECT city, mass, n FROM places ORDER BY mass DESC", wholeSpan(&kinds), "city,mass,n") of
+                    when Right(right as back: Table) do
+                        assertTrue(rowCount(&back) = 4, "four rows read");
+                        assertTrue(textIs(&back, 0, 0, "koeln") and floatIs(&back, 1, 0, 4.0), "the first row");
+                        assertTrue(equal(columnName(&back, 2), "n"), "the names given");
+                        case intAt(&back, 2, 3) of
+                            when Some(value as v: Int64) do
+                                assertTrue(v = 10, "the last n");
+                            when None do
+                                assertTrue(false, "n is there");
+                        end case;
+                        destroyTable(back);
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "the query runs");
+                end case;
+                destroyFree(kinds);
+                destroyTable(t);
+                closeDatabase(db);
+            when Left(left as e: SqlError) do
+                assertTrue(false, "a database in memory opens");
+        end case;
+        return nil;
+    end;
+
+    -- fromQuery reads a column asked for as kindBool as a column of Bool:
+    -- SQLite holds a Bool as the integer 0 or 1, as insertRows writes it,
+    -- so the column comes back of kind Bool with true and false beside the
+    -- columns of the other kinds; an integer that is neither 0 nor 1 is no
+    -- Bool SQLite can give, so the query is refused with the datatype
+    -- mismatch of SQLite (code 20), not read as a text, and a null stays a
+    -- missing value.
+    function testSqliteBool(): Unit is
+        case openWriter(":memory:") of
+            when Right(right as opened: Connection[Writing]) do
+                var db: Connection[Writing] := opened;
+                case execute(&!db, "CREATE TABLE flags (city TEXT, mass REAL, n INTEGER, ok INTEGER) STRICT", noValues()) of
+                    when Right(right as n: Nat64) do
+                        skip;
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "the table is made");
+                end case;
+                var t: Table := cities();
+                let ok: NdArray[Bool] := bools(true, false, false, true);
+                assertTrue(addBoolColumn(&!t, "ok", &ok), "the Bool column");
+                case insertRows(&!db, "INSERT INTO flags (city, mass, n, ok) VALUES (?, ?, ?, ?)", &t) of
+                    when Right(right as n: Nat64) do
+                        assertTrue(n = 4, "four rows written");
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "the rows are written");
+                end case;
+                var kinds: Buffer[Nat8] := allocateEmpty();
+                insertBack(&!kinds, kindText());
+                insertBack(&!kinds, kindFloat());
+                insertBack(&!kinds, kindInt());
+                insertBack(&!kinds, kindBool());
+                case fromQuery(&!db, "SELECT city, mass, n, ok FROM flags ORDER BY mass", wholeSpan(&kinds), "city,mass,n,ok") of
+                    when Right(right as back: Table) do
+                        assertTrue(rowCount(&back) = 4, "four rows read");
+                        assertTrue((columnKind(&back, 0) = kindText()) and (columnKind(&back, 1) = kindFloat()), "text and Float64 as asked");
+                        assertTrue((columnKind(&back, 2) = kindInt()) and (columnKind(&back, 3) = kindBool()), "Int64 and Bool as asked, the Bool not read as a text");
+                        assertTrue(textIs(&back, 0, 0, "berlin") and floatIs(&back, 1, 0, 1.0), "the text and the Float64 of the first row");
+                        case intAt(&back, 2, 1) of
+                            when Some(value as v: Int64) do
+                                assertTrue(v = 20, "the Int64 of the second row");
+                            when None do
+                                assertTrue(false, "the Int64 is there");
+                        end case;
+                        case boolAt(&back, 3, 0) of
+                            when Some(value as v: Bool) do
+                                assertTrue(v, "the first Bool, true");
+                            when None do
+                                assertTrue(false, "the first Bool is there");
+                        end case;
+                        case boolAt(&back, 3, 1) of
+                            when Some(value as v: Bool) do
+                                assertFalse(v, "the second Bool, false");
+                            when None do
+                                assertTrue(false, "the second Bool is there");
+                        end case;
+                        destroyTable(back);
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "the query runs");
+                end case;
+                destroyFree(kinds);
+                var one: Buffer[Nat8] := allocateEmpty();
+                insertBack(&!one, kindBool());
+                case fromQuery(&!db, "SELECT 7", wholeSpan(&one), "seven") of
+                    when Right(right as back: Table) do
+                        destroyTable(back);
+                        assertTrue(false, "the seven is no Bool SQLite can give");
+                    when Left(left as e: SqlError) do
+                        assertTrue(e.code = 20, "the seven is refused with the datatype mismatch of SQLite");
+                end case;
+                case fromQuery(&!db, "SELECT NULL", wholeSpan(&one), "none") of
+                    when Right(right as back: Table) do
+                        assertTrue(columnKind(&back, 0) = kindBool(), "a null is read into a column of Bool");
+                        case boolAt(&back, 0, 0) of
+                            when Some(value as v: Bool) do
+                                assertTrue(false, "a null is a missing value");
+                            when None do
+                                assertTrue(true, "a null is a missing value");
+                        end case;
+                        destroyTable(back);
+                    when Left(left as e: SqlError) do
+                        assertTrue(false, "a null is no failure");
+                end case;
+                destroyFree(one);
+                destroyNdArray(ok);
+                destroyTable(t);
+                closeDatabase(db);
+            when Left(left as e: SqlError) do
+                assertTrue(false, "a database in memory opens");
+        end case;
+        return nil;
+    end;
+
+    -- The ensures of the five add functions: a column more exactly when one
+    -- answers true, and the count of rows kept either way.
+    function testAddKeepsTheRows(): Unit is
+        var t: Table := table(4);
+        let mass: NdArray[Float64] := floats(1.0, 2.0, 3.0, 4.0);
+        let there: NdArray[Bool] := bools(true, false, true, true);
+        let ok: NdArray[Bool] := bools(true, true, false, false);
+        assertTrue(addFloatColumnWith(&!t, "mass", &mass, &there), "a Float64 column with marks");
+        assertTrue(addBoolColumn(&!t, "ok", &ok), "a Bool column");
+        assertFalse(addBoolColumn(&!t, "ok", &ok), "a name taken");
+        assertFalse(addTextColumn(&!t, "city", "a,b", 44), "two texts for four rows");
+        assertTrue((columnCount(&t) = 2) and (rowCount(&t) = 4), "two columns added, two refused");
+        assertTrue(not floatIs(&t, 0, 1, 2.0), "the value marked missing");
+        case boolAt(&t, 1, 0) of
+            when Some(value as v: Bool) do
+                assertTrue(v, "the first Bool");
+            when None do
+                assertTrue(false, "the first Bool is there");
+        end case;
+        destroyNdArray(ok);
+        destroyNdArray(there);
+        destroyNdArray(mass);
+        destroyTable(t);
+        return nil;
+    end;
+
+    -- Rows gathered one value after the other: the ensures of each put
+    -- keeps the count of whole rows or adds one, that of finishRows makes it
+    -- the count of rows; a value after the last whole row is left out.
+    function testGatherRows(): Unit is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, kindFloat());
+        insertBack(&!kinds, kindInt());
+        insertBack(&!kinds, kindText());
+        insertBack(&!kinds, kindBool());
+        var rows: Rows := rowsFor(wholeSpan(&kinds));
+        putFloat(&!rows, Some(value => 1.5));
+        putInt(&!rows, None());
+        let word: Span[Nat8, Static] := "ab";
+        putText(&!rows, Some(value => word));
+        assertTrue(gatheredRows(&rows) = 0, "no whole row before the fourth value");
+        putBool(&!rows, Some(value => true));
+        assertTrue(gatheredRows(&rows) = 1, "one whole row after the fourth");
+        putFloat(&!rows, None());
+        let t: Table := finishRows(rows, "x,n,s,b");
+        assertTrue((rowCount(&t) = 1) and (columnCount(&t) = 4), "one row, four columns");
+        assertTrue(floatIs(&t, 0, 0, 1.5) and textIs(&t, 2, 0, "ab"), "the values of the row");
+        destroyTable(t);
+        destroyFree(kinds);
+        return nil;
+    end;
+
+    -- Each call in a child of its own: a column the table lacks is refused
+    -- by the requires of select, an unknown kind by those of rowsFor and of
+    -- fromQuery; the known kinds and the columns there are taken.
+    function testRefusals(): Unit is
+        var unknown: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!unknown, kindText());
+        insertBack(&!unknown, 5);
+        var known: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!known, kindText());
+        insertBack(&!known, kindInt());
+        var cols: Buffer[Index] := allocateEmpty();
+        insertBack(&!cols, 0);
+        insertBack(&!cols, 3);
+        if asChild("selectPast") then
+            let t: Table := cities();
+            let picked: Table := select(&t, wholeSpan(&cols));
+            destroyTable(picked);
+            destroyTable(t);
+        else if asChild("rowsUnknown") then
+            let rows: Rows := rowsFor(wholeSpan(&unknown));
+            let t: Table := finishRows(rows, "");
+            destroyTable(t);
+        else if asChild("queryUnknown") or asChild("queryKnown") then
+            case openWriter(":memory:") of
+                when Right(right as opened: Connection[Writing]) do
+                    var db: Connection[Writing] := opened;
+                    var kinds: Buffer[Nat8] := allocateEmpty();
+                    if asChild("queryUnknown") then
+                        insertBack(&!kinds, 5);
+                    else
+                        insertBack(&!kinds, kindInt());
+                    end if;
+                    case fromQuery(&!db, "SELECT 1", wholeSpan(&kinds), "one") of
+                        when Right(right as back: Table) do
+                            destroyTable(back);
+                        when Left(left as e: SqlError) do
+                            skip;
+                    end case;
+                    destroyFree(kinds);
+                    closeDatabase(db);
+                when Left(left as e: SqlError) do
+                    skip;
+            end case;
+        else if asChild("fits") then
+            let rows: Rows := rowsFor(wholeSpan(&known));
+            let empty: Table := finishRows(rows, "a,b");
+            destroyTable(empty);
+        else
+            assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+            assertTrue(refusedInChild("testRefusals", "selectPast", "contract violated: the requires"), "select of column 3 of three is refused by the requires");
+            assertTrue(refusedInChild("testRefusals", "rowsUnknown", "contract violated: the requires"), "rowsFor of the code 5 is refused by the requires");
+            assertTrue(refusedInChild("testRefusals", "queryUnknown", "contract violated: the requires"), "fromQuery of the code 5 is refused by the requires");
+            assertTrue(not refusedInChild("testRefusals", "queryKnown", "contract violated"), "fromQuery of a known kind breaks no contract");
+            assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "rowsFor of known kinds breaks no contract");
+        end if;
+        destroyFree(cols);
+        destroyFree(known);
+        destroyFree(unknown);
+        return nil;
+    end;
+end module body.

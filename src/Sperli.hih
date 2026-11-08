@@ -1,0 +1,75 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The narrow interface Sperli asks of the array type: encode, decode, elementType, shape and combine, filled by Mirco.Array.
+
+Sperli stands for Simple Parallel Execution over Remote Links Interface.
+
+- Sperli holds no array of its own; a rank sends the bytes encode writes and the receiver gets the array back with decode.
+- The bytes are the wire format of Mirco.Wire, and decode checks all of it before it takes an element.
+- elementType gives the code of the table of Sperli: Int32 1, Int64 2, Float32 5, Float64 6; Nat8 and Bool are plain bytes, 0.
+- combine reduces two arrays of the same shape element by element with Standard.SperliCollective.combine, under its rules: whole numbers wrap around, plain bytes take only the bitwise operations.
+
+    let written: Index := encode(&grid, &!out);
+"""
+import Standard.Buffer (Buffer, length);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, count);
+import Mirco.Wire (WireError, headerLength);
+
+module Mirco.Sperli is
+    """
+    Why combine gave no array.
+    """
+    union CombineError: Free is
+        case OtherShape;
+        case NotCombined;
+    end;
+
+    """
+    The code in the table of Sperli for the code of a Mirco element type: 1 for Int32, 2 for Int64, 5 for Float32, 6 for Float64, and 0, plain bytes, for Nat8, Bool and any other code.
+    """
+    function sperliCode(code: Nat8): Nat8
+        ensures (result <= 6) and (result /= 3) and (result /= 4);
+
+    """
+    Appends the bytes of array in the wire format of Mirco.Wire to out and gives their count.
+    """
+    generic [T: Free(Element), R: Region, S: Region]
+    function encode(array: &[NdArray[T], R], out: &![Buffer[Nat8], S]): Index
+        ensures (result >= (headerLength(rank(array)) + count(array))) and (result <= (headerLength(rank(array)) + (8 * count(array))))
+        ensures length(&out) = (old(length(&out)) + result);
+
+    """
+    The array the bytes hold, or why they were refused; T is the element type asked for.
+    No contract: no precondition, since bytes that are cut, wrong or of another element type than T give a WireError, never a stop.
+    """
+    generic [T: Free(Element), R: Region]
+    function decode(bytes: Span[Nat8, R]): Either[WireError, NdArray[T]];
+
+    """
+    The code of the element type of array in the table of Sperli.
+    """
+    generic [T: Free(Element), R: Region]
+    function elementType(array: &[NdArray[T], R]): Nat8
+        ensures (result <= 6) and (result /= 3) and (result /= 4);
+
+    """
+    The length of every axis of array, borrowed.
+    """
+    generic [T: Free, R: Region]
+    function shape(array: &[NdArray[T], R]): Span[Index, R]
+        ensures spanLength(result) = rank(array);
+
+    """
+    The elements of first and second reduced one by one with reduction, a reduce operation of Standard.SperliCollective, first as the left operand; the result has their shape.
+    No contract: no precondition, since two shapes that differ give OtherShape and a reduction that does not fit the element type gives NotCombined, never a stop.
+    """
+    generic [T: Free(Element), R: Region, S: Region]
+    function combine(first: &[NdArray[T], R], second: &[NdArray[T], S], reduction: Nat8): Either[CombineError, NdArray[T]];
+end module.

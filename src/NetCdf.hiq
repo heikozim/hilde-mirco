@@ -1,0 +1,343 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, wholeSpan, getSpanMut, nth, length as bufferLength);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, count, rank, dimension, elements, fromSpan, maximumRank);
+import Mirco.Bindings.NetCdf (
+    create,
+    open,
+    close,
+    redefine,
+    endDefine,
+    defineDimension,
+    defineVariable,
+    variableOf,
+    typeOf,
+    rankOf,
+    dimensionsOf,
+    lengthOf,
+    putFloat64,
+    putInt64,
+    getFloat64,
+    getInt64
+);
+
+module body Mirco.NetCdf is
+    -- The name of a dimension: the name of the variable, an underscore and
+    -- the axis in decimal.
+    generic [R: Region]
+    function dimensionName(name: Span[Nat8, R], axis: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < spanLength(name) do
+            insertBack(&!out, name[i]);
+            i := i + 1;
+        end while;
+        insertBack(&!out, 95);
+        if axis >= 10 then
+            insertBack(&!out, digit(axis / 10));
+        end if;
+        insertBack(&!out, digit(rem(axis, 10)));
+        return out;
+    end;
+
+    function digit(d: Index): Nat8 is
+        case toNat8(rem(d, 10)) of
+            when Some(value as b: Nat8) do
+                return b + 48;
+            when None do
+                return 48;
+        end case;
+    end;
+
+    -- The file opened for definitions, or a negative number when it could
+    -- not be created or opened.
+    generic [R: Region]
+    function openForWrite(path: Span[Nat8, R], fresh: Bool): Int32 is
+        var ids: Buffer[Int32] := initialize(1, 0);
+        var status: Int32 := 0;
+        if fresh then
+            status := create(path, getSpanMut(&!ids, 0, 0));
+        else
+            status := open(path, true, getSpanMut(&!ids, 0, 0));
+        end if;
+        let file: Int32 := nth(&ids, 0);
+        destroyFree(ids);
+        if status /= 0 then
+            return -1;
+        end if;
+        if not fresh then
+            if redefine(file) /= 0 then
+                let closed: Int32 := close(file);
+                return -1;
+            end if;
+        end if;
+        return file;
+    end;
+
+    -- Defines the dimensions and the variable of an array of the given
+    -- shape and leaves define mode; the variable, or a negative number.
+    generic [R: Region, S: Region]
+    function defineFor(file: Int32, name: Span[Nat8, R], shape: Span[Index, S], floating: Bool): Int32 is
+        var dims: Buffer[Int32] := allocateEmpty();
+        var ids: Buffer[Int32] := initialize(1, 0);
+        var ok: Bool := true;
+        var axis: Index := 0;
+        while ok and (axis < spanLength(shape)) do
+            let dim_name: Buffer[Nat8] := dimensionName(name, axis);
+            let size: Index := shape[axis];
+            let status: Int32 := defineDimension(file, wholeSpan(&dim_name), size, getSpanMut(&!ids, 0, 0));
+            destroyFree(dim_name);
+            if status = 0 then
+                insertBack(&!dims, nth(&ids, 0));
+            else
+                ok := false;
+            end if;
+            axis := axis + 1;
+        end while;
+        var variable: Int32 := -1;
+        if ok then
+            if defineVariable(file, name, floating, wholeSpan(&dims), getSpanMut(&!ids, 0, 0)) = 0 then
+                variable := nth(&ids, 0);
+            end if;
+        end if;
+        destroyFree(dims);
+        destroyFree(ids);
+        if variable < 0 then
+            return -1;
+        end if;
+        if endDefine(file) /= 0 then
+            return -1;
+        end if;
+        return variable;
+    end;
+
+    function finish(file: Int32, written: Int32): Either[NetCdfFault, Unit] is
+        let closed: Int32 := close(file);
+        if (written /= 0) or (closed /= 0) then
+            return Left(left => NotDone());
+        end if;
+        return Right(right => nil);
+    end;
+
+    generic [T: Free, R: Region]
+    function shapeOfArray(array: &[NdArray[T], R]): Buffer[Index] is
+        var shape: Buffer[Index] := allocateEmpty();
+        var axis: Index := 0;
+        while axis < rank(array) do
+            insertBack(&!shape, dimension(array, axis));
+            axis := axis + 1;
+        end while;
+        return shape;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function writeFloat64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Float64], Q], fresh: Bool): Either[NetCdfFault, Unit] is
+        let file: Int32 := openForWrite(path, fresh);
+        if file < 0 then
+            return Left(left => NotOpened());
+        end if;
+        let shape: Buffer[Index] := shapeOfArray(array);
+        let variable: Int32 := defineFor(file, name, wholeSpan(&shape), true);
+        destroyFree(shape);
+        if variable < 0 then
+            let closed: Int32 := close(file);
+            return Left(left => NoVariable());
+        end if;
+        return finish(file, putFloat64(file, variable, elements(array)));
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function writeInt64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Int64], Q], fresh: Bool): Either[NetCdfFault, Unit] is
+        let file: Int32 := openForWrite(path, fresh);
+        if file < 0 then
+            return Left(left => NotOpened());
+        end if;
+        let shape: Buffer[Index] := shapeOfArray(array);
+        let variable: Int32 := defineFor(file, name, wholeSpan(&shape), false);
+        destroyFree(shape);
+        if variable < 0 then
+            let closed: Int32 := close(file);
+            return Left(left => NoVariable());
+        end if;
+        return finish(file, putInt64(file, variable, elements(array)));
+    end;
+
+    record Found: Free is
+        file: Int32;
+        variable: Int32;
+    end;
+
+    -- The file opened for reading and the variable found, of the type
+    -- wanted: 6 is NC_DOUBLE, 10 is NC_INT64.
+    generic [R: Region, S: Region]
+    function startRead(path: Span[Nat8, R], name: Span[Nat8, S], wanted: Int32): Either[NetCdfFault, Found] is
+        var ids: Buffer[Int32] := initialize(1, 0);
+        if open(path, false, getSpanMut(&!ids, 0, 0)) /= 0 then
+            destroyFree(ids);
+            return Left(left => NotOpened());
+        end if;
+        let file: Int32 := nth(&ids, 0);
+        if variableOf(file, name, getSpanMut(&!ids, 0, 0)) /= 0 then
+            destroyFree(ids);
+            let closed: Int32 := close(file);
+            return Left(left => NoVariable());
+        end if;
+        let variable: Int32 := nth(&ids, 0);
+        let typed: Int32 := typeOf(file, variable, getSpanMut(&!ids, 0, 0));
+        let kind: Int32 := nth(&ids, 0);
+        destroyFree(ids);
+        if (typed /= 0) or (kind /= wanted) then
+            let closed: Int32 := close(file);
+            return Left(left => OtherType());
+        end if;
+        return Right(right => Found(file => file, variable => variable));
+    end;
+
+    -- The shape of the variable, or None when its rank is none of an array
+    -- or netCDF does not answer.
+    function shapeOfVariable(found: Found): Option[Buffer[Index]] is
+        var room: Buffer[Int32] := initialize(maximumRank(), 0);
+        let n: Index := bufferLength(&room);
+        if dimensionsOf(found.file, found.variable, getSpanMut(&!room, 0, n - 1)) /= 0 then
+            destroyFree(room);
+            return None();
+        end if;
+        var ranks: Buffer[Int32] := initialize(1, 0);
+        let asked: Int32 := rankOf(found.file, found.variable, getSpanMut(&!ranks, 0, 0));
+        let r: Int32 := nth(&ranks, 0);
+        destroyFree(ranks);
+        var size: Index := 0;
+        case toIndex(r) of
+            when Some(value as s: Index) do
+                size := s;
+            when None do
+                size := 0;
+        end case;
+        if (asked /= 0) or ((size < 1) or (size > n)) then
+            destroyFree(room);
+            return None();
+        end if;
+        var shape: Buffer[Index] := allocateEmpty();
+        var lengths: Buffer[Index] := initialize(1, 0);
+        var ok: Bool := true;
+        var axis: Index := 0;
+        while ok and (axis < size) do
+            if lengthOf(found.file, nth(&room, axis), getSpanMut(&!lengths, 0, 0)) = 0 then
+                insertBack(&!shape, nth(&lengths, 0));
+            else
+                ok := false;
+            end if;
+            axis := axis + 1;
+        end while;
+        destroyFree(room);
+        destroyFree(lengths);
+        if not ok then
+            destroyFree(shape);
+            return None();
+        end if;
+        return Some(value => shape);
+    end;
+
+    -- The most elements one read of a variable makes, as the interface
+    -- promises it.
+    function readElementLimit(): Index is
+        return 4294967296;
+    end;
+
+    -- The count of elements of shape, or None when a dimension is 0, the
+    -- product does not fit an Index or goes above readElementLimit(): the
+    -- product is held at or below the limit while it is formed, so that no
+    -- multiplication overflows.  The rank of the shape, 1 to 32, is checked
+    -- by shapeOfVariable before this runs.
+    generic [R: Region]
+    function countedElements(shape: Span[Index, R]): Option[Index] is
+        var total: Index := 1;
+        var axis: Index := 0;
+        while axis < spanLength(shape) do
+            let dim: Index := shape[axis];
+            if dim < 1 then
+                return None();
+            end if;
+            if dim > (readElementLimit() / total) then
+                return None();
+            end if;
+            total := total * dim;
+            axis := axis + 1;
+        end while;
+        return Some(value => total);
+    end;
+
+    generic [R: Region, S: Region]
+    function readFloat64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[NetCdfFault, NdArray[Float64]] is
+        case startRead(path, name, 6) of
+            when Right(right as found: Found) do
+                case shapeOfVariable(found) of
+                    when Some(value as shape: Buffer[Index]) do
+                        case countedElements(wholeSpan(&shape)) of
+                            when Some(value as total: Index) do
+                                var values: Buffer[Float64] := initialize(total, 0.0);
+                                let status: Int32 := getFloat64(found.file, found.variable, getSpanMut(&!values, 0, total - 1));
+                                let closed: Int32 := close(found.file);
+                                if (status /= 0) or (closed /= 0) then
+                                    destroyFree(values);
+                                    destroyFree(shape);
+                                    return Left(left => NotDone());
+                                end if;
+                                let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+                                destroyFree(values);
+                                destroyFree(shape);
+                                return Right(right => made);
+                            when None do
+                                destroyFree(shape);
+                                let closed: Int32 := close(found.file);
+                                return Left(left => BadDimensions());
+                        end case;
+                    when None do
+                        let closed: Int32 := close(found.file);
+                        return Left(left => BadDimensions());
+                end case;
+            when Left(left as fault: NetCdfFault) do
+                return Left(left => fault);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function readInt64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[NetCdfFault, NdArray[Int64]] is
+        case startRead(path, name, 10) of
+            when Right(right as found: Found) do
+                case shapeOfVariable(found) of
+                    when Some(value as shape: Buffer[Index]) do
+                        case countedElements(wholeSpan(&shape)) of
+                            when Some(value as total: Index) do
+                                var values: Buffer[Int64] := initialize(total, 0);
+                                let status: Int32 := getInt64(found.file, found.variable, getSpanMut(&!values, 0, total - 1));
+                                let closed: Int32 := close(found.file);
+                                if (status /= 0) or (closed /= 0) then
+                                    destroyFree(values);
+                                    destroyFree(shape);
+                                    return Left(left => NotDone());
+                                end if;
+                                let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+                                destroyFree(values);
+                                destroyFree(shape);
+                                return Right(right => made);
+                            when None do
+                                destroyFree(shape);
+                                let closed: Int32 := close(found.file);
+                                return Left(left => BadDimensions());
+                        end case;
+                    when None do
+                        let closed: Int32 := close(found.file);
+                        return Left(left => BadDimensions());
+                end case;
+            when Left(left as fault: NetCdfFault) do
+                return Left(left => fault);
+        end case;
+    end;
+end module body.

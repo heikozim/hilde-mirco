@@ -1,0 +1,714 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Numeric (Numeric);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, dimension, count, flatGet);
+import Mirco.Compute (matmul as plainMatmul, dot as plainDot, matvec as plainMatvec, gemv as plainGemv, gemm as plainGemm);
+import Mirco.Linalg (
+    Decomposition,
+    part,
+    destroyDecomposition,
+    solve as plainSolve,
+    determinant as plainDeterminant,
+    inverse as plainInverse,
+    cholesky as plainCholesky,
+    lstsq as plainLstsq,
+    eigenSymmetric as plainEigen,
+    svd as plainSvd
+);
+import Mirco.Lapack (matmul, dot, matvec, gemv, gemm, solve, determinant, inverse, cholesky, qr, lstsq, eigenSymmetric, svd);
+import Mirco.Math (absolute, sine);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Lapack.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) <= (0.000000001 * (1.0 + absolute(b)));
+    end;
+
+    -- Each element of a and b within the tolerance of near, the same shape.
+    generic [R: Region, S: Region]
+    function same(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Bool is
+        if count(a) /= count(b) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < count(a) do
+            if not near(flatGet(a, i), flatGet(b, i)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The same up to the sign of each column, as eigenvectors and the
+    -- columns of q and u are fixed only up to their sign.
+    generic [R: Region, S: Region]
+    function sameUpToSign(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Bool is
+        if count(a) /= count(b) then
+            return false;
+        end if;
+        let rows: Index := dimension(a, 0);
+        let cols: Index := dimension(a, 1);
+        var j: Index := 0;
+        while j < cols do
+            var plus: Bool := true;
+            var minus: Bool := true;
+            var i: Index := 0;
+            while i < rows do
+                let x: Float64 := flatGet(a, (i * cols) + j);
+                let y: Float64 := flatGet(b, (i * cols) + j);
+                plus := plus and near(x, y);
+                minus := minus and near(x, -y);
+                i := i + 1;
+            end while;
+            if not (plus or minus) then
+                return false;
+            end if;
+            j := j + 1;
+        end while;
+        return true;
+    end;
+
+    -- A matrix of rows by cols whose elements are sines of the squares of
+    -- their places: sines of places in steps of one width would follow a
+    -- recurrence of two terms and give a matrix of rank 2.
+    function filled(rows: Index, cols: Index, seed: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        var x: Float64 := 0.0;
+        while k < (rows * cols) do
+            insertBack(&!v, sine(seed + ((x * x) * 0.37)));
+            x := x + 1.0;
+            k := k + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    function vectorFilled(n: Index, seed: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        var x: Float64 := 0.0;
+        while k < n do
+            insertBack(&!v, sine(seed + ((x * x) * 0.71)));
+            x := x + 1.0;
+            k := k + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- a times its transpose plus n on the diagonal: symmetric positive definite.
+    function spd(n: Index): NdArray[Float64] is
+        let a: NdArray[Float64] := filled(n, n, 0.3);
+        var v: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            var j: Index := 0;
+            while j < n do
+                var s: Float64 := 0.0;
+                var k: Index := 0;
+                while k < n do
+                    s := s + (flatGet(&a, (i * n) + k) * flatGet(&a, (j * n) + k));
+                    k := k + 1;
+                end while;
+                if i = j then
+                    s := s + 6.0;
+                end if;
+                insertBack(&!v, s);
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        destroyNdArray(a);
+        return made;
+    end;
+
+    function testMatmul(): Unit is
+        let a: NdArray[Float64] := filled(5, 3, 0.1);
+        let b: NdArray[Float64] := filled(3, 4, 0.9);
+        let fast: NdArray[Float64] := matmul(&a, &b);
+        let plain: NdArray[Float64] := plainMatmul(&a, &b);
+        assertTrue((dimension(&fast, 0) = 5) and (dimension(&fast, 1) = 4), "5 by 4");
+        assertTrue(same(&fast, &plain), "dgemm agrees with the compute layer");
+        destroyNdArray(a);
+        destroyNdArray(b);
+        destroyNdArray(fast);
+        destroyNdArray(plain);
+        return nil;
+    end;
+
+    function testSolveDeterminantInverse(): Unit is
+        let a: NdArray[Float64] := filled(6, 6, 0.2);
+        let b: NdArray[Float64] := vectorFilled(6, 0.5);
+        case solve(&a, &b) of
+            when Some(value as x: NdArray[Float64]) do
+                case plainSolve(&a, &b) of
+                    when Some(value as y: NdArray[Float64]) do
+                        assertTrue(same(&x, &y), "dgesv agrees with Mirco.Linalg");
+                        destroyNdArray(y);
+                    when None do
+                        assertTrue(false, "Mirco.Linalg solves it");
+                end case;
+                destroyNdArray(x);
+            when None do
+                assertTrue(false, "dgesv solves it");
+        end case;
+        assertTrue(near(determinant(&a), plainDeterminant(&a)), "the determinants agree");
+        case inverse(&a) of
+            when Some(value as x: NdArray[Float64]) do
+                case plainInverse(&a) of
+                    when Some(value as y: NdArray[Float64]) do
+                        assertTrue(same(&x, &y), "the inverses agree");
+                        destroyNdArray(y);
+                    when None do
+                        assertTrue(false, "Mirco.Linalg inverts it");
+                end case;
+                destroyNdArray(x);
+            when None do
+                assertTrue(false, "Lapack inverts it");
+        end case;
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 2.0);
+        insertBack(&!v, 2.0);
+        insertBack(&!v, 4.0);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 2);
+        let singular: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        let two: NdArray[Float64] := vectorFilled(2, 0.1);
+        case solve(&singular, &two) of
+            when Some(value as x: NdArray[Float64]) do
+                destroyNdArray(x);
+                assertTrue(false, "a singular system has no solution");
+            when None do
+                assertTrue(true, "None for a singular system");
+        end case;
+        assertTrue(determinant(&singular) = 0.0, "the determinant of a singular matrix");
+        destroyNdArray(singular);
+        destroyNdArray(two);
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    function testCholeskyAndLstsq(): Unit is
+        let a: NdArray[Float64] := spd(5);
+        case cholesky(&a) of
+            when Some(value as l: NdArray[Float64]) do
+                case plainCholesky(&a) of
+                    when Some(value as k: NdArray[Float64]) do
+                        assertTrue(same(&l, &k), "dpotrf agrees with Mirco.Linalg");
+                        destroyNdArray(k);
+                    when None do
+                        assertTrue(false, "Mirco.Linalg factors it");
+                end case;
+                destroyNdArray(l);
+            when None do
+                assertTrue(false, "dpotrf factors it");
+        end case;
+        let tall: NdArray[Float64] := filled(8, 3, 0.4);
+        let b: NdArray[Float64] := vectorFilled(8, 0.2);
+        case lstsq(&tall, &b) of
+            when Some(value as x: NdArray[Float64]) do
+                case plainLstsq(&tall, &b) of
+                    when Some(value as y: NdArray[Float64]) do
+                        assertTrue(same(&x, &y), "dgelsd agrees with Mirco.Linalg");
+                        destroyNdArray(y);
+                    when None do
+                        assertTrue(false, "Mirco.Linalg fits it");
+                end case;
+                destroyNdArray(x);
+            when None do
+                assertTrue(false, "dgelsd fits it");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(tall);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    function testQr(): Unit is
+        let a: NdArray[Float64] := filled(6, 4, 0.7);
+        let d: Decomposition := qr(&a);
+        let q: NdArray[Float64] := part(&d, 0);
+        let r: NdArray[Float64] := part(&d, 1);
+        let back: NdArray[Float64] := plainMatmul(&q, &r);
+        assertTrue((dimension(&q, 0) = 6) and (dimension(&r, 0) = 4), "q is 6 by 4, r 4 by 4");
+        assertTrue(same(&back, &a), "q r is a");
+        assertTrue(flatGet(&r, 4) = 0.0, "r is upper triangular");
+        destroyNdArray(q);
+        destroyNdArray(r);
+        destroyNdArray(back);
+        destroyDecomposition(d);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function testEigenAndSvd(): Unit is
+        let a: NdArray[Float64] := spd(4);
+        let fast: Decomposition := eigenSymmetric(&a);
+        let plain: Decomposition := plainEigen(&a);
+        let fv: NdArray[Float64] := part(&fast, 0);
+        let pv: NdArray[Float64] := part(&plain, 0);
+        let fw: NdArray[Float64] := part(&fast, 1);
+        let pw: NdArray[Float64] := part(&plain, 1);
+        assertTrue(same(&fv, &pv), "dsyevd finds the eigenvalues of Mirco.Linalg");
+        assertTrue(sameUpToSign(&fw, &pw), "and its eigenvectors up to their signs");
+        destroyNdArray(fv);
+        destroyNdArray(pv);
+        destroyNdArray(fw);
+        destroyNdArray(pw);
+        destroyDecomposition(fast);
+        destroyDecomposition(plain);
+        let m: NdArray[Float64] := filled(7, 3, 1.1);
+        let s1: Decomposition := svd(&m);
+        let s2: Decomposition := plainSvd(&m);
+        let fs: NdArray[Float64] := part(&s1, 1);
+        let ps: NdArray[Float64] := part(&s2, 1);
+        let fu: NdArray[Float64] := part(&s1, 0);
+        let pu: NdArray[Float64] := part(&s2, 0);
+        assertTrue(same(&fs, &ps), "dgesdd finds the singular values of Mirco.Linalg");
+        assertTrue(sameUpToSign(&fu, &pu), "and u up to the signs of its columns");
+        destroyNdArray(fs);
+        destroyNdArray(ps);
+        destroyNdArray(fu);
+        destroyNdArray(pu);
+        destroyDecomposition(s1);
+        destroyDecomposition(s2);
+        destroyNdArray(m);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function dropOption(x: Option[NdArray[Float64]]): Unit is
+        case x of
+            when Some(value as y: NdArray[Float64]) do
+                destroyNdArray(y);
+                return nil;
+            when None do
+                return nil;
+        end case;
+    end;
+
+    function matmulOf(rows: Index, inner: Index, b_rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, inner, 0.1);
+        let b: NdArray[Float64] := filled(b_rows, cols, 0.2);
+        let made: NdArray[Float64] := matmul(&a, &b);
+        destroyNdArray(made);
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- solve of a of rows by cols and a vector b of bRows.
+    function solveVectorOf(rows: Index, cols: Index, b_rows: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        let b: NdArray[Float64] := vectorFilled(b_rows, 0.4);
+        dropOption(solve(&a, &b));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- solve of a of rows by cols and a matrix b of bRows by bCols.
+    function solveMatrixOf(rows: Index, cols: Index, b_rows: Index, b_cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        let b: NdArray[Float64] := filled(b_rows, b_cols, 0.4);
+        dropOption(solve(&a, &b));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function determinantOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        let d: Float64 := determinant(&a);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function inverseOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        dropOption(inverse(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function choleskyOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        dropOption(cholesky(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function qrOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        destroyDecomposition(qr(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function lstsqOf(rows: Index, cols: Index, b_rows: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        let b: NdArray[Float64] := vectorFilled(b_rows, 0.4);
+        dropOption(lstsq(&a, &b));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function eigenOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        destroyDecomposition(eigenSymmetric(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function svdOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := filled(rows, cols, 0.3);
+        destroyDecomposition(svd(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- The square matrices of the fitting calls are spd, so that cholesky
+    -- and eigenSymmetric meet what they are for.
+    function fittingCalls(): Unit is
+        matmulOf(2, 3, 3, 4);
+        let a: NdArray[Float64] := spd(3);
+        let b: NdArray[Float64] := vectorFilled(3, 0.4);
+        let d: Float64 := determinant(&a);
+        dropOption(inverse(&a));
+        dropOption(cholesky(&a));
+        dropOption(solve(&a, &b));
+        destroyDecomposition(eigenSymmetric(&a));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        solveMatrixOf(3, 3, 3, 2);
+        qrOf(3, 2);
+        svdOf(3, 2);
+        lstsqOf(3, 2, 3);
+        lstsqOf(2, 3, 2);
+        return nil;
+    end;
+
+    -- Each call with a matrix that is not square, too wide where the
+    -- routine needs a tall one, or of other rows than b, in a child of its
+    -- own, must stop with the message of a violated requires before it
+    -- reaches the body or Lapack; the fitting calls are taken.
+    function testRefusesDimensionsThatDoNotFit(): Unit is
+        if asChild("matmulInnerApart") then
+            matmulOf(2, 3, 2, 3);
+            return nil;
+        end if;
+        if asChild("determinantNotSquare") then
+            determinantOf(2, 3);
+            return nil;
+        end if;
+        if asChild("inverseNotSquare") then
+            inverseOf(2, 3);
+            return nil;
+        end if;
+        if asChild("choleskyNotSquare") then
+            choleskyOf(3, 2);
+            return nil;
+        end if;
+        if asChild("eigenNotSquare") then
+            eigenOf(3, 2);
+            return nil;
+        end if;
+        if asChild("solveNotSquare") then
+            solveVectorOf(2, 3, 2);
+            return nil;
+        end if;
+        if asChild("solveVectorOfOtherRows") then
+            solveVectorOf(2, 2, 3);
+            return nil;
+        end if;
+        if asChild("solveMatrixOfOtherRows") then
+            solveMatrixOf(2, 2, 3, 2);
+            return nil;
+        end if;
+        if asChild("qrWide") then
+            qrOf(2, 3);
+            return nil;
+        end if;
+        if asChild("svdWide") then
+            svdOf(2, 3);
+            return nil;
+        end if;
+        if asChild("lstsqOtherRows") then
+            lstsqOf(3, 2, 2);
+            return nil;
+        end if;
+        if asChild("fits") then
+            fittingCalls();
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "matmulInnerApart", "contract violated: the requires"), "matmul of 2 by 3 and 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "matmulInnerApart", "Mirco.Lapack.matmul:"), "matmul of 2 by 3 and 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "determinantNotSquare", "contract violated: the requires"), "determinant of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "determinantNotSquare", "Mirco.Lapack.determinant:"), "determinant of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "inverseNotSquare", "contract violated: the requires"), "inverse of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "inverseNotSquare", "Mirco.Lapack.solve:"), "inverse of 2 by 3 does not reach the body of solve");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "choleskyNotSquare", "contract violated: the requires"), "cholesky of 3 by 2 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "choleskyNotSquare", "Mirco.Lapack.cholesky:"), "cholesky of 3 by 2 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "eigenNotSquare", "contract violated: the requires"), "eigenSymmetric of 3 by 2 is refused by the requires");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "solveNotSquare", "contract violated: the requires"), "solve with a of 2 by 3 is refused by the requires");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "solveVectorOfOtherRows", "contract violated: the requires"), "solve of 2 by 2 and a b of 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "solveVectorOfOtherRows", "Mirco.Lapack.solve:"), "solve of 2 by 2 and a b of 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "solveMatrixOfOtherRows", "contract violated: the requires"), "solve of 2 by 2 and a b of 3 by 2 is refused by the requires");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "qrWide", "contract violated: the requires"), "qr of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "qrWide", "Mirco.Lapack.qr:"), "qr of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "svdWide", "contract violated: the requires"), "svd of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "svdWide", "Mirco.Lapack.svd:"), "svd of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "lstsqOtherRows", "contract violated: the requires"), "lstsq of 3 by 2 and a b of 2 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "lstsqOtherRows", "Mirco.Lapack.lstsq:"), "lstsq of 3 by 2 and a b of 2 does not reach the body");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "fits", "Mirco.Lapack"), "fitting matrices are taken");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "fits", "contract violated"), "fitting matrices break no contract");
+        return nil;
+    end;
+
+    -- dot, matvec, gemv and gemm of blis against the compute layer, within
+    -- the tolerance of near: 1e-9 relative to 1 plus the value of the
+    -- compute layer, as for every function of this test.  The values are
+    -- worked out by hand as well where they are exact: the products of
+    -- small whole numbers.
+    function testDotMatvecGemvGemm(): Unit is
+        let x: NdArray[Float64] := vectorFilled(7, 0.3);
+        let y: NdArray[Float64] := vectorFilled(7, 1.1);
+        assertTrue(near(dot(&x, &y), plainDot(&x, &y)), "ddot by dgemm agrees with the compute layer");
+        let m: NdArray[Float64] := filled(5, 7, 0.4);
+        let fast: NdArray[Float64] := matvec(&m, &x);
+        let plain: NdArray[Float64] := plainMatvec(&m, &x);
+        assertTrue((count(&fast) = 5) and same(&fast, &plain), "matvec by dgemm agrees with the compute layer");
+        var fast_y: NdArray[Float64] := vectorFilled(5, 2.0);
+        var plain_y: NdArray[Float64] := vectorFilled(5, 2.0);
+        gemv(1.5, &m, &x, -0.5, &!fast_y);
+        plainGemv(1.5, &m, &x, -0.5, &!plain_y);
+        assertTrue(same(&fast_y, &plain_y), "gemv with alpha 1.5 and beta -0.5 agrees with the compute layer");
+        let a: NdArray[Float64] := filled(4, 6, 0.7);
+        let b: NdArray[Float64] := filled(6, 3, 1.3);
+        var fast_c: NdArray[Float64] := filled(4, 3, 0.2);
+        var plain_c: NdArray[Float64] := filled(4, 3, 0.2);
+        gemm(-2.0, &a, &b, 0.25, &!fast_c);
+        plainGemm(-2.0, &a, &b, 0.25, &!plain_c);
+        assertTrue(same(&fast_c, &plain_c), "gemm with alpha -2 and beta 0.25 agrees with the compute layer");
+        let whole: NdArray[Float64] := counted(2, 3);
+        let ones: NdArray[Float64] := vectorFilledWith(3, 1.0);
+        let sums: NdArray[Float64] := matvec(&whole, &ones);
+        assertTrue((flatGet(&sums, 0) = 6.0) and (flatGet(&sums, 1) = 15.0), "the row sums 1 + 2 + 3 and 4 + 5 + 6");
+        assertTrue(dot(&ones, &ones) = 3.0, "1 + 1 + 1");
+        var acc: NdArray[Float64] := vectorFilledWith(2, 1.0);
+        gemv(2.0, &whole, &ones, 3.0, &!acc);
+        assertTrue((flatGet(&acc, 0) = 15.0) and (flatGet(&acc, 1) = 33.0), "2 * 6 + 3 and 2 * 15 + 3");
+        let wt: NdArray[Float64] := counted(3, 2);
+        var sq: NdArray[Float64] := counted(2, 2);
+        gemm(1.0, &whole, &wt, -1.0, &!sq);
+        assertTrue((flatGet(&sq, 0) = 21.0) and (flatGet(&sq, 1) = 26.0) and (flatGet(&sq, 2) = 46.0) and (flatGet(&sq, 3) = 60.0), "1 2 3 over 4 5 6 times 1 2 over 3 4 over 5 6, less 1 2 over 3 4");
+        destroyNdArray(sq);
+        destroyNdArray(wt);
+        destroyNdArray(acc);
+        destroyNdArray(sums);
+        destroyNdArray(ones);
+        destroyNdArray(whole);
+        destroyNdArray(plain_c);
+        destroyNdArray(fast_c);
+        destroyNdArray(b);
+        destroyNdArray(a);
+        destroyNdArray(plain_y);
+        destroyNdArray(fast_y);
+        destroyNdArray(plain);
+        destroyNdArray(fast);
+        destroyNdArray(m);
+        destroyNdArray(y);
+        destroyNdArray(x);
+        return nil;
+    end;
+
+    -- A matrix of rows by cols holding 1, 2, ... in row-major order.
+    function counted(rows: Index, cols: Index): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var x: Float64 := 1.0;
+        var k: Index := 0;
+        while k < (rows * cols) do
+            insertBack(&!v, x);
+            x := x + 1.0;
+            k := k + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- A vector of n elements, each value.
+    function vectorFilledWith(n: Index, value: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!v, value);
+            k := k + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- dot, matvec, gemv and gemm of blis with arrays that do not fit, each
+    -- in a child of its own, must stop with the message of a violated
+    -- requires before they reach the body or blis.
+    function testProductsRefuseWhatDoesNotFit(): Unit is
+        if asChild("dotOfThreeAndTwo") then
+            let x: NdArray[Float64] := vectorFilledWith(3, 1.0);
+            let y: NdArray[Float64] := vectorFilledWith(2, 1.0);
+            let d: Float64 := dot(&x, &y);
+            destroyNdArray(y);
+            destroyNdArray(x);
+            return nil;
+        end if;
+        if asChild("matvecOfOtherLength") then
+            let m: NdArray[Float64] := counted(2, 3);
+            let x: NdArray[Float64] := vectorFilledWith(2, 1.0);
+            let r: NdArray[Float64] := matvec(&m, &x);
+            destroyNdArray(r);
+            destroyNdArray(x);
+            destroyNdArray(m);
+            return nil;
+        end if;
+        if asChild("gemvOfOtherY") then
+            let m: NdArray[Float64] := counted(2, 3);
+            let x: NdArray[Float64] := vectorFilledWith(3, 1.0);
+            var y: NdArray[Float64] := vectorFilledWith(3, 1.0);
+            gemv(1.0, &m, &x, 1.0, &!y);
+            destroyNdArray(y);
+            destroyNdArray(x);
+            destroyNdArray(m);
+            return nil;
+        end if;
+        if asChild("gemmOfOtherC") then
+            let a: NdArray[Float64] := counted(2, 3);
+            let b: NdArray[Float64] := counted(3, 2);
+            var c: NdArray[Float64] := counted(3, 3);
+            gemm(1.0, &a, &b, 1.0, &!c);
+            destroyNdArray(c);
+            destroyNdArray(b);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testProductsRefuseWhatDoesNotFit", "dotOfThreeAndTwo", " of Mirco.Lapack.dot ("), "dot of a vector of 3 and one of 2 is refused by the requires");
+        assertTrue(not refusedInChild("testProductsRefuseWhatDoesNotFit", "dotOfThreeAndTwo", "Mirco.Lapack.dot:"), "dot of 3 and 2 does not reach the body");
+        assertTrue(refusedInChild("testProductsRefuseWhatDoesNotFit", "matvecOfOtherLength", " of Mirco.Lapack.matvec ("), "matvec of 2 by 3 and a vector of 2 is refused by the requires");
+        assertTrue(refusedInChild("testProductsRefuseWhatDoesNotFit", "gemvOfOtherY", " of Mirco.Lapack.gemv ("), "gemv of 2 by 3 into a y of 3 is refused by the requires");
+        assertTrue(not refusedInChild("testProductsRefuseWhatDoesNotFit", "gemvOfOtherY", "Mirco.Lapack.gemv:"), "gemv into a y of 3 does not reach the body");
+        assertTrue(refusedInChild("testProductsRefuseWhatDoesNotFit", "gemmOfOtherC", " of Mirco.Lapack.gemm ("), "gemm of 2 by 3 and 3 by 2 into a c of 3 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testProductsRefuseWhatDoesNotFit", "gemmOfOtherC", "Mirco.Lapack.gemm:"), "gemm into a c of 3 by 3 does not reach the body");
+        return nil;
+    end;
+end module body.

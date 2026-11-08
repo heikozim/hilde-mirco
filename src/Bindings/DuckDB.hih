@@ -1,0 +1,430 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the functions of libduckdb that open a database safely, run statements, read their results and append rows.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.SchluckiStore is the safe module built on it, and the one a programme imports.
+- openSafe is the only way to a connection: every database is opened with the safe layer.
+- The lock of DuckDB leaves some functions open to change its configuration; refusedByLayer names them, and
+  no SQL that names one reaches DuckDB, nor a database whose views or macros do.
+- A handle is the pointer of DuckDB as Nat64, 0 when there is none.
+
+    let opened: Opened := openSafe("facts.duckdb", false);
+"""
+module Mirco.Bindings.DuckDB is
+    """
+    What openSafe gives: the database and its connection, both 0 unless failure is openDone.
+    """
+    record Opened: Free is
+        database: Nat64;
+        connection: Nat64;
+        failure: Int32;
+    end;
+
+    """
+    The failure of an open that worked.
+    """
+    function openDone(): Int32
+        ensures result = 0;
+
+    """
+    The library is older than the lowest version Mirco takes.
+    """
+    function libraryTooOld(): Int32
+        ensures result = 1;
+
+    """
+    The configuration could not be made or a setting was refused.
+    """
+    function configRefused(): Int32
+        ensures result = 2;
+
+    """
+    DuckDB could not open the file: it is not there for a reader, or it is no database of DuckDB.
+    """
+    function openFailed(): Int32
+        ensures result = 3;
+
+    """
+    Another programme holds the file, or this programme holds it in another mode.
+    """
+    function fileHeld(): Int32
+        ensures result = 4;
+
+    """
+    The settings of the safe layer read back from the open database are not those that were set.
+    """
+    function layerMissing(): Int32
+        ensures result = 5;
+
+    """
+    The database holds a view or a macro whose text refusedByLayer refuses, as a file made elsewhere may.
+    """
+    function definitionRefused(): Int32
+        ensures result = 6;
+
+    """
+    The lowest version of libduckdb Mirco takes, as major, minor and patch: 1.5.6, the first in which every
+    function of this module is in the stable interface of C.
+    """
+    function minimumMajor(): Int32
+        ensures result = 1;
+
+    """
+    The minor number of the lowest version.
+    """
+    function minimumMinor(): Int32
+        ensures result = 5;
+
+    """
+    The patch number of the lowest version.
+    """
+    function minimumPatch(): Int32
+        ensures result = 6;
+
+    """
+    Whether text holds no zero byte, which would end it for the C library.
+    No contract: no precondition; any span can be scanned.
+    """
+    generic [R: Region]
+    function zeroFree(text: Span[Nat8, R]): Bool;
+
+    """
+    Whether text names a function of DuckDB that changes its configuration although lock_configuration
+    holds, or that runs SQL made from a string: "PRAGMA", enable_logging, disable_logging,
+    truncate_duckdb_logs, enable_profiling, disable_profiling, enable_peg_parser, disable_peg_parser,
+    query_table and json_execute_serialized_sql wherever they stand, and query where a parenthesis follows
+    it. A name is a run of ASCII letters, digits and underscores, read in any case and without its leading
+    digits, so a name that is quoted, qualified, commented or inside a string is found too.
+    No contract: no precondition; any span can be scanned.
+    """
+    generic [R: Region]
+    function refusedByLayer(text: Span[Nat8, R]): Bool;
+
+    """
+    Whether the libduckdb the programme runs with is at least minimumMajor.minimumMinor.minimumPatch.
+    No contract: no precondition, since it takes no argument; the answer is a Bool.
+    """
+    function libraryFits(): Bool;
+
+    """
+    Opens the database at path, ":memory:" one in memory, for reading only when readOnly holds: with
+    enable_external_access, autoinstall_known_extensions, autoload_known_extensions and
+    allow_community_extensions false and then lock_configuration true, read back after the open. A database
+    in memory gets no directory for temporary files, so that SQL reaches no directory of the host; a file
+    keeps the one of DuckDB beside it, its name and .tmp. Within the programme a file is opened once by
+    DuckDB, and an open of it again shares that database. A database that holds a view or a macro whose
+    text refusedByLayer refuses is closed again with definitionRefused.
+    """
+    generic [R: Region]
+    function openSafe(path: Span[Nat8, R], read_only: Bool): Opened
+        requires (spanLength(path) > 0) and zeroFree(path);
+
+    """
+    Closes the connection and the database of an open.
+    No contract: it only closes what it is given, and a handle of 0 is left alone.
+    """
+    function closeSafe(database: Nat64, connection: Nat64): Unit;
+
+    """
+    The version of libduckdb, as the library reports it, copied into out; its length, which may be more
+    than out holds.
+    No contract: no precondition; the body copies no more than out holds.
+    """
+    generic [R: Region]
+    function libraryVersion(out: Span![Nat8, R]): Index;
+
+    """
+    Runs sql, which gives no rows that are wanted; 0 when it ran, else 1 and the error type of DuckDB, and 1
+    for a text that refusedByLayer refuses, which DuckDB never sees.
+    """
+    generic [R: Region]
+    function run(connection: Nat64, sql: Span[Nat8, R]): Int32
+        requires (connection /= 0) and zeroFree(sql);
+
+    """
+    Runs sql and keeps its result, which destroyResult gives back; 0 when there was no memory for it, when
+    DuckDB failed the statement without an error, or when refusedByLayer refuses sql, which DuckDB then
+    never sees.
+    """
+    generic [R: Region]
+    function query(connection: Nat64, sql: Span[Nat8, R]): Nat64
+        requires (connection /= 0) and zeroFree(sql);
+
+    """
+    0 when the statement of a result ran, else 1 and the error type of DuckDB.
+    No contract: no precondition, since a result of 0 gives 1.
+    """
+    function resultFailure(result: Nat64): Int32;
+
+    """
+    The count of columns of a result, 0 for a result of 0 or one that failed.
+    No contract: no precondition, since a result of 0 gives 0.
+    """
+    function resultColumns(result: Nat64): Index;
+
+    """
+    The type of DuckDB of column c of a result, DUCKDB_TYPE_INVALID, 0, for a column it does not have.
+    No contract: no precondition, since a column past the last gives 0.
+    """
+    function resultType(result: Nat64, c: Index): Int32;
+
+    """
+    Whether column c of a result is bigint, integer, smallint or tinyint, which an Int64 holds exactly.
+    No contract: no precondition, since a column past the last is none of them.
+    """
+    function isIntColumn(result: Nat64, c: Index): Bool;
+
+    """
+    Whether column c of a result is double or float, which a Float64 holds exactly.
+    No contract: no precondition, since a column past the last is none of them.
+    """
+    function isFloatColumn(result: Nat64, c: Index): Bool;
+
+    """
+    Whether column c of a result is varchar.
+    No contract: no precondition, since a column past the last is no varchar.
+    """
+    function isTextColumn(result: Nat64, c: Index): Bool;
+
+    """
+    Whether column c of a result is boolean.
+    No contract: no precondition, since a column past the last is no boolean.
+    """
+    function isBoolColumn(result: Nat64, c: Index): Bool;
+
+    """
+    The next chunk of rows of a result, which destroyChunk gives back; 0 after the last.
+    No contract: no precondition, since a result of 0 or one that failed gives 0.
+    """
+    function nextChunk(result: Nat64): Nat64;
+
+    """
+    The count of rows of a chunk, 0 for a chunk of 0.
+    No contract: no precondition, since a chunk of 0 gives 0.
+    """
+    function chunkRows(chunk: Nat64): Index;
+
+    """
+    Gives a chunk back.
+    No contract: it only frees what it is given, and a chunk of 0 is left alone.
+    """
+    function destroyChunk(chunk: Nat64): Unit;
+
+    """
+    Gives a result back.
+    No contract: it only frees what it is given, and a result of 0 is left alone.
+    """
+    function destroyResult(result: Nat64): Unit;
+
+    """
+    Whether the value of column c in row r of a chunk is there, not null.
+    No contract: a binding to C; the columns, rows and types of a chunk are no value a contract can read, so the body checks them and stops the programme on one outside.
+    """
+    function cellValid(result: Nat64, chunk: Nat64, c: Index, r: Index): Bool;
+
+    """
+    The Float64 of column c in row r of a chunk; a column not of isFloatColumn stops the programme.
+    No contract: a binding to C; the columns, rows and types of a chunk are no value a contract can read, so the body checks them and stops the programme on one outside.
+    """
+    function cellFloat(result: Nat64, chunk: Nat64, c: Index, r: Index): Float64;
+
+    """
+    The Int64 of column c in row r of a chunk; a column not of isIntColumn stops the programme.
+    No contract: a binding to C; the columns, rows and types of a chunk are no value a contract can read, so the body checks them and stops the programme on one outside.
+    """
+    function cellInt(result: Nat64, chunk: Nat64, c: Index, r: Index): Int64;
+
+    """
+    The Bool of column c in row r of a chunk; a column not of isBoolColumn stops the programme.
+    No contract: a binding to C; the columns, rows and types of a chunk are no value a contract can read, so the body checks them and stops the programme on one outside.
+    """
+    function cellBool(result: Nat64, chunk: Nat64, c: Index, r: Index): Bool;
+
+    """
+    The length in bytes of the text of column c in row r of a chunk; a column not of isTextColumn stops the
+    programme.
+    No contract: a binding to C; the columns, rows and types of a chunk are no value a contract can read, so the body checks them and stops the programme on one outside.
+    """
+    function cellTextLength(result: Nat64, chunk: Nat64, c: Index, r: Index): Index;
+
+    """
+    Copies the text of column c in row r of a chunk into out, no more than out holds; the count copied.
+    No contract: a binding to C; the columns, rows and types of a chunk are no value a contract can read, so the body checks them and stops the programme on one outside.
+    """
+    generic [R: Region]
+    function cellText(result: Nat64, chunk: Nat64, c: Index, r: Index, out: Span![Nat8, R]): Index;
+
+    """
+    Prepares sql, which destroyPrepared gives back; 0 when DuckDB refused it or refusedByLayer refuses it.
+    """
+    generic [R: Region]
+    function prepare(connection: Nat64, sql: Span[Nat8, R]): Nat64
+        requires (connection /= 0) and zeroFree(sql);
+
+    """
+    The count of question marks of a prepared statement, 0 for one of 0.
+    No contract: no precondition, since a statement of 0 gives 0.
+    """
+    function parameterCount(statement: Nat64): Index;
+
+    """
+    Binds the Float64 to question mark i, counted from 1; 0 when it was bound.
+    No contract: a binding to C; the count of question marks of a statement is no value a contract can read, so the body gives 1 for an i that is not one of them.
+    """
+    function bindFloat(statement: Nat64, i: Index, value: Float64): Int32;
+
+    """
+    Binds the Int64 to question mark i; 0 when it was bound.
+    No contract: a binding to C; the count of question marks of a statement is no value a contract can read, so the body gives 1 for an i that is not one of them.
+    """
+    function bindInt(statement: Nat64, i: Index, value: Int64): Int32;
+
+    """
+    Binds the Bool to question mark i as a boolean; 0 when it was bound.
+    No contract: a binding to C; the count of question marks of a statement is no value a contract can read, so the body gives 1 for an i that is not one of them.
+    """
+    function bindBool(statement: Nat64, i: Index, value: Bool): Int32;
+
+    """
+    Binds the text to question mark i as a varchar of its length; 0 when it was bound, and not 0 when it
+    is no UTF-8.
+    No contract: a binding to C; the count of question marks of a statement is no value a contract can read, so the body gives 1 for an i that is not one of them.
+    """
+    generic [R: Region]
+    function bindText(statement: Nat64, i: Index, value: Span[Nat8, R]): Int32;
+
+    """
+    Binds null to question mark i; 0 when it was bound.
+    No contract: a binding to C; the count of question marks of a statement is no value a contract can read, so the body gives 1 for an i that is not one of them.
+    """
+    function bindNull(statement: Nat64, i: Index): Int32;
+
+    """
+    Runs a prepared statement with the values bound; the count of rows it changed, or -1 minus the error
+    type of DuckDB when it failed.
+    """
+    function executePrepared(statement: Nat64): Int64
+        requires statement /= 0;
+
+    """
+    The count of rows changed of an outcome of executePrepared, 0 for a failure.
+    No contract: no precondition; a negative outcome gives 0.
+    """
+    function changedRows(outcome: Int64): Nat64;
+
+    """
+    The error type of DuckDB of an outcome of executePrepared, -1 for one that is no failure.
+    No contract: no precondition; an outcome of 0 or more, or one below the range of Int32, gives -1.
+    """
+    function outcomeError(outcome: Int64): Int32;
+
+    """
+    Gives a prepared statement back.
+    No contract: it only frees what it is given, and a statement of 0 is left alone.
+    """
+    function destroyPrepared(statement: Nat64): Unit;
+
+    """
+    What openAppender gives: the Appender of DuckDB and the count of its columns, 0 and 0 unless failure
+    is appendDone.
+    """
+    record Appending: Free is
+        appender: Nat64;
+        columns: Index;
+        failure: Int32;
+    end;
+
+    """
+    The failure of an openAppender that worked.
+    """
+    function appendDone(): Int32
+        ensures result = 0;
+
+    """
+    The statement is not of the one form openAppender takes.
+    """
+    function insertRefused(): Int32
+        ensures result = 1;
+
+    """
+    DuckDB refused the table or a column of the statement.
+    """
+    function appenderRefused(): Int32
+        ensures result = 2;
+
+    """
+    The count of columns of sql when it has the form "INSERT INTO table (column, ...) VALUES (?, ...)", with
+    as many question marks as columns, every name a plain one of ASCII letters, digits and underscores
+    that begins with no digit, the words in any case, spaces between the parts and a semicolon at the end
+    allowed; 0 for any other text.
+    No contract: no precondition; any span can be scanned.
+    """
+    generic [R: Region]
+    function insertColumns(sql: Span[Nat8, R]): Index;
+
+    """
+    The Appender of the table of sql, an insert of the form insertColumns takes, with the columns of sql as
+    its columns in their order; no SQL is run, the names go to DuckDB as names. dropAppender gives it back.
+    """
+    generic [R: Region]
+    function openAppender(connection: Nat64, sql: Span[Nat8, R]): Appending
+        requires (connection /= 0) and zeroFree(sql);
+
+    """
+    Appends the Float64 as the next value of the row; 0 when it was taken.
+    No contract: a binding to C; whether a value fits the column is known to DuckDB only, so the body gives 1 for one it refuses and for an appender of 0.
+    """
+    function appendFloat(appender: Nat64, value: Float64): Int32;
+
+    """
+    Appends the Int64 as the next value of the row; 0 when it was taken.
+    No contract: a binding to C; whether a value fits the column is known to DuckDB only, so the body gives 1 for one it refuses and for an appender of 0.
+    """
+    function appendInt(appender: Nat64, value: Int64): Int32;
+
+    """
+    Appends the Bool as the next value of the row; 0 when it was taken.
+    No contract: a binding to C; whether a value fits the column is known to DuckDB only, so the body gives 1 for one it refuses and for an appender of 0.
+    """
+    function appendBool(appender: Nat64, value: Bool): Int32;
+
+    """
+    Appends the text as a varchar of its length as the next value of the row; 0 when it was taken. A text
+    that is no UTF-8 is refused by flushAppender.
+    No contract: a binding to C; whether a value fits the column is known to DuckDB only, so the body gives 1 for one it refuses and for an appender of 0.
+    """
+    generic [R: Region]
+    function appendText(appender: Nat64, value: Span[Nat8, R]): Int32;
+
+    """
+    Appends null as the next value of the row; 0 when it was taken.
+    No contract: a binding to C; whether a column takes null is known to DuckDB only, so the body gives 1 for an appender of 0.
+    """
+    function appendNull(appender: Nat64): Int32;
+
+    """
+    Ends the row, which must have a value for every column; 0 when it did.
+    No contract: a binding to C; the count of values appended is kept by DuckDB, so the body gives 1 for a row it refuses and for an appender of 0.
+    """
+    function endRow(appender: Nat64): Int32;
+
+    """
+    Writes the rows appended so far into the table, within the transaction of the connection when one is
+    open; 0 when they were written, else 1 plus the error type of DuckDB, so 19 for a duplicate key.
+    No contract: a binding to C; a key or a check is known to DuckDB only, so the body gives a code.
+    """
+    function flushAppender(appender: Nat64): Int32;
+
+    """
+    Gives an Appender back; the rows not flushed are discarded, never written.
+    No contract: it only frees what it is given, and an appender of 0 is left alone.
+    """
+    function dropAppender(appender: Nat64): Unit;
+end module.

@@ -1,0 +1,400 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Hilde has no shift operators and no 128 bit numbers.  A number of 128
+-- bits is two halves of 64; a shift left is a multiplication modulo 2^64,
+-- a shift right a division, and a product of two halves is made from four
+-- products of 32 bit quarters.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, nth, storeNth, length as bufferLength);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, zeros, countMut, flatSet);
+import Standard.Bits (int64Bits, int64FromBits);
+import Mirco.Math (squareRoot, logarithm, logarithmOnePlus, exponential, cosine, pi);
+import Mirco.Bindings.Ziggurat (ki, wi, fi);
+
+module body Mirco.Random is
+    constant two_to11: Nat64 := 2048;
+    constant two_to32: Nat64 := 4294967296;
+    constant two_to48: Nat64 := 281474976710656;
+    constant two_to58: Nat64 := 288230376151711744;
+    constant low_quarter: Nat64 := 4294967295;
+
+    -- The multiplier of the 128 bit generator, in halves, and the cheap
+    -- multiplier of 64 bits of the variant pcg64Dxsm.
+    constant multiplier_high: Nat64 := 2549297995355413924;
+    constant multiplier_low: Nat64 := 4865540595714422341;
+    constant cheap_multiplier: Nat64 := 15750249268501108917;
+
+    -- 2 to the -53, the step between two floats drawn.
+    constant float_step: Float64 := 0.00000000000000011102230246251565;
+
+    record Pcg64: Free is
+        high: Nat64;
+        low: Nat64;
+        incrementHigh: Nat64;
+        incrementLow: Nat64;
+        cheap: Bool;
+    end;
+
+    record Wide: Free is
+        high: Nat64;
+        low: Nat64;
+    end;
+
+    -- The full product of two halves, 128 bits.
+    function multiplyFull(a: Nat64, b: Nat64): Wide is
+        let a0: Nat64 := bitwiseAnd(a, low_quarter);
+        let a1: Nat64 := a / two_to32;
+        let b0: Nat64 := bitwiseAnd(b, low_quarter);
+        let b1: Nat64 := b / two_to32;
+        let p00: Nat64 := a0 * b0;
+        let p01: Nat64 := a0 * b1;
+        let p10: Nat64 := a1 * b0;
+        let p11: Nat64 := a1 * b1;
+        let middle: Nat64 := (p00 / two_to32) + bitwiseAnd(p01, low_quarter) + bitwiseAnd(p10, low_quarter);
+        let low: Nat64 := modularAdd(bitwiseAnd(p00, low_quarter), modularMultiply(middle, two_to32));
+        let high: Nat64 := p11 + (p01 / two_to32) + (p10 / two_to32) + (middle / two_to32);
+        return Wide(high => high, low => low);
+    end;
+
+    -- a times b modulo 2^128.
+    function multiplyWide(a: Wide, b: Wide): Wide is
+        let full: Wide := multiplyFull(a.low, b.low);
+        let cross: Nat64 := modularAdd(modularMultiply(a.high, b.low), modularMultiply(a.low, b.high));
+        return Wide(high => modularAdd(full.high, cross), low => full.low);
+    end;
+
+    -- a plus b modulo 2^128.
+    function addWide(a: Wide, b: Wide): Wide is
+        let low: Nat64 := modularAdd(a.low, b.low);
+        var high: Nat64 := modularAdd(a.high, b.high);
+        if low < a.low then
+            high := modularAdd(high, 1);
+        end if;
+        return Wide(high => high, low => low);
+    end;
+
+    -- 2 to the power of k, for k below 64.
+    function twoTo(k: Nat64): Nat64 is
+        var value: Nat64 := 1;
+        var i: Nat64 := 0;
+        while i < k do
+            value := value * 2;
+            i := i + 1;
+        end while;
+        return value;
+    end;
+
+    -- x rotated right by r bits, r below 64.
+    function rotateRight(x: Nat64, r: Nat64): Nat64 is
+        if r = 0 then
+            return x;
+        end if;
+        return bitwiseOr(x / twoTo(r), modularMultiply(x, twoTo(64 - r)));
+    end;
+
+    -- One step of the congruential generator, by the multiplier of its kind.
+    function stepped(g: Pcg64): Pcg64 is
+        var multiplier: Wide := Wide(high => multiplier_high, low => multiplier_low);
+        if g.cheap then
+            multiplier := Wide(high => 0, low => cheap_multiplier);
+        end if;
+        let next: Wide := addWide(multiplyWide(Wide(high => g.high, low => g.low), multiplier),
+            Wide(high => g.incrementHigh, low => g.incrementLow));
+        return Pcg64(high => next.high, low => next.low, incrementHigh => g.incrementHigh,
+            incrementLow => g.incrementLow, cheap => g.cheap);
+    end;
+
+    -- The seeding of the reference: the increment is the stream times two
+    -- plus one, the state starts at zero, steps, takes the seed and steps.
+    function seeded(seed_high: Nat64, seed_low: Nat64, stream_high: Nat64, stream_low: Nat64, cheap: Bool): Pcg64 is
+        let inc_high: Nat64 := bitwiseOr(modularMultiply(stream_high, 2), stream_low / (two_to32 * 2147483648));
+        let inc_low: Nat64 := bitwiseOr(modularMultiply(stream_low, 2), 1);
+        let zero: Pcg64 := Pcg64(high => 0, low => 0, incrementHigh => inc_high, incrementLow => inc_low, cheap => cheap);
+        let first: Pcg64 := stepped(zero);
+        let added: Wide := addWide(Wide(high => first.high, low => first.low), Wide(high => seed_high, low => seed_low));
+        return stepped(Pcg64(high => added.high, low => added.low, incrementHigh => inc_high,
+            incrementLow => inc_low, cheap => cheap));
+    end;
+
+    function defaultGenerator(seed: Nat64, stream: Nat64): Pcg64 is
+        return seeded(0, seed, 0, stream, true);
+    end;
+
+    function pcg64(seed: Nat64, stream: Nat64): Pcg64 is
+        return seeded(0, seed, 0, stream, false);
+    end;
+
+    function pcg64Wide(seed_high: Nat64, seed_low: Nat64, stream_high: Nat64, stream_low: Nat64): Pcg64 is
+        return seeded(seed_high, seed_low, stream_high, stream_low, false);
+    end;
+
+    function pcg64Dxsm(seed: Nat64, stream: Nat64): Pcg64 is
+        return seeded(0, seed, 0, stream, true);
+    end;
+
+    -- NumPy's SeedSequence on words of 32 bits: the seed as one or two
+    -- words, mixed by hashes into a pool of four, and the state drawn from
+    -- the pool by a second hash.  Every product stays below 2 to the 64.
+    constant hash_init_a: Nat64 := 1135663077;
+    constant hash_mult_a: Nat64 := 2468251765;
+    constant hash_init_b: Nat64 := 2337405405;
+    constant hash_mult_b: Nat64 := 1492356589;
+    constant mix_left: Nat64 := 3389127133;
+    constant mix_right: Nat64 := 1232336661;
+
+    record Hashed: Free is
+        value: Nat64;
+        factor: Nat64;
+    end;
+
+    function hashMix(v: Nat64, c: Nat64): Hashed is
+        let x: Nat64 := bitwiseXor(v, c);
+        let next: Nat64 := rem(c * hash_mult_a, two_to32);
+        let y: Nat64 := rem(x * next, two_to32);
+        return Hashed(value => bitwiseXor(y, y / 65536), factor => next);
+    end;
+
+    function mixWords(x: Nat64, y: Nat64): Nat64 is
+        let r: Nat64 := rem((rem(mix_left * x, two_to32) + two_to32) - rem(mix_right * y, two_to32), two_to32);
+        return bitwiseXor(r, r / 65536);
+    end;
+
+    function drawn(v: Nat64, c: Nat64): Hashed is
+        let x: Nat64 := bitwiseXor(v, c);
+        let next: Nat64 := rem(c * hash_mult_b, two_to32);
+        let y: Nat64 := rem(x * next, two_to32);
+        return Hashed(value => bitwiseXor(y, y / 65536), factor => next);
+    end;
+
+    function defaultRng(seed: Nat64): Pcg64 is
+        var entropy: Buffer[Nat64] := allocateEmpty();
+        insertBack(&!entropy, rem(seed, two_to32));
+        if seed >= two_to32 then
+            insertBack(&!entropy, seed / two_to32);
+        end if;
+        var pool: Buffer[Nat64] := allocateEmpty();
+        var c: Nat64 := hash_init_a;
+        var i: Index := 0;
+        while i < 4 do
+            var word: Nat64 := 0;
+            if i < bufferLength(&entropy) then
+                word := nth(&entropy, i);
+            end if;
+            let h: Hashed := hashMix(word, c);
+            c := h.factor;
+            insertBack(&!pool, h.value);
+            i := i + 1;
+        end while;
+        destroyFree(entropy);
+        var source: Index := 0;
+        while source < 4 do
+            var target: Index := 0;
+            while target < 4 do
+                if source /= target then
+                    let h: Hashed := hashMix(nth(&pool, source), c);
+                    c := h.factor;
+                    let mixed: Nat64 := mixWords(nth(&pool, target), h.value);
+                    storeNth(&!pool, target, mixed);
+                end if;
+                target := target + 1;
+            end while;
+            source := source + 1;
+        end while;
+        var words: Buffer[Nat64] := allocateEmpty();
+        var d: Nat64 := hash_init_b;
+        var k: Index := 0;
+        while k < 8 do
+            let h: Hashed := drawn(nth(&pool, rem(k, 4)), d);
+            d := h.factor;
+            insertBack(&!words, h.value);
+            k := k + 1;
+        end while;
+        destroyFree(pool);
+        let seed_high: Nat64 := nth(&words, 0) + (nth(&words, 1) * two_to32);
+        let seed_low: Nat64 := nth(&words, 2) + (nth(&words, 3) * two_to32);
+        let stream_high: Nat64 := nth(&words, 4) + (nth(&words, 5) * two_to32);
+        let stream_low: Nat64 := nth(&words, 6) + (nth(&words, 7) * two_to32);
+        destroyFree(words);
+        return seeded(seed_high, seed_low, stream_high, stream_low, false);
+    end;
+
+    generic [R: Region]
+    function current(g: &![Pcg64, R]): Pcg64 is
+        return Pcg64(high => g->high, low => g->low, incrementHigh => g->incrementHigh,
+            incrementLow => g->incrementLow, cheap => g->cheap);
+    end;
+
+    generic [R: Region]
+    function store(g: &![Pcg64, R], next: Pcg64): Unit is
+        g->high := next.high;
+        g->low := next.low;
+        return nil;
+    end;
+
+    -- pcg64 steps first and mixes the new state; pcg64Dxsm mixes the old state
+    -- and then steps.
+    generic [R: Region]
+    function nextNat64(generator: &![Pcg64, R]): Nat64 is
+        let before: Pcg64 := current(&~generator);
+        let after: Pcg64 := stepped(before);
+        store(generator, after);
+        if before.cheap then
+            var hi: Nat64 := before.high;
+            let lo: Nat64 := bitwiseOr(before.low, 1);
+            hi := bitwiseXor(hi, hi / two_to32);
+            hi := modularMultiply(hi, cheap_multiplier);
+            hi := bitwiseXor(hi, hi / two_to48);
+            return modularMultiply(hi, lo);
+        end if;
+        return rotateRight(bitwiseXor(after.high, after.low), after.high / two_to58);
+    end;
+
+    -- The threshold of the rejection is 2^64 modulo bound: the numbers
+    -- below it would make the small results more likely.
+    generic [R: Region]
+    function nextBelow(generator: &![Pcg64, R], bound: Nat64): Nat64 is
+        let threshold: Nat64 := rem(modularSubtract(0, bound), bound);
+        while true do
+            let x: Nat64 := nextNat64(&~generator);
+            if x >= threshold then
+                return rem(x, bound);
+            end if;
+        end while;
+    end;
+
+    generic [R: Region]
+    function nextFloat64(generator: &![Pcg64, R]): Float64 is
+        let top: Nat64 := nextNat64(generator) / two_to11;
+        case toFloat64(top) of
+            when Some(value as wide: Float64) do
+                return wide * float_step;
+            when None do
+                abort("Mirco.Random: 53 bits that are no Float64");
+        end case;
+    end;
+
+    -- The first number lies above 0 up to 1, so that its logarithm is finite.
+    generic [R: Region]
+    function nextNormal(generator: &![Pcg64, R]): Float64 is
+        let u: Float64 := 1.0 - nextFloat64(&~generator);
+        let v: Float64 := nextFloat64(generator);
+        return squareRoot(-2.0 * logarithm(u)) * cosine((2.0 * pi()) * v);
+    end;
+
+    -- NumPy's standard_normal: the low byte of a draw picks the layer, the
+    -- next bit the sign and the 52 above it the place in the layer; outside
+    -- the rectangle of the layer the density decides, and in the base layer
+    -- the tail beyond r is drawn by Marsaglia's method.
+    constant ziggurat_r: Float64 := 3.6541528853610087963519472518;
+    constant ziggurat_inverse_r: Float64 := 0.27366123732975827203338247596;
+    constant two_to52: Nat64 := 4503599627370496;
+
+    generic [R: Region]
+    function nextStandardNormal(generator: &![Pcg64, R]): Float64 is
+        while true do
+            let draw: Nat64 := nextNat64(&~generator);
+            let layer: Index := toLayer(rem(draw, 256));
+            let rest: Nat64 := draw / 256;
+            let negative: Bool := rem(rest, 2) = 1;
+            let place: Nat64 := rem(rest / 2, two_to52);
+            var x: Float64 := wideFloat(place) * wi(layer);
+            if negative then
+                x := -x;
+            end if;
+            if place < ki(layer) then
+                return x;
+            end if;
+            if layer = 0 then
+                while true do
+                    let xx: Float64 := -(ziggurat_inverse_r * logarithmOnePlus(-nextFloat64(&~generator)));
+                    let yy: Float64 := -logarithmOnePlus(-nextFloat64(&~generator));
+                    if (yy + yy) > (xx * xx) then
+                        if rem(place / 256, 2) = 1 then
+                            return -(ziggurat_r + xx);
+                        end if;
+                        return ziggurat_r + xx;
+                    end if;
+                end while;
+            end if;
+            let edge: Float64 := ((fi(layer - 1) - fi(layer)) * nextFloat64(&~generator)) + fi(layer);
+            if edge < exponential(-0.5 * (x * x)) then
+                return x;
+            end if;
+        end while;
+    end;
+
+    function toLayer(v: Nat64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function wideFloat(v: Nat64): Float64 is
+        case toFloat64(v) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                return 0.0;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function standardNormal(generator: &![Pcg64, R], shape: Span[Index, S]): NdArray[Float64] is
+        var out: NdArray[Float64] := zeros(shape);
+        let n: Index := countMut(&!out);
+        var i: Index := 0;
+        while i < n do
+            flatSet(&!out, i, nextStandardNormal(&~generator));
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region, S: Region]
+    function uniform(generator: &![Pcg64, R], shape: Span[Index, S]): NdArray[Float64] is
+        var made: NdArray[Float64] := zeros(shape);
+        let total: Index := countMut(&!made);
+        var at: Index := 0;
+        while at < total do
+            flatSet(&!made, at, nextFloat64(&~generator));
+            at := at + 1;
+        end while;
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function normal(generator: &![Pcg64, R], shape: Span[Index, S], mean: Float64, deviation: Float64): NdArray[Float64] is
+        var made: NdArray[Float64] := zeros(shape);
+        let total: Index := countMut(&!made);
+        var at: Index := 0;
+        while at < total do
+            flatSet(&!made, at, mean + (deviation * nextNormal(&~generator)));
+            at := at + 1;
+        end while;
+        return made;
+    end;
+
+    -- The width high - low is taken modulo 2^64 on the bits, so that it is
+    -- right also where the difference does not fit an Int64.
+    generic [R: Region, S: Region]
+    function integers(generator: &![Pcg64, R], shape: Span[Index, S], low: Int64, high: Int64): NdArray[Int64] is
+        let width: Nat64 := modularSubtract(int64Bits(high), int64Bits(low));
+        let base: Nat64 := int64Bits(low);
+        var made: NdArray[Int64] := zeros(shape);
+        let total: Index := countMut(&!made);
+        var at: Index := 0;
+        while at < total do
+            flatSet(&!made, at, int64FromBits(modularAdd(base, nextBelow(&~generator, width))));
+            at := at + 1;
+        end while;
+        return made;
+    end;
+end module body.

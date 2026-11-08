@@ -1,0 +1,234 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Mirco.Optimize (bisect, brentRoot, minimizeGolden);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Math (absolute, squareRoot, cosine, exponential);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Optimize.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64, tolerance: Float64): Bool is
+        return absolute(a - b) < tolerance;
+    end;
+
+    function squareMinusTwo(x: Float64): Float64 is
+        return (x * x) - 2.0;
+    end;
+
+    function squarePlusOne(x: Float64): Float64 is
+        return (x * x) + 1.0;
+    end;
+
+    function cosineMinusX(x: Float64): Float64 is
+        return cosine(x) - x;
+    end;
+
+    function bowl(x: Float64): Float64 is
+        return (x - 1.5) * (x - 1.5);
+    end;
+
+    function rootOr(found: Option[Float64], otherwise: Float64): Float64 is
+        case found of
+            when Some(value as x: Float64) do
+                return x;
+            when None do
+                return otherwise;
+        end case;
+    end;
+
+    function testBisect(): Unit is
+        let r: Float64 := rootOr(bisect(squareMinusTwo, 0.0, 2.0, 0.000000000001), -1.0);
+        assertTrue(near(r, squareRoot(2.0), 0.000000000002), "the root of 2");
+        let none: Float64 := rootOr(bisect(squarePlusOne, -1.0, 1.0, 0.000001), -7.0);
+        assertTrue(none = -7.0, "no change of sign, no root");
+        return nil;
+    end;
+
+    -- The root of cos x = x is the Dottie number, 0.7390851332151607.
+    function testBrent(): Unit is
+        let r: Float64 := rootOr(brentRoot(squareMinusTwo, 0.0, 2.0, 0.000000000001), -1.0);
+        assertTrue(near(r, squareRoot(2.0), 0.000000000002), "the root of 2");
+        let d: Float64 := rootOr(brentRoot(cosineMinusX, 0.0, 1.0, 0.000000000001), -1.0);
+        assertTrue(near(d, 0.7390851332151607, 0.000000000002), "cos x = x");
+        let none: Float64 := rootOr(brentRoot(squarePlusOne, -1.0, 1.0, 0.000001), -7.0);
+        assertTrue(none = -7.0, "no change of sign, no root");
+        return nil;
+    end;
+
+    function testGolden(): Unit is
+        let m: Float64 := minimizeGolden(bowl, 0.0, 4.0, 0.0000001);
+        assertTrue(near(m, 1.5, 0.000001), "the bottom of the bowl");
+        let edge: Float64 := minimizeGolden(bowl, 2.0, 3.0, 0.0000001);
+        assertTrue(near(edge, 2.0, 0.000001), "a minimum at the edge");
+        return nil;
+    end;
+
+    -- The search named which over a to b with tolerance: 0 bisect, 1
+    -- brentRoot, 2 minimizeGolden; the result is not asked for.
+    function searchOf(which: Index, a: Float64, b: Float64, tolerance: Float64): Unit is
+        if which = 0 then
+            let r: Float64 := rootOr(bisect(squareMinusTwo, a, b, tolerance), 0.0);
+            return nil;
+        end if;
+        if which = 1 then
+            let r: Float64 := rootOr(brentRoot(squareMinusTwo, a, b, tolerance), 0.0);
+            return nil;
+        end if;
+        let m: Float64 := minimizeGolden(bowl, a, b, tolerance);
+        return nil;
+    end;
+
+    -- Each call in a child of its own: for each of the three searches,
+    -- bounds the wrong way round, an infinite bound, a NaN bound and a
+    -- tolerance of 0 are refused by its requires; from 0 to 2 with a
+    -- tolerance above 0 each is taken.
+    function testRefusals(): Unit is
+        let infinity: Float64 := exponential(1000.0);
+        let nan: Float64 := infinity - infinity;
+        if asChild("bisectReversed") then
+            searchOf(0, 2.0, 0.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("bisectInfinite") then
+            searchOf(0, 0.0 - infinity, infinity, 0.000001);
+            return nil;
+        end if;
+        if asChild("bisectNaN") then
+            searchOf(0, nan, 2.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("bisectZeroTolerance") then
+            searchOf(0, 0.0, 2.0, 0.0);
+            return nil;
+        end if;
+        if asChild("brentRootReversed") then
+            searchOf(1, 2.0, 0.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("brentRootInfinite") then
+            searchOf(1, 0.0 - infinity, infinity, 0.000001);
+            return nil;
+        end if;
+        if asChild("brentRootNaN") then
+            searchOf(1, nan, 2.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("brentRootZeroTolerance") then
+            searchOf(1, 0.0, 2.0, 0.0);
+            return nil;
+        end if;
+        if asChild("minimizeGoldenReversed") then
+            searchOf(2, 2.0, 0.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("minimizeGoldenInfinite") then
+            searchOf(2, 0.0 - infinity, infinity, 0.000001);
+            return nil;
+        end if;
+        if asChild("minimizeGoldenNaN") then
+            searchOf(2, nan, 2.0, 0.000001);
+            return nil;
+        end if;
+        if asChild("minimizeGoldenZeroTolerance") then
+            searchOf(2, 0.0, 2.0, 0.0);
+            return nil;
+        end if;
+        if asChild("fits") then
+            searchOf(0, 0.0, 2.0, 0.000001);
+            searchOf(1, 0.0, 2.0, 0.000001);
+            searchOf(2, 0.0, 2.0, 0.000001);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "bisectReversed", "contract violated: the requires"), "bisect from 2 to 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "bisectInfinite", "contract violated: the requires"), "bisect over infinite bounds is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "bisectNaN", "contract violated: the requires"), "bisect from a NaN is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "bisectZeroTolerance", "contract violated: the requires"), "bisect to a tolerance of 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "brentRootReversed", "contract violated: the requires"), "brentRoot from 2 to 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "brentRootInfinite", "contract violated: the requires"), "brentRoot over infinite bounds is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "brentRootNaN", "contract violated: the requires"), "brentRoot from a NaN is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "brentRootZeroTolerance", "contract violated: the requires"), "brentRoot to a tolerance of 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "minimizeGoldenReversed", "contract violated: the requires"), "minimizeGolden from 2 to 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "minimizeGoldenInfinite", "contract violated: the requires"), "minimizeGolden over infinite bounds is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "minimizeGoldenNaN", "contract violated: the requires"), "minimizeGolden from a NaN is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "minimizeGoldenZeroTolerance", "contract violated: the requires"), "minimizeGolden to a tolerance of 0 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "the three searches from 0 to 2 break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "the three searches from 0 to 2 are taken");
+        return nil;
+    end;
+end module body.

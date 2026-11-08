@@ -1,0 +1,137 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the functions of the netCDF-C library that write and read whole variables of numbers.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.NetCdf is the safe module built on it, and the one a programme imports.
+- Each function returns the status of netCDF, 0 for success; an identifier it makes goes into out.
+
+    let status: Int32 := create("out.nc", out);
+"""
+module Mirco.Bindings.NetCdf is
+    """
+    Whether text holds no zero byte, which would end the name for the C library; true for an empty text.
+    Any span can be scanned, so it has no requires. It is the condition of the requires of Mirco.NetCdf.writeFloat64,
+    writeInt64, readFloat64 and readInt64.
+    """
+    generic [R: Region]
+    function zeroFree(text: Span[Nat8, R]): Bool
+        ensures (spanLength(text) > 0) or result;
+
+    """
+    Creates the file at path anew in the format of netCDF 4, nc_create; its identifier into out[0].
+    """
+    generic [R: Region, S: Region]
+    function create(path: Span[Nat8, R], out: Span![Int32, S]): Int32
+        requires zeroFree(path);
+
+    """
+    Opens the file at path, for writing when writable holds, nc_open; its identifier into out[0].
+    """
+    generic [R: Region, S: Region]
+    function open(path: Span[Nat8, R], writable: Bool, out: Span![Int32, S]): Int32
+        requires zeroFree(path);
+
+    """
+    Closes a file, nc_close.
+    No contract: no precondition, since netCDF refuses an identifier that is no open file, and the status says so; Mirco.NetCdf.writeFloat64, writeInt64, readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), close only a file they opened.
+    """
+    function close(file: Int32): Int32;
+
+    """
+    Puts an open file into define mode, nc_redef.
+    No contract: no precondition, since netCDF refuses an identifier that is no open file, and the status says so; Mirco.NetCdf.writeFloat64 and writeInt64, with their contract requires zeroFree(path) and zeroFree(name), call it only on a file they opened.
+    """
+    function redefine(file: Int32): Int32;
+
+    """
+    Ends the define mode of a file, nc_enddef.
+    No contract: no precondition, since netCDF refuses an identifier that is no open file, and the status says so; Mirco.NetCdf.writeFloat64 and writeInt64, with their contract requires zeroFree(path) and zeroFree(name), call it only on a file they opened.
+    """
+    function endDefine(file: Int32): Int32;
+
+    """
+    Defines the dimension name of the given length, nc_def_dim; its identifier into out[0].
+    """
+    generic [R: Region, S: Region]
+    function defineDimension(file: Int32, name: Span[Nat8, R], size: Index, out: Span![Int32, S]): Int32
+        requires zeroFree(name);
+
+    """
+    Defines the variable name over the dimensions, of NC_DOUBLE when floating holds and of NC_INT64
+    otherwise, nc_def_var; its identifier into out[0].
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function defineVariable(file: Int32, name: Span[Nat8, R], floating: Bool, dimensions: Span[Int32, S], out: Span![Int32, Q]): Int32
+        requires zeroFree(name);
+
+    """
+    The identifier of the variable name into out[0], nc_inq_varid.
+    """
+    generic [R: Region, S: Region]
+    function variableOf(file: Int32, name: Span[Nat8, R], out: Span![Int32, S]): Int32
+        requires zeroFree(name);
+
+    """
+    The type of a variable into out[0]: 6 for NC_DOUBLE, 10 for NC_INT64, another number otherwise.
+    No contract: no precondition, since the body gives NC_EINVAL for an out that holds no element, and netCDF refuses an identifier that is no variable; Mirco.NetCdf.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), pass an out of one element.
+    """
+    generic [R: Region]
+    function typeOf(file: Int32, variable: Int32, out: Span![Int32, R]): Int32;
+
+    """
+    The number of dimensions of a variable into out[0], nc_inq_varndims.
+    No contract: no precondition, since the body gives NC_EINVAL for an out that holds no element, and netCDF refuses an identifier that is no variable; Mirco.NetCdf.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), pass an out of one element.
+    """
+    generic [R: Region]
+    function rankOf(file: Int32, variable: Int32, out: Span![Int32, R]): Int32;
+
+    """
+    The identifiers of the dimensions of a variable into out, which holds at least as many as its rank,
+    nc_inq_vardimid.
+    No contract: no precondition, since the body gives NC_EINVAL for an out that holds no element or fewer than the rank of the variable, and writes nothing past out; Mirco.NetCdf.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), pass an out of maximumRank elements.
+    """
+    generic [R: Region]
+    function dimensionsOf(file: Int32, variable: Int32, out: Span![Int32, R]): Int32;
+
+    """
+    The length of a dimension into out[0], nc_inq_dimlen.
+    No contract: no precondition, since the body gives NC_EINVAL for an out that holds no element, and netCDF refuses an identifier that is no dimension; Mirco.NetCdf.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), pass an out of one element.
+    """
+    generic [R: Region]
+    function lengthOf(file: Int32, dimension: Int32, out: Span![Index, R]): Int32;
+
+    """
+    Writes every element of a variable from values, nc_put_var_double.
+    No contract: a binding to C; the count of elements of a variable is no value a contract can read, so the wrapper Mirco.NetCdf.writeFloat64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it defines the variable from the shape of the array whose elements it passes.
+    """
+    generic [R: Region]
+    function putFloat64(file: Int32, variable: Int32, values: Span[Float64, R]): Int32;
+
+    """
+    Writes every element of a variable from values, nc_put_var_longlong.
+    No contract: a binding to C; the count of elements of a variable is no value a contract can read, so the wrapper Mirco.NetCdf.writeInt64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it defines the variable from the shape of the array whose elements it passes.
+    """
+    generic [R: Region]
+    function putInt64(file: Int32, variable: Int32, values: Span[Int64, R]): Int32;
+
+    """
+    Reads every element of a variable into out, nc_get_var_double.
+    No contract: a binding to C; the count of elements of a variable is no value a contract can read, so the wrapper Mirco.NetCdf.readFloat64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it sizes out to the product of the lengths of the dimensions of the variable.
+    """
+    generic [R: Region]
+    function getFloat64(file: Int32, variable: Int32, out: Span![Float64, R]): Int32;
+
+    """
+    Reads every element of a variable into out, nc_get_var_longlong.
+    No contract: a binding to C; the count of elements of a variable is no value a contract can read, so the wrapper Mirco.NetCdf.readInt64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it sizes out to the product of the lengths of the dimensions of the variable.
+    """
+    generic [R: Region]
+    function getInt64(file: Int32, variable: Int32, out: Span![Int64, R]): Int32;
+end module.

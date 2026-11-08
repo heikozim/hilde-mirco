@@ -1,0 +1,311 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A save writes name.ending.part, renames it to name.ending and only then
+-- adds name.ending and a line end to the list of written files, in one
+-- write to a file opened for appending, so that the ranks of a job of
+-- Sperli may add their lines at the same time.
+import Standard.Buffer (Buffer, destroyFree, wholeSpan);
+import Standard.String (String, length, asSpan, destroyString, fromLiteral);
+import Standard.StringBuilder (StringBuilder, makeStringBuilder, writeByte, writeString, finalize);
+import Standard.File (
+    FileDescriptor,
+    openRead,
+    openWrite,
+    openAppend,
+    closeFile,
+    readAll,
+    writeAll,
+    renameFile,
+    removeFileIfThere,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray);
+import Mirco.Schlucki (Table, TableError, columnCount, readCsv, writeCsv);
+import Mirco.Wire (WireError, encode, decode);
+import Mirco.Yompi (Figure, renderSvg, renderPng);
+
+module body Mirco.Cell is
+    function stateNameLimit(): Index is
+        return 64;
+    end;
+
+    function letterOrDigit(b: Nat8): Bool is
+        return ((b >= 97) and (b <= 122)) or ((b >= 65) and (b <= 90)) or ((b >= 48) and (b <= 57));
+    end;
+
+    function wordByte(b: Nat8): Bool is
+        return letterOrDigit(b) or (b = 95) or (b = 45);
+    end;
+
+    generic [R: Region]
+    function isStateName(name: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(name);
+        if (n = 0) or (n > stateNameLimit()) then
+            return false;
+        end if;
+        if name[0] = 45 then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < n do
+            if not wordByte(name[i]) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isInputName(file: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(file);
+        if (n = 0) or (n > 128) then
+            return false;
+        end if;
+        if (file[0] = 46) or (file[0] = 45) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < n do
+            if not (wordByte(file[i]) or (file[i] = 46)) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function isEnding(ending: Span[Nat8, R]): Bool is
+        let n: Index := spanLength(ending);
+        if (n < 2) or (n > 8) then
+            return false;
+        end if;
+        if ending[0] /= 46 then
+            return false;
+        end if;
+        var i: Index := 1;
+        while i < n do
+            let b: Nat8 := ending[i];
+            if not (((b >= 97) and (b <= 122)) or ((b >= 48) and (b <= 57))) then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    function stateDirectory(): String is
+        case environmentValue("MIRCO_NOTEBOOK_STATE") of
+            when Some(value as dir: String) do
+                if length(&dir) > 0 then
+                    return dir;
+                end if;
+                destroyString(dir);
+                return fromLiteral(".");
+            when None do
+                return fromLiteral(".");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function statePath(name: Span[Nat8, R], ending: Span[Nat8, S]): String is
+        let dir: String := stateDirectory();
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, asSpan(&dir));
+        writeByte(&!b, 47);
+        writeString(&!b, name);
+        writeString(&!b, ending);
+        destroyString(dir);
+        return finalize(b);
+    end;
+
+    -- Writes data into path.part and renames it to path; false, and no
+    -- part left behind, when a step fails.
+    generic [R: Region, S: Region]
+    function writeFile(path: Span[Nat8, R], data: Span[Nat8, S]): Bool is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, path);
+        writeString(&!b, ".part");
+        let part: String := finalize(b);
+        var done: Bool := false;
+        case openWrite(asSpan(&part)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, data);
+                let closed: Bool := closeFile(file);
+                if wrote and closed then
+                    done := renameFile(asSpan(&part), path);
+                end if;
+            when None do
+                done := false;
+        end case;
+        if not done then
+            let gone: Bool := removeFileIfThere(asSpan(&part));
+        end if;
+        destroyString(part);
+        return done;
+    end;
+
+    -- Adds name, ending and a line end to the list MIRCO_NOTEBOOK_WRITTEN
+    -- names, when it names one; a list that cannot be opened is left be,
+    -- since the file itself is written and the tool also looks at the
+    -- directory.
+    generic [R: Region, S: Region]
+    function noteWritten(name: Span[Nat8, R], ending: Span[Nat8, S]): Unit is
+        case environmentValue("MIRCO_NOTEBOOK_WRITTEN") of
+            when Some(value as list: String) do
+                if length(&list) > 0 then
+                    var b: StringBuilder := makeStringBuilder();
+                    writeString(&!b, name);
+                    writeString(&!b, ending);
+                    writeByte(&!b, 10);
+                    let line: String := finalize(b);
+                    case openAppend(asSpan(&list), 384) of
+                        when Some(value as opened: FileDescriptor) do
+                            var file: FileDescriptor := opened;
+                            let wrote: Bool := writeAll(&!file, asSpan(&line));
+                            let closed: Bool := closeFile(file);
+                        when None do
+                            skip;
+                    end case;
+                    destroyString(line);
+                end if;
+                destroyString(list);
+            when None do
+                skip;
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function save(name: Span[Nat8, R], ending: Span[Nat8, S], data: Span[Nat8, Q]): Bool is
+        let path: String := statePath(name, ending);
+        let done: Bool := writeFile(asSpan(&path), data);
+        destroyString(path);
+        if done then
+            noteWritten(name, ending);
+        end if;
+        return done;
+    end;
+
+    generic [R: Region]
+    function readFile(path: Span[Nat8, R]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function saveTable(name: Span[Nat8, R], t: &[Table, S]): Bool is
+        case writeCsv(t) of
+            when Some(value as text: String) do
+                let done: Bool := save(name, ".csv", asSpan(&text));
+                destroyString(text);
+                return done;
+            when None do
+                return false;
+        end case;
+    end;
+
+    generic [S: Region]
+    function tableOf(text: Option[String], kinds: Span[Nat8, S]): Either[CellError, Table] is
+        case text of
+            when Some(value as got: String) do
+                let read: Either[TableError, Table] := readCsv(asSpan(&got), kinds);
+                destroyString(got);
+                case read of
+                    when Right(right as t: Table) do
+                        let good: Either[CellError, Table] := Right(right => t);
+                        return good;
+                    when Left(left as e: TableError) do
+                        let bad: Either[CellError, Table] := Left(left => NotTable(table => e));
+                        return bad;
+                end case;
+            when None do
+                let missing: Either[CellError, Table] := Left(left => NoFile());
+                return missing;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function loadTable(name: Span[Nat8, R], kinds: Span[Nat8, S]): Either[CellError, Table] is
+        let text: Option[String] := readState(name, ".csv");
+        return tableOf(text, kinds);
+    end;
+
+    generic [T: Free(Element), R: Region, S: Region]
+    function saveArray(name: Span[Nat8, R], array: &[NdArray[T], S]): Bool is
+        let bytes: Buffer[Nat8] := encode(array);
+        let done: Bool := save(name, ".mirc", wholeSpan(&bytes));
+        destroyFree(bytes);
+        return done;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function loadArray(name: Span[Nat8, R]): Either[CellError, NdArray[T]] is
+        case readState(name, ".mirc") of
+            when Some(value as got: String) do
+                let read: Either[WireError, NdArray[T]] := decode(asSpan(&got));
+                destroyString(got);
+                case read of
+                    when Right(right as a: NdArray[T]) do
+                        let good: Either[CellError, NdArray[T]] := Right(right => a);
+                        return good;
+                    when Left(left as e: WireError) do
+                        let bad: Either[CellError, NdArray[T]] := Left(left => NotArray(wire => e));
+                        return bad;
+                end case;
+            when None do
+                let missing: Either[CellError, NdArray[T]] := Left(left => NoFile());
+                return missing;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function saveSvg(name: Span[Nat8, R], f: &[Figure, S]): Bool is
+        let text: String := renderSvg(f);
+        let done: Bool := save(name, ".svg", asSpan(&text));
+        destroyString(text);
+        return done;
+    end;
+
+    generic [R: Region, S: Region]
+    function savePng(name: Span[Nat8, R], f: &[Figure, S]): Bool is
+        let bytes: String := renderPng(f);
+        let done: Bool := save(name, ".png", asSpan(&bytes));
+        destroyString(bytes);
+        return done;
+    end;
+
+    generic [R: Region, S: Region]
+    function saveText(name: Span[Nat8, R], text: Span[Nat8, S]): Bool is
+        return save(name, ".txt", text);
+    end;
+
+    generic [R: Region, S: Region]
+    function readState(name: Span[Nat8, R], ending: Span[Nat8, S]): Option[String] is
+        let path: String := statePath(name, ending);
+        let text: Option[String] := readFile(asSpan(&path));
+        destroyString(path);
+        return text;
+    end;
+
+    generic [R: Region, S: Region]
+    function loadInputTable(file: Span[Nat8, R], kinds: Span[Nat8, S]): Either[CellError, Table] is
+        let text: Option[String] := readFile(file);
+        return tableOf(text, kinds);
+    end;
+end module body.

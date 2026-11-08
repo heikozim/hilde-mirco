@@ -1,0 +1,251 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    insertBack,
+    wholeSpan
+);
+import Mirco.Element (
+    Element,
+    elementCode,
+    elementWidth,
+    zeroElement,
+    appendLittleEndian,
+    readLittleEndian,
+    validLittleEndian,
+    knownCode
+);
+import Mirco.Array (NdArray, rank, count, dimension, flatGet, fromSpan);
+
+module body Mirco.Wire is
+    function wireVersion(): Nat8 is
+        return 1;
+    end;
+
+    function headerLength(rank: Index): Index is
+        return 8 + (8 * rank);
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function encodedLength(array: &[NdArray[T], R]): Index is
+        let zero: T := zeroElement();
+        return headerLength(rank(array)) + (count(array) * elementWidth(zero));
+    end;
+
+    -- The eight bytes of value, lowest first; the division by 256 takes the
+    -- place of a shift.
+    generic [R: Region]
+    function appendEight(value: Index, out: &![Buffer[Nat8], R]): Unit is
+        var rest: Index := value;
+        var done: Index := 0;
+        while done < 8 do
+            let high: Index := rest / 256;
+            let low: Index := rest - (high * 256);
+            case toNat8(low) of
+                when Some(value as byte: Nat8) do
+                    insertBack(&~out, byte);
+                when None do
+                    abort("Mirco.Wire: a byte above 255");
+            end case;
+            rest := high;
+            done := done + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The number of the eight bytes at at, lowest first, as a Nat64, so that
+    -- a dimension too large for an Index is seen before it is used.
+    generic [R: Region]
+    function readEight(bytes: Span[Nat8, R], at: Index): Nat64 is
+        var value: Nat64 := 0;
+        var left: Index := 8;
+        while left > 0 do
+            left := left - 1;
+            let byte: Nat8 := bytes[at + left];
+            case toNat64(byte) of
+                when Some(value as wide: Nat64) do
+                    value := (value * 256) + wide;
+                when None do
+                    abort("Mirco.Wire: a byte that is no number");
+            end case;
+        end while;
+        return value;
+    end;
+
+    function byteOf(value: Index): Nat8 is
+        case toNat8(value) of
+            when Some(value as byte: Nat8) do
+                return byte;
+            when None do
+                abort("Mirco.Wire: a rank above 255");
+        end case;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function encode(array: &[NdArray[T], R]): Buffer[Nat8] is
+        let zero: T := zeroElement();
+        var out: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!out, 77);
+        insertBack(&!out, 73);
+        insertBack(&!out, 82);
+        insertBack(&!out, 67);
+        insertBack(&!out, wireVersion());
+        insertBack(&!out, elementCode(zero));
+        insertBack(&!out, byteOf(rank(array)));
+        insertBack(&!out, 0);
+        var axis: Index := 0;
+        while axis < rank(array) do
+            appendEight(dimension(array, axis), &!out);
+            axis := axis + 1;
+        end while;
+        var at: Index := 0;
+        while at < count(array) do
+            appendLittleEndian(flatGet(array, at), &!out);
+            at := at + 1;
+        end while;
+        return out;
+    end;
+
+    function refuse(why: WireError): Either[WireError, Index] is
+        let refused: Either[WireError, Index] := Left(left => why);
+        return refused;
+    end;
+
+    -- The count of elements the header of bytes announces, after every
+    -- check of the header, or why the header was refused.  Every product
+    -- is held below the bytes there are, so none overflows.
+    generic [T: Free(Element), R: Region]
+    function checkHeader(bytes: Span[Nat8, R], zero: T): Either[WireError, Index] is
+        if spanLength(bytes) < 8 then
+            return refuse(TooShort());
+        end if;
+        if (bytes[0] /= 77) or (bytes[1] /= 73) or (bytes[2] /= 82) or (bytes[3] /= 67) then
+            return refuse(BadMagic());
+        end if;
+        if bytes[4] /= wireVersion() then
+            return refuse(BadVersion());
+        end if;
+        if not knownCode(bytes[5]) then
+            return refuse(UnknownElement());
+        end if;
+        if bytes[5] /= elementCode(zero) then
+            return refuse(OtherElement());
+        end if;
+        let rank_byte: Nat8 := bytes[6];
+        if (rank_byte < 1) or (rank_byte > 32) then
+            return refuse(BadRank());
+        end if;
+        if bytes[7] /= 0 then
+            return refuse(BadReserved());
+        end if;
+        var rank: Index := 0;
+        case toIndex(rank_byte) of
+            when Some(value as wide: Index) do
+                rank := wide;
+            when None do
+                return refuse(BadRank());
+        end case;
+        let header: Index := headerLength(rank);
+        if spanLength(bytes) < header then
+            return refuse(TooShort());
+        end if;
+        let width: Index := elementWidth(zero);
+        let room: Index := (spanLength(bytes) - header) / width;
+        var total: Index := 1;
+        var axis: Index := 0;
+        while axis < rank do
+            let raw: Nat64 := readEight(bytes, 8 + (8 * axis));
+            if raw < 1 then
+                return refuse(BadDimension());
+            end if;
+            -- A dimension above the largest Index, 2^32 - 1 on a 32 bit
+            -- target, cannot fit the bytes there are either.
+            var dim: Index := 0;
+            case toIndex(raw) of
+                when Some(value as wide: Index) do
+                    dim := wide;
+                when None do
+                    return refuse(BadLength());
+            end case;
+            if dim > (room / total) then
+                return refuse(BadLength());
+            end if;
+            total := total * dim;
+            axis := axis + 1;
+        end while;
+        if spanLength(bytes) /= (header + (total * width)) then
+            return refuse(BadLength());
+        end if;
+        var at: Index := 0;
+        while at < total do
+            if not validLittleEndian(zero, bytes, header + (at * width)) then
+                return refuse(BadElement());
+            end if;
+            at := at + 1;
+        end while;
+        let good: Either[WireError, Index] := Right(right => total);
+        return good;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function decode(bytes: Span[Nat8, R]): Either[WireError, NdArray[T]] is
+        let zero: T := zeroElement();
+        case checkHeader(bytes, zero) of
+            when Left(left as why: WireError) do
+                let refused: Either[WireError, NdArray[T]] := Left(left => why);
+                return refused;
+            when Right(right as total: Index) do
+                var dims: Buffer[Index] := allocateEmpty();
+                var axis: Index := 0;
+                let rank: Index := rankOf(bytes);
+                while axis < rank do
+                    insertBack(&!dims, axisLength(bytes, axis));
+                    axis := axis + 1;
+                end while;
+                let width: Index := elementWidth(zero);
+                let header: Index := headerLength(length(&dims));
+                var values: Buffer[T] := allocateEmpty();
+                var at: Index := 0;
+                while at < total do
+                    let value: T := readLittleEndian(bytes, header + (at * width));
+                    insertBack(&!values, value);
+                    at := at + 1;
+                end while;
+                let made: NdArray[T] := fromSpan(wholeSpan(&dims), wholeSpan(&values));
+                destroyFree(dims);
+                destroyFree(values);
+                let decoded: Either[WireError, NdArray[T]] := Right(right => made);
+                return decoded;
+        end case;
+    end;
+
+    -- The rank of a header checkHeader has accepted.
+    generic [R: Region]
+    function rankOf(bytes: Span[Nat8, R]): Index is
+        case toIndex(bytes[6]) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Mirco.Wire: the rank of an accepted header that is no Index");
+        end case;
+    end;
+
+    -- The length of axis in a header checkHeader has accepted.
+    generic [R: Region]
+    function axisLength(bytes: Span[Nat8, R], axis: Index): Index is
+        case toIndex(readEight(bytes, 8 + (8 * axis))) of
+            when Some(value as wide: Index) do
+                return wide;
+            when None do
+                abort("Mirco.Wire: a dimension of an accepted header that is no Index");
+        end case;
+    end;
+end module body.

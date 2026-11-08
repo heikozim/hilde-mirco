@@ -1,0 +1,88 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, length, nth, wholeSpan);
+import Mirco.Element (
+    Element,
+    codeFloat64,
+    codeFloat32,
+    codeInt64,
+    codeInt32,
+    codeNat8,
+    codeBool,
+    knownCode,
+    widthOfCode,
+    elementCode,
+    elementWidth,
+    zeroElement,
+    appendLittleEndian,
+    readLittleEndian,
+    validLittleEndian
+);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Element.Test is
+    -- The codes and widths of the table in docs/mirco.en.md.
+    function testCodesAndWidths(): Unit is
+        assertTrue((codeFloat64() = 1) and (codeFloat32() = 2) and (codeInt64() = 3), "codes 1 to 3");
+        assertTrue((codeInt32() = 4) and (codeNat8() = 5) and (codeBool() = 6), "codes 4 to 6");
+        assertTrue((widthOfCode(1) = 8) and (widthOfCode(2) = 4) and (widthOfCode(3) = 8), "widths of codes 1 to 3");
+        assertTrue((widthOfCode(4) = 4) and (widthOfCode(5) = 1) and (widthOfCode(6) = 1), "widths of codes 4 to 6");
+        assertTrue((widthOfCode(0) = 0) and (widthOfCode(7) = 0) and (widthOfCode(255) = 0), "no width for another code");
+        assertTrue(knownCode(1) and knownCode(6), "the first and the last code");
+        assertFalse(knownCode(0) or knownCode(7) or knownCode(255), "no other code");
+        let f: Float32 := 0.0;
+        let i: Int64 := 0;
+        let b: Nat8 := 0;
+        assertTrue((elementCode(0.0) = 1) and (elementCode(f) = 2) and (elementCode(i) = 3), "the code of a value");
+        assertTrue((elementCode(0) = 4) and (elementCode(b) = 5) and (elementCode(true) = 6), "the code of a value");
+        assertTrue((elementWidth(0.0) = 8) and (elementWidth(f) = 4) and (elementWidth(true) = 1), "the width of a value");
+        let zero: Float64 := zeroElement();
+        let no: Bool := zeroElement();
+        assertTrue((zero = 0.0) and (not no), "the zero of a type");
+        return nil;
+    end;
+
+    -- 258 as Int32 is 02 01 00 00, lowest byte first, and reads back.
+    function testLittleEndian(): Unit is
+        var out: Buffer[Nat8] := allocateEmpty();
+        appendLittleEndian(258, &!out);
+        appendLittleEndian(true, &!out);
+        assertTrue(length(&out) = 5, "four bytes and one");
+        assertTrue((nth(&out, 0) = 2) and (nth(&out, 1) = 1) and (nth(&out, 2) = 0) and (nth(&out, 3) = 0), "02 01 00 00");
+        assertTrue(nth(&out, 4) = 1, "true is 1");
+        let back: Int32 := readLittleEndian(wholeSpan(&out), 0);
+        let flag: Bool := readLittleEndian(wholeSpan(&out), 4);
+        assertTrue((back = 258) and flag, "read back");
+        destroyFree(out);
+        var wide: Buffer[Nat8] := allocateEmpty();
+        appendLittleEndian(-1.5, &!wide);
+        assertTrue(length(&wide) = 8, "eight bytes of a Float64");
+        assertTrue((nth(&wide, 7) = 191) and (nth(&wide, 6) = 248) and (nth(&wide, 0) = 0), "-1.5 is bf f8 00 .. 00");
+        let again: Float64 := readLittleEndian(wholeSpan(&wide), 0);
+        assertTrue(again = -1.5, "-1.5 read back");
+        destroyFree(wide);
+        return nil;
+    end;
+
+    -- A Bool is the byte 0 or 1; any other byte is refused.  Every byte
+    -- is an element of the other types.
+    function testValidBytes(): Unit is
+        var bytes: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!bytes, 0);
+        insertBack(&!bytes, 1);
+        insertBack(&!bytes, 2);
+        insertBack(&!bytes, 255);
+        assertTrue(validLittleEndian(true, wholeSpan(&bytes), 0) and validLittleEndian(true, wholeSpan(&bytes), 1), "0 and 1 are a Bool");
+        assertFalse(validLittleEndian(true, wholeSpan(&bytes), 2) or validLittleEndian(true, wholeSpan(&bytes), 3), "2 and 255 are no Bool");
+        let b: Nat8 := 0;
+        assertTrue(validLittleEndian(b, wholeSpan(&bytes), 3), "255 is a Nat8");
+        assertTrue(validLittleEndian(0, wholeSpan(&bytes), 0), "four bytes are an Int32");
+        destroyFree(bytes);
+        return nil;
+    end;
+end module body.

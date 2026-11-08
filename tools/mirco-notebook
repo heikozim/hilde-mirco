@@ -1,0 +1,251 @@
+#!/bin/sh
+# Runs the cells of a notebook of Hilde, a file NAME.hnb of cells that
+# Mirco.Notebook reads: each cell built and run with hilde run,
+# or, for a cell "--- cell NAME sperli RANKS HOSTS", built with hilde
+# compile and started as a job of Sperli (Simple Parallel Execution over
+# Remote Links Interface) with hilde run -n RANKS --hosts HOSTS.  POSIX sh.
+#
+#     HILDE=/path/to/hilde tools/mirco-notebook list NOTEBOOK.hnb
+#     HILDE=/path/to/hilde tools/mirco-notebook run NOTEBOOK.hnb [CELL]
+#
+# HILDE names a Hilde tree: its standard/src and bindings/generated give
+# the modules, beside those of Mirco; HILDE_COMPILER names the compiler,
+# HILDE/hilde when it is not set, and a cell of Sperli needs hilde-launcher
+# beside it.  run runs every cell in order and stops at the first that
+# fails, or only CELL.  Everything of a run lies in NAME.run beside the
+# notebook, mode 0700:
+#
+#     cells/CELL.hiq   the source of each cell, its lines where they are in
+#                      the notebook, so that a message points into it
+#     state/           the files the cells save and load (Mirco.Cell)
+#     out/CELL.txt     what the cell printed; out/CELL.err the messages of
+#                      the compiler and the cache
+#     bin/CELL         the programme of a cell of Sperli
+#     manifest.csv     cell, file, kind and bytes of every file a cell
+#                      wrote, its rows replaced when the cell runs again
+#     runs.csv         cell, exit, milliseconds, units from the cache and
+#                      units of each run of a cell, appended
+#
+# A cell runs in the directory of the notebook, with MIRCO_NOTEBOOK_STATE
+# naming state/ and MIRCO_NOTEBOOK_WRITTEN a list its saves add to; a file
+# of state/ that is new or changed after the cell counts as written by it
+# too.  Exit 0 when every cell ran with 0, 2 for a notebook that is
+# refused, the status of a failing cell, 9 for anything else.
+set -u
+umask 077
+abort() {
+	echo "mirco-notebook: $*" >&2
+	exit 9
+}
+usage() {
+	echo "usage: mirco-notebook list NOTEBOOK.hnb | run NOTEBOOK.hnb [CELL]" >&2
+	exit 9
+}
+[ $# -ge 2 ] || usage
+command=$1
+notebook=$2
+cell=${3:-}
+case "$command" in
+list) [ $# -eq 2 ] || usage ;;
+run) [ $# -le 3 ] || usage ;;
+*) usage ;;
+esac
+case "$cell" in
+'') ;;
+[a-z]*) case "$cell" in *[!a-z0-9-]*) abort "no cell can be named $cell" ;; esac ;;
+*) abort "no cell can be named $cell" ;;
+esac
+H=${HILDE:-}
+[ -n "$H" ] && [ -d "$H/standard/src" ] || abort "HILDE does not name a Hilde tree with standard/src"
+compiler=${HILDE_COMPILER:-$H/hilde}
+case "$compiler" in /*) ;; *) compiler="$PWD/$compiler" ;; esac
+[ -x "$compiler" ] || abort "no compiler at $compiler"
+root=$(cd "$(dirname "$0")/.." && pwd) || exit 9
+modules="$root/src:$H/standard/src:$H/bindings/generated"
+case "$modules" in *[!A-Za-z0-9/._:-]*) abort "a path of the modules holds a byte other than letters, digits and / . _ - : $modules" ;; esac
+[ -f "$notebook" ] && [ -r "$notebook" ] || abort "no notebook at $notebook"
+base=$(basename "$notebook")
+case "$base" in
+*.hnb) ;;
+*) abort "a notebook ends with .hnb: $base" ;;
+esac
+case "$base" in .* | -* | *[!A-Za-z0-9._-]*) abort "a notebook is named by letters, digits and . _ - only: $base" ;; esac
+dir=$(cd "$(dirname "$notebook")" && pwd) || exit 9
+notebook="$dir/$base"
+run="$dir/${base%.hnb}.run"
+
+# A directory of the run that is this user's own and no link, made when it
+# is missing.
+own_directory() {
+	if [ -L "$1" ] || { [ -e "$1" ] && ! [ -d "$1" ]; }; then
+		abort "$1 is there and no directory"
+	fi
+	[ -d "$1" ] || mkdir "$1" || abort "cannot make $1"
+	[ -O "$1" ] || abort "$1 belongs to another user"
+	chmod 700 "$1" || abort "cannot set the mode of $1"
+}
+own_directory "$run"
+for sub in cells state out bin; do
+	own_directory "$run/$sub"
+done
+
+# Milliseconds since the epoch; whole seconds where date has no %N.
+now_ms() {
+	t=$(date +%s%N 2> /dev/null)
+	case "$t" in
+	'' | *[!0-9]*) echo $(($(date +%s) * 1000)) ;;
+	*) echo $((t / 1000000)) ;;
+	esac
+}
+
+# The messages of the compiler without the lines of the cache.
+messages() {
+	grep -v '^hilde cache: ' "$1" >&2
+}
+
+start_all=$(now_ms)
+plan="$run/plan.txt"
+rm -f "$run/cells/"*.hiq
+"$compiler" run "--modules=$modules" "$root/tools/NotebookTool.hiq" plan "$notebook" "$run" > "$plan" 2> "$run/plan.err"
+rc=$?
+if [ "$rc" != 0 ]; then
+	cat "$plan" >&2
+	messages "$run/plan.err"
+	[ "$rc" = 2 ] && exit 2
+	exit 9
+fi
+plan_ms=$(($(now_ms) - start_all))
+
+# Each line of the plan was checked by Mirco.Notebook; it is checked here
+# again before a word of it reaches a path or a command.
+checked_line() {
+	case "$1" in [a-z]*) ;; *) return 1 ;; esac
+	case "$1" in *[!a-z0-9-]*) return 1 ;; esac
+	case "$2" in '' | *[!0-9]*) return 1 ;; esac
+	case "$3" in -) ;; [A-Za-z0-9_]*) case "$3" in *[!A-Za-z0-9._-]*) return 1 ;; esac ;; *) return 1 ;; esac
+	case "$4" in [A-Za-z]*) case "$4" in *[!A-Za-z0-9.]*) return 1 ;; esac ;; *) return 1 ;; esac
+	case "$5" in '' | *[!0-9]*) return 1 ;; esac
+	return 0
+}
+while read -r name ranks hosts module line; do
+	checked_line "$name" "$ranks" "$hosts" "$module" "$line" || abort "a line of the plan that is not one: $name"
+done < "$plan"
+
+if [ "$command" = list ]; then
+	while read -r name ranks hosts module line; do
+		if [ "$ranks" = 0 ]; then
+			echo "$name line $line module $module"
+		else
+			echo "$name line $line module $module sperli $ranks $hosts"
+		fi
+	done < "$plan"
+	exit 0
+fi
+if [ -n "$cell" ] && ! grep -q "^$cell " "$plan"; then
+	abort "the notebook has no cell $cell"
+fi
+
+# The files of state/ with a checksum, one a line; names of other bytes
+# are left out, and said so once.
+snapshot() {
+	for f in "$run/state"/* "$run/state"/.*; do
+		[ -f "$f" ] && ! [ -L "$f" ] || continue
+		b=${f##*/}
+		case "$b" in
+		*.part) continue ;;
+		[A-Za-z0-9_]*) case "$b" in *[!A-Za-z0-9._-]*) echo "mirco-notebook: state/$b is no plain name and is not recorded" >&2; continue ;; esac ;;
+		*) echo "mirco-notebook: state/$b is no plain name and is not recorded" >&2; continue ;;
+		esac
+		printf '%s %s\n' "$b" "$(cksum < "$f")"
+	done
+}
+
+# Prints a file of text, the first count lines of it, and ends the last
+# line when the file does not.
+print_text() {
+	head -n "$2" "$1"
+	[ -z "$(tail -c 1 "$1")" ] || echo
+}
+
+# Shows a file a cell wrote, by its kind.
+show_file() {
+	path=$1
+	bytes=$2
+	case "$path" in
+	*.txt) echo "-- text $path:"; print_text "$run/$path" 20 ;;
+	*.csv) echo "-- table $path, $(($(wc -l < "$run/$path") - 1)) rows:"; head -n 11 "$run/$path" | tr -d '\r' ;;
+	*.svg) echo "-- image (svg) $path, $bytes bytes" ;;
+	*.png) echo "-- image (PNG) $path, $bytes bytes" ;;
+	*.mirc) echo "-- array $path, $bytes bytes" ;;
+	*) echo "-- file $path, $bytes bytes" ;;
+	esac
+}
+
+[ -f "$run/runs.csv" ] || echo "cell,exit,milliseconds,cache_hits,cache_units" > "$run/runs.csv"
+echo "cell,file,bytes" > "$run/written.csv"
+ran=
+status=0
+while read -r name ranks hosts module line; do
+	[ -z "$cell" ] || [ "$cell" = "$name" ] || continue
+	ran="${ran:+$ran,}$name"
+	source="$run/cells/$name.hiq"
+	out="$run/out/$name.txt"
+	err="$run/out/$name.err"
+	: > "$run/written.txt"
+	snapshot > "$run/before.txt"
+	begin=$(now_ms)
+	if [ "$ranks" = 0 ]; then
+		(cd "$dir" && MIRCO_NOTEBOOK_STATE="$run/state" MIRCO_NOTEBOOK_WRITTEN="$run/written.txt" HILDE_CACHE_TRACE=1 \
+			exec "$compiler" run "--modules=$modules" "$source") < /dev/null > "$out" 2> "$err"
+		rc=$?
+	else
+		[ -f "$dir/$hosts" ] || abort "cell $name: no file of hosts $dir/$hosts"
+		HILDE_CACHE_TRACE=1 "$compiler" compile "$source" "--modules=$modules" "--entrypoint=$module:main" "--output=$run/bin/$name" < /dev/null > "$out" 2> "$err"
+		rc=$?
+		if [ "$rc" = 0 ]; then
+			(cd "$dir" && MIRCO_NOTEBOOK_STATE="$run/state" MIRCO_NOTEBOOK_WRITTEN="$run/written.txt" \
+				exec "$compiler" run -n "$ranks" --hosts "$dir/$hosts" "$run/bin/$name") < /dev/null > "$out" 2>> "$err"
+			rc=$?
+		fi
+	fi
+	ms=$(($(now_ms) - begin))
+	snapshot > "$run/after.txt"
+	grep -v -x -F -f "$run/before.txt" "$run/after.txt" | cut -d ' ' -f 1 > "$run/changed.txt"
+	while read -r b; do
+		case "$b" in [A-Za-z0-9_]*) case "$b" in *[!A-Za-z0-9._-]*) continue ;; esac ;; *) continue ;; esac
+		[ -f "$run/state/$b" ] && echo "$b"
+	done < "$run/written.txt" >> "$run/changed.txt"
+	hits=$(sed -n 's/^hilde cache: [0-9]* ms: \([0-9]*\) of \([0-9]*\) units from the cache$/\1 \2/p' "$err" | tail -1)
+	set -- $hits
+	cache_hits=${1:-0}
+	cache_units=${2:-0}
+	cache="$cache_hits of $cache_units units from the cache"
+	off=$(sed -n 's/^hilde cache: [0-9]* ms: off: //p' "$err" | tail -1)
+	[ -z "$off" ] || cache="cache off: $off"
+	echo "$name,$rc,$ms,$cache_hits,$cache_units" >> "$run/runs.csv"
+	echo "== cell $name (line $line): exit $rc, $ms ms, $cache"
+	print_text "$out" 1000000
+	echo "$name,out/$name.txt,$(wc -c < "$out" | tr -d ' ')" >> "$run/written.csv"
+	for b in $(sort -u "$run/changed.txt"); do
+		bytes=$(wc -c < "$run/state/$b" | tr -d ' ')
+		echo "$name,state/$b,$bytes" >> "$run/written.csv"
+		show_file "state/$b" "$bytes"
+	done
+	if [ "$rc" != 0 ]; then
+		messages "$err"
+		status=$rc
+		break
+	fi
+done < "$plan"
+rm -f "$run/before.txt" "$run/after.txt" "$run/changed.txt" "$run/written.txt"
+begin=$(now_ms)
+"$compiler" run "--modules=$modules" "$root/tools/NotebookTool.hiq" record "$run" "$ran" > "$run/record.txt" 2> "$run/record.err"
+rc=$?
+record_ms=$(($(now_ms) - begin))
+if [ "$rc" != 0 ]; then
+	cat "$run/record.txt" >&2
+	messages "$run/record.err"
+	[ "$status" != 0 ] || status=9
+fi
+echo "== manifest $run/manifest.csv; plan $plan_ms ms, record $record_ms ms, all $(($(now_ms) - start_all)) ms"
+exit "$status"

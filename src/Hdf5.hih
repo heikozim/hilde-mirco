@@ -1,0 +1,93 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Writes arrays into HDF5 files and reads them back, through the HDF5 library of the system.
+
+- A dataset of Float64 is stored as little endian binary64, one of Int64 as little endian 64 bit integers.
+- A dataset is read only as the type it holds: an integer dataset is no Float64 array and the reverse.
+- Every failure of the library and a missing dataset come back as a fault.
+- The dimensions of a dataset are checked before the array is made: a dimension of 0, and a count of elements that does not fit an Index or goes above readElementLimit(), come back as BadShape.  A dimension of 0 gives no empty result, since an array of this package holds every dimension at least 1, so a dataset with such a space has no shape an array can have; the fault names the file, not the reader.
+- A path or a name with a zero byte is refused by a contract, since the library would read it as ended there.
+
+    let written: Either[Hdf5Fault, Unit] := writeFloat64("out.h5", "x", &array, true);
+"""
+import Mirco.Array (NdArray, count);
+import Mirco.Bindings.Hdf5 (zeroFree);
+
+module Mirco.Hdf5 is
+    """
+    Why a call refused or failed.
+    """
+    union Hdf5Fault: Free is
+        """
+        The file could not be created or opened.
+        """
+        case CannotOpen;
+        """
+        The file has no dataset of that name, or it could not be made.
+        """
+        case NoDataset;
+        """
+        The dataset holds elements of another type than the one asked for.
+        """
+        case WrongType;
+        """
+        The space of the dataset is not one an array can have, or it disagrees with the elements:
+        its rank is 0 or above 32, a dimension does not fit an Index or is 0, or the count of its
+        elements goes above readElementLimit().
+        """
+        case BadShape;
+        """
+        The library failed to write or to read the elements, or to close the file.
+        """
+        case Failed;
+    end;
+
+    """
+    The most elements one read of a dataset makes.  A read holds the product of the dimensions at
+    or below it while it forms the product, so that the product neither overflows an Index nor asks
+    for a stretch of memory no array read in one piece needs; a dataset that announces more is
+    refused as BadShape.  4294967296 elements of 8 bytes are 32 gigabyte.
+    """
+    function readElementLimit(): Index
+        ensures result = 4294967296;
+
+    """
+    Writes array as the dataset name of the file at path: into a new file when fresh holds, which
+    replaces one that is there, else into the file that is there.
+    Neither path nor name holds a zero byte, which would end it for the C library.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function writeFloat64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Float64], Q], fresh: Bool): Either[Hdf5Fault, Unit]
+        requires (zeroFree(path)) and (zeroFree(name));
+
+    """
+    writeFloat64 for an array of Int64.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function writeInt64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Int64], Q], fresh: Bool): Either[Hdf5Fault, Unit]
+        requires (zeroFree(path)) and (zeroFree(name));
+
+    """
+    The dataset name of the file at path as an array of Float64, with its dimensions; WrongType when it
+    holds anything but floating point numbers of 8 bytes, BadShape when a dimension of its space is 0
+    or the count of its elements does not fit an Index or goes above readElementLimit().
+    """
+    generic [R: Region, S: Region]
+    function readFloat64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[Hdf5Fault, NdArray[Float64]]
+        requires (zeroFree(path)) and (zeroFree(name));
+
+    """
+    The dataset name of the file at path as an array of Int64; WrongType when it holds anything but
+    signed integers of 8 bytes, BadShape when a dimension of its space is 0 or the count of its
+    elements does not fit an Index or goes above readElementLimit().
+    """
+    generic [R: Region, S: Region]
+    function readInt64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[Hdf5Fault, NdArray[Int64]]
+        requires (zeroFree(path)) and (zeroFree(name));
+end module.

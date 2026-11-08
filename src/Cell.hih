@@ -1,0 +1,171 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The state of a cell of a notebook in files: what one cell saves, the next one loads.
+
+- A cell is a programme of its own, so nothing but files passes from one cell to the next.
+- A table of Schlucki is saved as CSV in the form Mirco.Schlucki.readCsv reads back, an array in the wire format of Mirco.Wire.
+- A figure of Yompi (Your Own Math and Plotting Interface) is saved as svg or PNG, a text as it is; these are what a cell shows.
+- A state is named by a word of letters, digits, underscores and hyphens; its file is the word and the ending of its format.
+- The files lie in the directory MIRCO_NOTEBOOK_STATE names, which tools/mirco-notebook sets, else in the current one.
+- Each save writes a new file and renames it into place, then adds its name to the list MIRCO_NOTEBOOK_WRITTEN names.
+
+    let saved: Bool := saveTable("sales", &t);
+    case loadTable("sales", wholeSpan(&kinds)) of
+        when Right(right as back: Table) do
+            destroyTable(back);
+        when Left(left as e: CellError) do
+            skip;
+    end case;
+"""
+import Standard.String (String, length);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray);
+import Mirco.Schlucki (Table, TableError, columnCount);
+import Mirco.Wire (WireError);
+import Mirco.Yompi (Figure);
+
+module Mirco.Cell is
+    """
+    Why a state or an input could not be loaded.
+    """
+    union CellError: Free is
+        """
+        The file is not there or could not be read.
+        """
+        case NoFile;
+        """
+        The file is no table of the kinds asked for; readCsv says why.
+        """
+        case NotTable is
+            table: TableError;
+        """
+        The file is no array of the element type asked for; decode says why.
+        """
+        case NotArray is
+            wire: WireError;
+    end;
+
+    """
+    The most bytes of the name of a state.
+    """
+    function stateNameLimit(): Index
+        ensures result = 64;
+
+    """
+    Whether name can name a state: 1 to stateNameLimit bytes, each a letter, a digit, an underscore or a
+    hyphen, the first no hyphen; so it never names a path outside the directory of the states.
+    No contract: no precondition, since any bytes can be looked at.
+    """
+    generic [R: Region]
+    function isStateName(name: Span[Nat8, R]): Bool;
+
+    """
+    Whether file can name an input beside the notebook: 1 to 128 bytes, each a letter, a digit, a point, an
+    underscore or a hyphen, the first no point and no hyphen; so it never names another directory.
+    No contract: no precondition, since any bytes can be looked at.
+    """
+    generic [R: Region]
+    function isInputName(file: Span[Nat8, R]): Bool;
+
+    """
+    Whether ending can end the file of a state: a point, then 1 to 7 small letters or digits; so it never
+    names another directory.
+    No contract: no precondition, since any bytes can be looked at.
+    """
+    generic [R: Region]
+    function isEnding(ending: Span[Nat8, R]): Bool;
+
+    """
+    The directory of the states: the value of MIRCO_NOTEBOOK_STATE, or "." when it is not set or empty.
+    """
+    function stateDirectory(): String
+        ensures length(&result) > 0;
+
+    """
+    The path of the state name with the ending, a point included: the directory of the states, a slash,
+    the name and the ending.
+    """
+    generic [R: Region, S: Region]
+    function statePath(name: Span[Nat8, R], ending: Span[Nat8, S]): String
+        requires isStateName(name) and isEnding(ending)
+        ensures length(&result) > spanLength(name);
+
+    """
+    Saves the table as name.csv; false when writeCsv refuses it or the file could not be written.
+    No ensures: whether the file was written is the work of the file system.
+    """
+    generic [R: Region, S: Region]
+    function saveTable(name: Span[Nat8, R], t: &[Table, S]): Bool
+        requires isStateName(name) and (columnCount(t) >= 1);
+
+    """
+    The table of name.csv, a column for each of kinds, as readCsv reads it.
+    No ensures: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function loadTable(name: Span[Nat8, R], kinds: Span[Nat8, S]): Either[CellError, Table]
+        requires isStateName(name);
+
+    """
+    Saves the array as name.mirc in the wire format; false when the file could not be written.
+    No ensures: whether the file was written is the work of the file system.
+    """
+    generic [T: Free(Element), R: Region, S: Region]
+    function saveArray(name: Span[Nat8, R], array: &[NdArray[T], S]): Bool
+        requires isStateName(name);
+
+    """
+    The array of name.mirc, of the element type T.
+    No ensures: an Either result, which an ensures cannot look into.
+    """
+    generic [T: Free(Element), R: Region]
+    function loadArray(name: Span[Nat8, R]): Either[CellError, NdArray[T]]
+        requires isStateName(name);
+
+    """
+    Saves the figure as name.svg; false when the file could not be written.
+    No ensures: whether the file was written is the work of the file system.
+    """
+    generic [R: Region, S: Region]
+    function saveSvg(name: Span[Nat8, R], f: &[Figure, S]): Bool
+        requires isStateName(name);
+
+    """
+    Saves the figure as name.png; false when the file could not be written.
+    No ensures: whether the file was written is the work of the file system.
+    """
+    generic [R: Region, S: Region]
+    function savePng(name: Span[Nat8, R], f: &[Figure, S]): Bool
+        requires isStateName(name);
+
+    """
+    Saves the text as name.txt; false when the file could not be written.
+    No ensures: whether the file was written is the work of the file system.
+    """
+    generic [R: Region, S: Region]
+    function saveText(name: Span[Nat8, R], text: Span[Nat8, S]): Bool
+        requires isStateName(name);
+
+    """
+    The bytes of the state file name with the ending, as they were saved.
+    No ensures: an Option result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function readState(name: Span[Nat8, R], ending: Span[Nat8, S]): Option[String]
+        requires isStateName(name) and isEnding(ending);
+
+    """
+    The table of the CSV file beside the notebook, read from the current directory, which tools/mirco-notebook
+    makes the directory of the notebook; a column for each of kinds.
+    No ensures: an Either result, which an ensures cannot look into.
+    """
+    generic [R: Region, S: Region]
+    function loadInputTable(file: Span[Nat8, R], kinds: Span[Nat8, S]): Either[CellError, Table]
+        requires isInputName(file);
+end module.

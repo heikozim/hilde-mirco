@@ -1,0 +1,437 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, removeLast, destroyFree, length, nth, storeNth, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, rank, dimension, count, flatGet);
+import Mirco.Wire (
+    WireError,
+    TooShort,
+    BadMagic,
+    BadVersion,
+    UnknownElement,
+    OtherElement,
+    BadRank,
+    BadReserved,
+    BadDimension,
+    BadLength,
+    BadElement,
+    headerLength,
+    encode,
+    encodedLength,
+    decode
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Wire.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The test vectors of the wire format, kept here and nowhere else: the
+    -- hex of the bytes encode writes for the array each test builds.
+    function vectorInt32(): Span[Nat8, Static] is
+        return "4d49524301040100020000000000000001000000feffffff";
+    end;
+
+    function vectorFloat64(): Span[Nat8, Static] is
+        return "4d4952430101020001000000000000000100000000000000000000000000f03f";
+    end;
+
+    function vectorBool(): Span[Nat8, Static] is
+        return "4d495243010601000300000000000000010001";
+    end;
+
+    function vectorFloat32(): Span[Nat8, Static] is
+        return "4d4952430102010002000000000000000000803f000000bf";
+    end;
+
+    function vectorInt64(): Span[Nat8, Static] is
+        return "4d495243010301000100000000000000d4feffffffffffff";
+    end;
+
+    function vectorNat8(): Span[Nat8, Static] is
+        return "4d4952430105020002000000000000000200000000000000010203ff";
+    end;
+
+    function nibble(c: Nat8): Nat8 is
+        if (c >= 48) and (c <= 57) then
+            return c - 48;
+        else if (c >= 97) and (c <= 102) then
+            return c - 87;
+        end if;
+        abort("Mirco.Wire.Test: a vector holds a character that is no hex digit");
+    end;
+
+    function fromHex(text: Span[Nat8, Static]): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 0;
+        while (at + 1) < spanLength(text) do
+            let high: Nat8 := nibble(text[at]);
+            let low: Nat8 := nibble(text[at + 1]);
+            insertBack(&!out, (high * 16) + low);
+            at := at + 2;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(a: &[Buffer[Nat8], R], b: &[Buffer[Nat8], S]): Bool is
+        if length(a) /= length(b) then
+            return false;
+        end if;
+        var at: Index := 0;
+        while at < length(a) do
+            if nth(a, at) /= nth(b, at) then
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    -- The number of a refusal, so that two can be compared.
+    function reason(why: WireError): Int32 is
+        case why of
+            when TooShort do
+                return 1;
+            when BadMagic do
+                return 2;
+            when BadVersion do
+                return 3;
+            when UnknownElement do
+                return 4;
+            when OtherElement do
+                return 5;
+            when BadRank do
+                return 6;
+            when BadReserved do
+                return 7;
+            when BadDimension do
+                return 8;
+            when BadLength do
+                return 9;
+            when BadElement do
+                return 10;
+        end case;
+    end;
+
+    -- The refusal of bytes asked to hold Int32 elements, 0 when they were taken.
+    generic [R: Region]
+    function refusalInt32(bytes: &[Buffer[Nat8], R]): Int32 is
+        let got: Either[WireError, NdArray[Int32]] := decode(wholeSpan(bytes));
+        case got of
+            when Left(left as why: WireError) do
+                return reason(why);
+            when Right(right as array: NdArray[Int32]) do
+                destroyNdArray(array);
+                return 0;
+        end case;
+    end;
+
+    function testInt32Vector(): Unit is
+        let shape: Buffer[Index] := one(2);
+        var values: Buffer[Int32] := allocateEmpty();
+        insertBack(&!values, 1);
+        insertBack(&!values, -2);
+        let array: NdArray[Int32] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let bytes: Buffer[Nat8] := encode(&array);
+        let expected: Buffer[Nat8] := fromHex(vectorInt32());
+        assertTrue(sameBytes(&bytes, &expected), "Int32 [1, -2] has the bytes of its vector");
+        assertTrue(encodedLength(&array) = 24, "8 + 8 + 2 * 4 bytes");
+        let got: Either[WireError, NdArray[Int32]] := decode(wholeSpan(&bytes));
+        case got of
+            when Right(right as back: NdArray[Int32]) do
+                assertTrue(rank(&back) = 1, "rank 1 back");
+                assertTrue(dimension(&back, 0) = 2, "two elements back");
+                assertTrue(flatGet(&back, 1) = -2, "-2 back");
+                destroyNdArray(back);
+            when Left(left as why: WireError) do
+                assertTrue(false, "its own bytes are taken");
+        end case;
+        destroyFree(bytes);
+        destroyFree(expected);
+        destroyNdArray(array);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testFloat64Vector(): Unit is
+        let shape: Buffer[Index] := two(1, 1);
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.0);
+        let array: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let bytes: Buffer[Nat8] := encode(&array);
+        let expected: Buffer[Nat8] := fromHex(vectorFloat64());
+        assertTrue(sameBytes(&bytes, &expected), "Float64 [[1.0]] has the bytes of its vector");
+        let got: Either[WireError, NdArray[Float64]] := decode(wholeSpan(&bytes));
+        case got of
+            when Right(right as back: NdArray[Float64]) do
+                assertTrue(rank(&back) = 2, "rank 2 back");
+                assertTrue(flatGet(&back, 0) = 1.0, "1.0 back");
+                destroyNdArray(back);
+            when Left(left as why: WireError) do
+                assertTrue(false, "its own bytes are taken");
+        end case;
+        destroyFree(bytes);
+        destroyFree(expected);
+        destroyNdArray(array);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testBoolVector(): Unit is
+        let shape: Buffer[Index] := one(3);
+        var values: Buffer[Bool] := allocateEmpty();
+        insertBack(&!values, true);
+        insertBack(&!values, false);
+        insertBack(&!values, true);
+        let array: NdArray[Bool] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let bytes: Buffer[Nat8] := encode(&array);
+        let expected: Buffer[Nat8] := fromHex(vectorBool());
+        assertTrue(sameBytes(&bytes, &expected), "Bool [true, false, true] has the bytes of its vector");
+        destroyFree(bytes);
+        destroyFree(expected);
+        destroyNdArray(array);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testFloat32Vector(): Unit is
+        let shape: Buffer[Index] := one(2);
+        var values: Buffer[Float32] := allocateEmpty();
+        insertBack(&!values, 1.0);
+        insertBack(&!values, -0.5);
+        let array: NdArray[Float32] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let bytes: Buffer[Nat8] := encode(&array);
+        let expected: Buffer[Nat8] := fromHex(vectorFloat32());
+        assertTrue(sameBytes(&bytes, &expected), "Float32 [1.0, -0.5] has the bytes of its vector");
+        destroyFree(bytes);
+        destroyFree(expected);
+        destroyNdArray(array);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testInt64Vector(): Unit is
+        let shape: Buffer[Index] := one(1);
+        var values: Buffer[Int64] := allocateEmpty();
+        insertBack(&!values, -300);
+        let array: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let bytes: Buffer[Nat8] := encode(&array);
+        let expected: Buffer[Nat8] := fromHex(vectorInt64());
+        assertTrue(sameBytes(&bytes, &expected), "Int64 [-300] has the bytes of its vector");
+        destroyFree(bytes);
+        destroyFree(expected);
+        destroyNdArray(array);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testNat8Vector(): Unit is
+        let shape: Buffer[Index] := two(2, 2);
+        var values: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!values, 1);
+        insertBack(&!values, 2);
+        insertBack(&!values, 3);
+        insertBack(&!values, 255);
+        let array: NdArray[Nat8] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let bytes: Buffer[Nat8] := encode(&array);
+        let expected: Buffer[Nat8] := fromHex(vectorNat8());
+        assertTrue(sameBytes(&bytes, &expected), "Nat8 [[1, 2], [3, 255]] has the bytes of its vector");
+        destroyFree(bytes);
+        destroyFree(expected);
+        destroyNdArray(array);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    -- Every refusal, each from the Int32 vector with one change; the vector
+    -- itself is taken, so a refusal is the change and nothing else.
+    function testRefusals(): Unit is
+        let good: Buffer[Nat8] := fromHex(vectorInt32());
+        assertTrue(refusalInt32(&good) = 0, "the vector itself is taken");
+        let short: Buffer[Nat8] := fromHex("4d4952430104");
+        assertTrue(refusalInt32(&short) = 1, "six bytes are too short");
+        var magic: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!magic, 0, 0);
+        assertTrue(refusalInt32(&magic) = 2, "another magic is refused");
+        var version: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!version, 4, 2);
+        assertTrue(refusalInt32(&version) = 3, "version 2 is refused");
+        var unknown: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!unknown, 5, 9);
+        assertTrue(refusalInt32(&unknown) = 4, "code 9 is no element type");
+        var other: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!other, 5, 1);
+        assertTrue(refusalInt32(&other) = 5, "Float64 bytes asked as Int32 are refused");
+        var rank_zero: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!rank_zero, 6, 0);
+        assertTrue(refusalInt32(&rank_zero) = 6, "rank 0 is refused");
+        var rank_high: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!rank_high, 6, 33);
+        assertTrue(refusalInt32(&rank_high) = 6, "rank 33 is refused");
+        var reserved: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!reserved, 7, 1);
+        assertTrue(refusalInt32(&reserved) = 7, "a reserved byte other than 0 is refused");
+        var dim_zero: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!dim_zero, 8, 0);
+        assertTrue(refusalInt32(&dim_zero) = 8, "a dimension of 0 is refused");
+        var longer: Buffer[Nat8] := fromHex(vectorInt32());
+        insertBack(&!longer, 0);
+        assertTrue(refusalInt32(&longer) = 9, "a byte more is refused");
+        var shorter: Buffer[Nat8] := fromHex(vectorInt32());
+        let dropped: Nat8 := removeLast(&!shorter);
+        assertTrue(dropped = 255, "the last byte of the vector was dropped");
+        assertTrue(refusalInt32(&shorter) = 9, "a byte less is refused");
+        var huge: Buffer[Nat8] := fromHex(vectorInt32());
+        storeNth(&!huge, 15, 128);
+        assertTrue(refusalInt32(&huge) = 9, "a dimension of 2 to the 63 is refused by length, without an overflow");
+        destroyFree(good);
+        destroyFree(short);
+        destroyFree(magic);
+        destroyFree(version);
+        destroyFree(unknown);
+        destroyFree(other);
+        destroyFree(rank_zero);
+        destroyFree(rank_high);
+        destroyFree(reserved);
+        destroyFree(dim_zero);
+        destroyFree(longer);
+        destroyFree(shorter);
+        destroyFree(huge);
+        return nil;
+    end;
+
+    function testBadBoolRefused(): Unit is
+        var bytes: Buffer[Nat8] := fromHex(vectorBool());
+        storeNth(&!bytes, 17, 2);
+        let got: Either[WireError, NdArray[Bool]] := decode(wholeSpan(&bytes));
+        case got of
+            when Left(left as why: WireError) do
+                assertTrue(reason(why) = 10, "a Bool of 2 is refused");
+            when Right(right as array: NdArray[Bool]) do
+                destroyNdArray(array);
+                assertTrue(false, "a Bool of 2 is refused");
+        end case;
+        destroyFree(bytes);
+        return nil;
+    end;
+
+    function one(a: Index): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        insertBack(&!out, a);
+        return out;
+    end;
+
+    function two(a: Index, b: Index): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        insertBack(&!out, a);
+        insertBack(&!out, b);
+        return out;
+    end;
+
+    -- headerLength of rank, the length dropped.
+    function headerOf(rank: Index): Unit is
+        let n: Index := headerLength(rank);
+        return nil;
+    end;
+
+    -- A rank of 33 is refused by the requires of headerLength; 0 and 32
+    -- are taken.
+    function testHeaderRefusal(): Unit is
+        if asChild("headerRankThirtyThree") then
+            headerOf(33);
+            return nil;
+        end if;
+        if asChild("fits") then
+            headerOf(0);
+            headerOf(32);
+            return nil;
+        end if;
+        assertTrue(headerLength(32) = 264, "rank 32 has a header of 264 bytes");
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testHeaderRefusal", "headerRankThirtyThree", "contract violated: the requires"), "headerLength of rank 33 is refused by the requires");
+        assertTrue(not refusedInChild("testHeaderRefusal", "fits", "contract violated"), "ranks 0 and 32 break no contract");
+        assertTrue(not refusedInChild("testHeaderRefusal", "fits", "Mirco"), "ranks 0 and 32 are taken");
+        return nil;
+    end;
+end module body.

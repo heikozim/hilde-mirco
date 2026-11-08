@@ -1,0 +1,24 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Computes XXH3 of 64 bits, the checksum of the envelopes and pages of an RNTuple.
+
+- The seed 0 and the default secret of 192 bytes, as XXH3_64bits of the library xxHash computes it.
+- Every length, from the empty input on; time linear in the length.
+
+    let sum: Nat64 := xxh3(bytes);
+"""
+
+module Mirco.Xxh3 is
+    """
+    XXH3 of data with the seed 0 and the default secret.
+    No contract: no precondition, since any bytes have a hash, and every Nat64 is a possible result.
+    """
+    generic [R: Region]
+    function xxh3(data: Span[Nat8, R]): Nat64;
+end module.

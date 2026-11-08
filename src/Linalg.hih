@@ -1,0 +1,118 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Solves linear systems and decomposes matrices of Float64: into lower and upper triangles, Cholesky, QR, the symmetric eigenproblem and the singular value decomposition.
+
+- A matrix is an array of rank 2; a dimension that does not fit stops the programme with a message.
+- solve, determinant and inverse take time cubic in n, by triangles with partial pivoting.
+- A singular matrix gives None where a result would divide by zero, never a division.
+- The eigenproblem and the decomposition into singular values are iterated by Jacobi, at most 100 sweeps.
+
+    let x: Option[NdArray[Float64]] := solve(&a, &b);
+"""
+import Mirco.Array (NdArray, rank, dimension);
+
+module Mirco.Linalg is
+    """
+    Up to three arrays a decomposition gives: q and r, the eigenvalues and the eigenvectors, or u, s and vt.
+    """
+    type Decomposition: Linear;
+
+    """
+    The count of arrays of the decomposition, 2 or 3.
+    """
+    generic [R: Region]
+    function parts(d: &[Decomposition, R]): Index
+        ensures (result >= 2) and (result <= 3);
+
+    """
+    A copy of the array at position which of the decomposition.
+    """
+    generic [R: Region]
+    function part(d: &[Decomposition, R], which: Index): NdArray[Float64]
+        requires which < parts(d);
+
+    """
+    A decomposition of the two arrays first and second, for a backend that computes them itself.
+    """
+    function twoParts(first: NdArray[Float64], second: NdArray[Float64]): Decomposition
+        ensures parts(&result) = 2;
+
+    """
+    A decomposition of the three arrays first, second and third, for a backend that computes them itself.
+    """
+    function threeParts(first: NdArray[Float64], second: NdArray[Float64], third: NdArray[Float64]): Decomposition
+        ensures parts(&result) = 3;
+
+    """
+    Gives the decomposition back.
+    No contract: a destroy function.
+    """
+    function destroyDecomposition(d: Decomposition): Unit;
+
+    """
+    The x with a x = b, for a square a and b a vector or a matrix of as many rows; None when a is singular.
+    """
+    generic [R: Region, S: Region]
+    function solve(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and ((rank(b) = 1) or (rank(b) = 2)) and (dimension(a, 0) = dimension(a, 1)) and (dimension(b, 0) = dimension(a, 0));
+
+    """
+    The determinant of a square matrix, by lower and upper triangles with partial pivoting.
+    """
+    generic [R: Region]
+    function determinant(a: &[NdArray[Float64], R]): Float64
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1));
+
+    """
+    The inverse of a square matrix; None when it is singular.
+    """
+    generic [R: Region]
+    function inverse(a: &[NdArray[Float64], R]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1));
+
+    """
+    The lower triangular l with l times its transpose a, for a symmetric positive definite a; None otherwise.
+    """
+    generic [R: Region]
+    function cholesky(a: &[NdArray[Float64], R]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1));
+
+    """
+    q with orthonormal columns and an upper triangular r with q r = a, for a of m rows and n columns, m at least
+    n: q is m by n and r n by n, by Householder reflections.
+    """
+    generic [R: Region]
+    function qr(a: &[NdArray[Float64], R]): Decomposition
+        requires (rank(a) = 2) and (dimension(a, 0) >= dimension(a, 1))
+        ensures parts(&result) = 2;
+
+    """
+    The x of least squares, the smallest norm of a x - b, for a of full column rank; None otherwise.
+    """
+    generic [R: Region, S: Region]
+    function lstsq(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]]
+        requires (rank(a) = 2) and (rank(b) = 1) and (dimension(a, 0) >= dimension(a, 1)) and (dimension(b, 0) = dimension(a, 0));
+
+    """
+    The eigenvalues of a symmetric matrix in ascending order and its eigenvectors as the columns of a matrix.
+    """
+    generic [R: Region]
+    function eigenSymmetric(a: &[NdArray[Float64], R]): Decomposition
+        requires (rank(a) = 2) and (dimension(a, 0) = dimension(a, 1))
+        ensures parts(&result) = 2;
+
+    """
+    u, s and vt with a = u diag(s) vt, for a of m rows and n columns, m at least n: u is m by n, s the n
+    singular values in descending order, vt n by n.
+    """
+    generic [R: Region]
+    function svd(a: &[NdArray[Float64], R]): Decomposition
+        requires (rank(a) = 2) and (dimension(a, 0) >= dimension(a, 1))
+        ensures parts(&result) = 3;
+end module.

@@ -1,0 +1,618 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The decoder of the Lempel Ziv Markov chain algorithm after the description of its inventor: a range
+-- decoder over probabilities of 11 bits, a literal coded under the
+-- previous byte, lengths and distances coded in trees of bits.  The
+-- probabilities lie in one buffer at the offsets of the constants below;
+-- a tree of n bits uses the slots 1 to 2^n - 1 from its base.  The output
+-- is its own dictionary.
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, length, lengthMut, nthMut, storeNth, wholeSpan);
+import Standard.String (String, fromByteBuffer);
+import Standard.Gzip (crc32);
+
+module body Mirco.Xz is
+    constant top_value: Nat64 := 16777216;
+    constant two_to32: Nat64 := 4294967296;
+    constant probability_one: Index := 2048;
+    constant is_match_at: Index := 0;
+    constant is_rep_at: Index := 192;
+    constant is_rep_g0_at: Index := 204;
+    constant is_rep_g1_at: Index := 216;
+    constant is_rep_g2_at: Index := 228;
+    constant is_rep0_long_at: Index := 240;
+    constant pos_slot_at: Index := 432;
+    constant spec_pos_at: Index := 688;
+    constant align_at: Index := 802;
+    constant length_at: Index := 818;
+    constant rep_length_at: Index := 1332;
+    constant literal_at: Index := 1846;
+    constant probability_count: Index := 14134;
+
+    record Coder: Free is
+        range: Nat64;
+        code: Nat64;
+        at: Index;
+        good: Bool;
+    end;
+
+    record Step: Free is
+        value: Index;
+        coder: Coder;
+    end;
+
+    -- The state between the symbols: the state of the last kinds, the four
+    -- last distances, and lc, lp and pb of the properties.
+    record Machine: Free is
+        state: Index;
+        rep0: Index;
+        rep1: Index;
+        rep2: Index;
+        rep3: Index;
+        lc: Index;
+        lp: Index;
+        pb: Index;
+        good: Bool;
+    end;
+
+    function wide(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function index(v: Nat64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function count(i: Index): Nat64 is
+        case toNat64(i) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function twoTo(k: Index): Index is
+        var v: Index := 1;
+        var i: Index := 0;
+        while i < k do
+            v := v * 2;
+            i := i + 1;
+        end while;
+        return v;
+    end;
+
+    function broken(c: Coder): Coder is
+        return Coder(range => c.range, code => c.code, at => c.at, good => false);
+    end;
+
+    generic [R: Region]
+    function normalize(data: Span[Nat8, R], c: Coder): Coder is
+        if c.range >= top_value then
+            return c;
+        end if;
+        if c.at >= spanLength(data) then
+            return broken(c);
+        end if;
+        return Coder(range => c.range * 256, code => rem((c.code * 256) + wide(data[c.at]), two_to32), at => c.at + 1, good => c.good);
+    end;
+
+    -- The first byte of a range coder is 0, the next four the code.
+    generic [R: Region]
+    function startCoder(data: Span[Nat8, R], at: Index): Coder is
+        let bad: Coder := Coder(range => 0, code => 0, at => at, good => false);
+        if (at > spanLength(data)) or ((spanLength(data) - at) < 5) then
+            return bad;
+        end if;
+        if data[at] /= 0 then
+            return bad;
+        end if;
+        var code: Nat64 := 0;
+        var i: Index := 1;
+        while i < 5 do
+            code := (code * 256) + wide(data[at + i]);
+            i := i + 1;
+        end while;
+        return Coder(range => two_to32 - 1, code => code, at => at + 5, good => true);
+    end;
+
+    generic [R: Region, S: Region]
+    function bit(data: Span[Nat8, R], c: Coder, probs: &![Buffer[Index], S], i: Index): Step is
+        let p: Index := nthMut(&~probs, i);
+        let bound: Nat64 := (c.range / 2048) * count(p);
+        if c.code < bound then
+            storeNth(&~probs, i, p + ((probability_one - p) / 32));
+            return Step(value => 0, coder => normalize(data, Coder(range => bound, code => c.code, at => c.at, good => c.good)));
+        end if;
+        storeNth(&~probs, i, p - (p / 32));
+        return Step(value => 1, coder => normalize(data, Coder(range => c.range - bound, code => c.code - bound, at => c.at, good => c.good)));
+    end;
+
+    generic [R: Region, S: Region]
+    function tree(data: Span[Nat8, R], c: Coder, probs: &![Buffer[Index], S], base: Index, bits: Index): Step is
+        var m: Index := 1;
+        var coder: Coder := c;
+        var i: Index := 0;
+        while i < bits do
+            let s: Step := bit(data, coder, &~probs, base + m);
+            m := (2 * m) + s.value;
+            coder := s.coder;
+            i := i + 1;
+        end while;
+        return Step(value => m - twoTo(bits), coder => coder);
+    end;
+
+    generic [R: Region, S: Region]
+    function reverseTree(data: Span[Nat8, R], c: Coder, probs: &![Buffer[Index], S], base: Index, bits: Index): Step is
+        var m: Index := 1;
+        var symbol: Index := 0;
+        var coder: Coder := c;
+        var i: Index := 0;
+        while i < bits do
+            let s: Step := bit(data, coder, &~probs, base + m);
+            m := (2 * m) + s.value;
+            symbol := symbol + (s.value * twoTo(i));
+            coder := s.coder;
+            i := i + 1;
+        end while;
+        return Step(value => symbol, coder => coder);
+    end;
+
+    generic [R: Region]
+    function direct(data: Span[Nat8, R], c: Coder, bits: Index): Step is
+        var coder: Coder := c;
+        var v: Index := 0;
+        var i: Index := 0;
+        while i < bits do
+            let half: Nat64 := coder.range / 2;
+            if coder.code >= half then
+                coder := Coder(range => half, code => coder.code - half, at => coder.at, good => coder.good);
+                v := (2 * v) + 1;
+            else
+                coder := Coder(range => half, code => coder.code, at => coder.at, good => coder.good);
+                v := 2 * v;
+            end if;
+            coder := normalize(data, coder);
+            i := i + 1;
+        end while;
+        return Step(value => v, coder => coder);
+    end;
+
+    -- A length, from 0, in three parts: below 8, below 16, below 272.
+    generic [R: Region, S: Region]
+    function lengthOf(data: Span[Nat8, R], c: Coder, probs: &![Buffer[Index], S], base: Index, pos_state: Index): Step is
+        let choice: Step := bit(data, c, &~probs, base);
+        if choice.value = 0 then
+            return tree(data, choice.coder, &~probs, (base + 2) + (pos_state * 8), 3);
+        end if;
+        let choice2: Step := bit(data, choice.coder, &~probs, base + 1);
+        if choice2.value = 0 then
+            let mid: Step := tree(data, choice2.coder, &~probs, (base + 130) + (pos_state * 8), 3);
+            return Step(value => 8 + mid.value, coder => mid.coder);
+        end if;
+        let high: Step := tree(data, choice2.coder, &~probs, base + 258, 8);
+        return Step(value => 16 + high.value, coder => high.coder);
+    end;
+
+    generic [R: Region]
+    function resetProbabilities(probs: &![Buffer[Index], R]): Unit is
+        var i: Index := 0;
+        while i < lengthMut(&~probs) do
+            storeNth(&~probs, i, 1024);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function freshMachine(m: Machine): Machine is
+        return Machine(state => 0, rep0 => 0, rep1 => 0, rep2 => 0, rep3 => 0, lc => m.lc, lp => m.lp, pb => m.pb, good => m.good);
+    end;
+
+    function failedMachine(m: Machine): Machine is
+        return Machine(state => m.state, rep0 => m.rep0, rep1 => m.rep1, rep2 => m.rep2, rep3 => m.rep3, lc => m.lc, lp => m.lp,
+            pb => m.pb, good => false);
+    end;
+
+    function afterLiteral(state: Index): Index is
+        if state < 4 then
+            return 0;
+        end if;
+        if state < 10 then
+            return state - 3;
+        end if;
+        return state - 6;
+    end;
+
+    -- One chunk of lzma of unpacked bytes, its range data from at for packed
+    -- bytes; the bytes go to out, at most limit in all.
+    generic [R: Region, S: Region, Q: Region]
+    function lzmaChunk(data: Span[Nat8, R], at: Index, packed: Index, unpacked: Index, out: &![Buffer[Nat8], S], probs: &![Buffer[Index], Q], machine: Machine, limit: Index): Machine is
+        var m: Machine := machine;
+        var coder: Coder := startCoder(spanPart(data, 0, at + packed), at);
+        let goal: Index := lengthMut(&~out) + unpacked;
+        if goal > limit then
+            return failedMachine(m);
+        end if;
+        while coder.good and (lengthMut(&~out) < goal) do
+            let pos: Index := lengthMut(&~out);
+            let pos_state: Index := rem(pos, twoTo(m.pb));
+            let is_match: Step := bit(data, coder, &~probs, (is_match_at + (m.state * 16)) + pos_state);
+            coder := is_match.coder;
+            if is_match.value = 0 then
+                var previous: Index := 0;
+                if pos > 0 then
+                    previous := index(wide(nthMut(&~out, pos - 1)));
+                end if;
+                let lit_state: Index := (rem(pos, twoTo(m.lp)) * twoTo(m.lc)) + (previous / twoTo(8 - m.lc));
+                let base: Index := literal_at + (768 * lit_state);
+                var symbol: Index := 1;
+                if (m.state >= 7) and (m.rep0 < pos) then
+                    var match_byte: Index := index(wide(nthMut(&~out, (pos - m.rep0) - 1)));
+                    var same: Bool := true;
+                    while same and (symbol < 256) do
+                        let match_bit: Index := rem(match_byte / 128, 2);
+                        match_byte := rem(match_byte * 2, 256);
+                        let s: Step := bit(data, coder, &~probs, (base + 256) + ((match_bit * 256) + symbol));
+                        coder := s.coder;
+                        symbol := (2 * symbol) + s.value;
+                        same := match_bit = s.value;
+                    end while;
+                end if;
+                while symbol < 256 do
+                    let s: Step := bit(data, coder, &~probs, base + symbol);
+                    coder := s.coder;
+                    symbol := (2 * symbol) + s.value;
+                end while;
+                insertBack(&~out, byteOf(symbol - 256));
+                m := Machine(state => afterLiteral(m.state), rep0 => m.rep0, rep1 => m.rep1, rep2 => m.rep2, rep3 => m.rep3,
+                    lc => m.lc, lp => m.lp, pb => m.pb, good => m.good);
+            else
+                let is_rep: Step := bit(data, coder, &~probs, is_rep_at + m.state);
+                coder := is_rep.coder;
+                var size: Index := 0;
+                if is_rep.value = 1 then
+                    let g0: Step := bit(data, coder, &~probs, is_rep_g0_at + m.state);
+                    coder := g0.coder;
+                    var short_rep: Bool := false;
+                    if g0.value = 0 then
+                        let long: Step := bit(data, coder, &~probs, (is_rep0_long_at + (m.state * 16)) + pos_state);
+                        coder := long.coder;
+                        short_rep := long.value = 0;
+                    else
+                        let g1: Step := bit(data, coder, &~probs, is_rep_g1_at + m.state);
+                        coder := g1.coder;
+                        var distance: Index := m.rep1;
+                        var r2: Index := m.rep2;
+                        var r3: Index := m.rep3;
+                        if g1.value = 1 then
+                            let g2: Step := bit(data, coder, &~probs, is_rep_g2_at + m.state);
+                            coder := g2.coder;
+                            if g2.value = 0 then
+                                distance := m.rep2;
+                            else
+                                distance := m.rep3;
+                                r3 := m.rep2;
+                            end if;
+                            r2 := m.rep1;
+                        end if;
+                        m := Machine(state => m.state, rep0 => distance, rep1 => m.rep0, rep2 => r2, rep3 => r3, lc => m.lc, lp => m.lp,
+                            pb => m.pb, good => m.good);
+                    end if;
+                    if short_rep then
+                        var next: Index := 9;
+                        if m.state >= 7 then
+                            next := 11;
+                        end if;
+                        m := Machine(state => next, rep0 => m.rep0, rep1 => m.rep1, rep2 => m.rep2, rep3 => m.rep3, lc => m.lc,
+                            lp => m.lp, pb => m.pb, good => m.good);
+                        size := 1;
+                    else
+                        let l: Step := lengthOf(data, coder, &~probs, rep_length_at, pos_state);
+                        coder := l.coder;
+                        size := l.value + 2;
+                        var next: Index := 8;
+                        if m.state >= 7 then
+                            next := 11;
+                        end if;
+                        m := Machine(state => next, rep0 => m.rep0, rep1 => m.rep1, rep2 => m.rep2, rep3 => m.rep3, lc => m.lc,
+                            lp => m.lp, pb => m.pb, good => m.good);
+                    end if;
+                else
+                    let l: Step := lengthOf(data, coder, &~probs, length_at, pos_state);
+                    coder := l.coder;
+                    size := l.value + 2;
+                    var length_state: Index := l.value;
+                    if length_state > 3 then
+                        length_state := 3;
+                    end if;
+                    let slot: Step := tree(data, coder, &~probs, pos_slot_at + (length_state * 64), 6);
+                    coder := slot.coder;
+                    var distance: Index := slot.value;
+                    if slot.value >= 4 then
+                        let direct_bits: Index := (slot.value / 2) - 1;
+                        distance := (2 + rem(slot.value, 2)) * twoTo(direct_bits);
+                        if slot.value < 14 then
+                            let low: Step := reverseTree(data, coder, &~probs, ((spec_pos_at + distance) - slot.value) - 1, direct_bits);
+                            coder := low.coder;
+                            distance := distance + low.value;
+                        else
+                            let middle: Step := direct(data, coder, direct_bits - 4);
+                            coder := middle.coder;
+                            let low: Step := reverseTree(data, coder, &~probs, align_at, 4);
+                            coder := low.coder;
+                            distance := (distance + (middle.value * 16)) + low.value;
+                        end if;
+                    end if;
+                    var next: Index := 7;
+                    if m.state >= 7 then
+                        next := 10;
+                    end if;
+                    m := Machine(state => next, rep0 => distance, rep1 => m.rep0, rep2 => m.rep1, rep3 => m.rep2, lc => m.lc, lp => m.lp,
+                        pb => m.pb, good => m.good);
+                end if;
+                let have: Index := lengthMut(&~out);
+                if (m.rep0 >= have) or (size > (goal - have)) then
+                    return failedMachine(m);
+                end if;
+                var k: Index := 0;
+                while k < size do
+                    let here: Index := lengthMut(&~out);
+                    let b: Nat8 := nthMut(&~out, (here - m.rep0) - 1);
+                    insertBack(&~out, b);
+                    k := k + 1;
+                end while;
+            end if;
+        end while;
+        if (not coder.good) or (lengthMut(&~out) /= goal) or (coder.at > (at + packed)) then
+            return failedMachine(m);
+        end if;
+        return m;
+    end;
+
+    function byteOf(v: Index): Nat8 is
+        case toNat8(v) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The chunks of LZMA2 from at to the control byte 0: 1 and 2 copy
+    -- bytes, 128 and above are lzma with what they reset in bits 5 and 6.
+    -- The position after the end byte comes back, or 0 on a fault.
+    generic [R: Region, S: Region]
+    function lzma2(data: Span[Nat8, R], at: Index, out: &![Buffer[Nat8], S], limit: Index): Index is
+        var probs: Buffer[Index] := initialize(probability_count, 1024);
+        var m: Machine := Machine(state => 0, rep0 => 0, rep1 => 0, rep2 => 0, rep3 => 0, lc => 0, lp => 0, pb => 0, good => true);
+        var started: Bool := false;
+        var i: Index := at;
+        while i < spanLength(data) do
+            let control: Index := index(wide(data[i]));
+            if control = 0 then
+                destroyFree(probs);
+                return i + 1;
+            end if;
+            if (control = 1) or (control = 2) then
+                if (spanLength(data) - i) < 3 then
+                    destroyFree(probs);
+                    return 0;
+                end if;
+                let size: Index := ((index(wide(data[i + 1])) * 256) + index(wide(data[i + 2]))) + 1;
+                if ((spanLength(data) - (i + 3)) < size) or ((lengthMut(&~out) + size) > limit) then
+                    destroyFree(probs);
+                    return 0;
+                end if;
+                var k: Index := 0;
+                while k < size do
+                    insertBack(&~out, data[(i + 3) + k]);
+                    k := k + 1;
+                end while;
+                i := (i + 3) + size;
+            else if control >= 128 then
+                if (spanLength(data) - i) < 5 then
+                    destroyFree(probs);
+                    return 0;
+                end if;
+                let unpacked: Index := (((rem(control, 32) * 65536) + (index(wide(data[i + 1])) * 256)) + index(wide(data[i + 2]))) + 1;
+                let packed: Index := ((index(wide(data[i + 3])) * 256) + index(wide(data[i + 4]))) + 1;
+                let reset: Index := rem(control / 32, 4);
+                var start: Index := i + 5;
+                if reset >= 2 then
+                    if (spanLength(data) - i) < 6 then
+                        destroyFree(probs);
+                        return 0;
+                    end if;
+                    let props: Index := index(wide(data[i + 5]));
+                    if props >= 225 then
+                        destroyFree(probs);
+                        return 0;
+                    end if;
+                    let lc: Index := rem(props, 9);
+                    let lp: Index := rem(props / 9, 5);
+                    let pb: Index := props / 45;
+                    if (lc + lp) > 4 then
+                        destroyFree(probs);
+                        return 0;
+                    end if;
+                    m := Machine(state => m.state, rep0 => m.rep0, rep1 => m.rep1, rep2 => m.rep2, rep3 => m.rep3, lc => lc, lp => lp,
+                        pb => pb, good => true);
+                    start := i + 6;
+                    started := true;
+                end if;
+                if not started then
+                    destroyFree(probs);
+                    return 0;
+                end if;
+                if reset >= 1 then
+                    resetProbabilities(&!probs);
+                    m := freshMachine(m);
+                end if;
+                if (spanLength(data) - start) < packed then
+                    destroyFree(probs);
+                    return 0;
+                end if;
+                m := lzmaChunk(data, start, packed, unpacked, &~out, &!probs, m, limit);
+                if not m.good then
+                    destroyFree(probs);
+                    return 0;
+                end if;
+                i := start + packed;
+            else
+                destroyFree(probs);
+                return 0;
+            end if;
+        end while;
+        destroyFree(probs);
+        return 0;
+    end;
+
+    -- n bytes from at, little endian.
+    generic [R: Region]
+    function littleAt(data: Span[Nat8, R], at: Index, n: Index): Nat64 is
+        var v: Nat64 := 0;
+        var i: Index := n;
+        while i > 0 do
+            i := i - 1;
+            v := (v * 256) + wide(data[at + i]);
+        end while;
+        return v;
+    end;
+
+    function crcOf(c: Nat32): Nat64 is
+        case toNat64(c) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A number of the xz headers: seven bits a byte, the lowest first, the
+    -- high bit set in all but the last; the next position, or 0 on a fault.
+    generic [R: Region]
+    function skipNumber(data: Span[Nat8, R], at: Index, last: Index): Index is
+        var i: Index := at;
+        var n: Index := 0;
+        while (i < last) and (n < 9) do
+            let b: Index := index(wide(data[i]));
+            i := i + 1;
+            n := n + 1;
+            if b < 128 then
+                return i;
+            end if;
+        end while;
+        return 0;
+    end;
+
+    function checkSize(kind: Index): Index is
+        if kind = 0 then
+            return 0;
+        end if;
+        if kind <= 3 then
+            return 4;
+        end if;
+        if kind <= 6 then
+            return 8;
+        end if;
+        if kind <= 9 then
+            return 16;
+        end if;
+        if kind <= 12 then
+            return 32;
+        end if;
+        return 64;
+    end;
+
+    -- The CRC32 of the bytes of out from before on, those of one block.
+    generic [R: Region]
+    function crcFrom(out: &[Buffer[Nat8], R], before: Index): Nat64 is
+        return crcOf(crc32(spanPart(wholeSpan(out), before, length(out) - before)));
+    end;
+
+    generic [R: Region]
+    function unxz(data: Span[Nat8, R], limit: Index): Option[String] is
+        let n: Index := spanLength(data);
+        if n < 12 then
+            return None();
+        end if;
+        if (data[0] /= 253) or (data[1] /= 55) or (data[2] /= 122) or (data[3] /= 88) or (data[4] /= 90) or (data[5] /= 0) then
+            return None();
+        end if;
+        if (data[6] /= 0) or (crcOf(crc32(spanPart(data, 6, 2))) /= littleAt(data, 8, 4)) then
+            return None();
+        end if;
+        let check: Index := index(wide(data[7]));
+        if check > 15 then
+            return None();
+        end if;
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 12;
+        while (at < n) and (data[at] /= 0) do
+            let block_start: Index := at;
+            let header_size: Index := (index(wide(data[at])) + 1) * 4;
+            if ((n - at) < header_size) or (crcOf(crc32(spanPart(data, at, header_size - 4))) /= littleAt(data, (at + header_size) - 4, 4)) then
+                destroyFree(out);
+                return None();
+            end if;
+            let flags: Index := index(wide(data[at + 1]));
+            let last: Index := (at + header_size) - 4;
+            if rem(flags, 4) /= 0 then
+                destroyFree(out);
+                return None();
+            end if;
+            var p: Index := at + 2;
+            if rem(flags / 64, 2) = 1 then
+                p := skipNumber(data, p, last);
+            end if;
+            if (p /= 0) and (rem(flags / 128, 2) = 1) then
+                p := skipNumber(data, p, last);
+            end if;
+            if (p = 0) or ((p + 3) > last) or (data[p] /= 33) or (data[p + 1] /= 1) then
+                destroyFree(out);
+                return None();
+            end if;
+            let before: Index := length(&out);
+            let after: Index := lzma2(data, at + header_size, &!out, limit);
+            if after = 0 then
+                destroyFree(out);
+                return None();
+            end if;
+            var block_end: Index := after;
+            while rem(block_end - block_start, 4) /= 0 do
+                block_end := block_end + 1;
+            end while;
+            let size: Index := checkSize(check);
+            if (block_end > n) or ((n - block_end) < size) then
+                destroyFree(out);
+                return None();
+            end if;
+            if check = 1 then
+                if crcFrom(&out, before) /= littleAt(data, block_end, 4) then
+                    destroyFree(out);
+                    return None();
+                end if;
+            end if;
+            at := block_end + size;
+        end while;
+        if at >= n then
+            destroyFree(out);
+            return None();
+        end if;
+        return Some(value => fromByteBuffer(out));
+    end;
+end module body.

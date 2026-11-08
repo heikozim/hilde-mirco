@@ -1,0 +1,431 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, length, nth, wholeSpan);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, rank, flatGet);
+import Mirco.Wire (
+    WireError,
+    TooShort,
+    BadMagic,
+    BadVersion,
+    UnknownElement,
+    OtherElement,
+    BadRank,
+    BadReserved,
+    BadDimension,
+    BadLength,
+    BadElement,
+    encode as wireEncode
+);
+import Mirco.Sperli (CombineError, OtherShape, NotCombined, sperliCode, encode, decode, elementType, shape, combine);
+import Standard.SperliCollective (sumReduction, minReduction, maxReduction, prodReduction, landReduction, borReduction, bxorReduction);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Sperli.Test is
+    -- The vector of the array combine gives for the sum of the Int32
+    -- arrays [1, -2] and [3, 4]: the header of shape [2], then 4 and 2.
+    function vectorSumInt32(): Span[Nat8, Static] is
+        return "4d4952430104010002000000000000000400000002000000";
+    end;
+
+    function nibble(c: Nat8): Nat8 is
+        if (c >= 48) and (c <= 57) then
+            return c - 48;
+        else if (c >= 97) and (c <= 102) then
+            return c - 87;
+        end if;
+        abort("Mirco.Sperli.Test: a vector holds a character that is no hex digit");
+    end;
+
+    function fromHex(text: Span[Nat8, Static]): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 0;
+        while (at + 1) < spanLength(text) do
+            let high: Nat8 := nibble(text[at]);
+            let low: Nat8 := nibble(text[at + 1]);
+            insertBack(&!out, (high * 16) + low);
+            at := at + 2;
+        end while;
+        return out;
+    end;
+
+    generic [R: Region, S: Region]
+    function sameBytes(a: &[Buffer[Nat8], R], b: &[Buffer[Nat8], S]): Bool is
+        if length(a) /= length(b) then
+            return false;
+        end if;
+        var at: Index := 0;
+        while at < length(a) do
+            if nth(a, at) /= nth(b, at) then
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether dims is the shape rows by columns.
+    generic [R: Region]
+    function twoBy(dims: Span[Index, R], rows: Index, columns: Index): Bool is
+        if spanLength(dims) /= 2 then
+            return false;
+        end if;
+        return (dims[0] = rows) and (dims[1] = columns);
+    end;
+
+    -- An array of rank 1 with the two values.
+    generic [T: Free(Element)]
+    function pair(first: T, second: T): NdArray[T] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        var values: Buffer[T] := allocateEmpty();
+        insertBack(&!values, first);
+        insertBack(&!values, second);
+        let made: NdArray[T] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- An array of shape rows by columns holding 1, 2, ... in row-major order.
+    function counted(rows: Index, columns: Index): NdArray[Int64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, columns);
+        var values: Buffer[Int64] := allocateEmpty();
+        var next: Int64 := 1;
+        var at: Index := 0;
+        while at < (rows * columns) do
+            insertBack(&!values, next);
+            next := next + 1;
+            at := at + 1;
+        end while;
+        let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- The number of a refusal of the decoder, as Mirco.Wire.Test counts them.
+    function wireReason(why: WireError): Int32 is
+        case why of
+            when TooShort do
+                return 1;
+            when BadMagic do
+                return 2;
+            when BadVersion do
+                return 3;
+            when UnknownElement do
+                return 4;
+            when OtherElement do
+                return 5;
+            when BadRank do
+                return 6;
+            when BadReserved do
+                return 7;
+            when BadDimension do
+                return 8;
+            when BadLength do
+                return 9;
+            when BadElement do
+                return 10;
+        end case;
+    end;
+
+    -- 0 when combine gave an array, 1 for OtherShape, 2 for NotCombined.
+    function reason(why: CombineError): Int32 is
+        case why of
+            when OtherShape do
+                return 1;
+            when NotCombined do
+                return 2;
+        end case;
+    end;
+
+    generic [T: Free(Element), R: Region, S: Region]
+    function refusal(first: &[NdArray[T], R], second: &[NdArray[T], S], reduction: Nat8): Int32 is
+        case combine(first, second, reduction) of
+            when Left(left as why: CombineError) do
+                return reason(why);
+            when Right(right as made: NdArray[T]) do
+                destroyNdArray(made);
+                return 0;
+        end case;
+    end;
+
+    function testElementType(): Unit is
+        let f64: NdArray[Float64] := pair(1.0, 2.0);
+        let f32: NdArray[Float32] := pair(1.0, 2.0);
+        let i64: NdArray[Int64] := pair(1, 2);
+        let i32: NdArray[Int32] := pair(1, 2);
+        let n8: NdArray[Nat8] := pair(1, 2);
+        let flags: NdArray[Bool] := pair(true, false);
+        assertTrue(elementType(&f64) = 6, "Float64 is float64 of Sperli, 6");
+        assertTrue(elementType(&f32) = 5, "Float32 is float32 of Sperli, 5");
+        assertTrue(elementType(&i64) = 2, "Int64 is int64 of Sperli, 2");
+        assertTrue(elementType(&i32) = 1, "Int32 is int32 of Sperli, 1");
+        assertTrue(elementType(&n8) = 0, "Nat8 is plain bytes, 0");
+        assertTrue(elementType(&flags) = 0, "Bool is plain bytes, 0");
+        assertTrue((sperliCode(0) = 0) and (sperliCode(7) = 0) and (sperliCode(255) = 0), "a code of no Mirco type is plain bytes");
+        destroyNdArray(f64);
+        destroyNdArray(f32);
+        destroyNdArray(i64);
+        destroyNdArray(i32);
+        destroyNdArray(n8);
+        destroyNdArray(flags);
+        return nil;
+    end;
+
+    function testShape(): Unit is
+        let grid: NdArray[Int64] := counted(2, 3);
+        assertTrue(spanLength(shape(&grid)) = 2, "two axes");
+        assertTrue(twoBy(shape(&grid), 2, 3), "2 by 3");
+        assertTrue(not twoBy(shape(&grid), 3, 2), "not 3 by 2");
+        destroyNdArray(grid);
+        return nil;
+    end;
+
+    -- encode appends behind what out holds, the bytes of Mirco.Wire, and
+    -- decode gives the array back, for the two types added last as well.
+    function testEncodeAppendsAndDecodes(): Unit is
+        let values: NdArray[Float32] := pair(1.0, -0.5);
+        var out: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!out, 170);
+        let written: Index := encode(&values, &!out);
+        let wire: Buffer[Nat8] := wireEncode(&values);
+        assertTrue(written = length(&wire), "the count is that of the wire format");
+        assertTrue((length(&out) = (written + 1)) and (nth(&out, 0) = 170), "the byte before is kept");
+        var same: Bool := true;
+        var at: Index := 0;
+        while at < written do
+            if nth(&out, at + 1) /= nth(&wire, at) then
+                same := false;
+            end if;
+            at := at + 1;
+        end while;
+        assertTrue(same, "the bytes are those of the wire format");
+        let ints: NdArray[Int32] := pair(7, -9);
+        var more: Buffer[Nat8] := allocateEmpty();
+        let wrote_ints: Index := encode(&ints, &!more);
+        let got_ints: Either[WireError, NdArray[Int32]] := decode(wholeSpan(&more));
+        case got_ints of
+            when Right(right as back: NdArray[Int32]) do
+                assertTrue((rank(&back) = 1) and (flatGet(&back, 0) = 7) and (flatGet(&back, 1) = -9), "Int32 back");
+                destroyNdArray(back);
+            when Left(left as why: WireError) do
+                assertTrue(false, "Int32 decoded");
+        end case;
+        destroyFree(wire);
+        destroyFree(out);
+        destroyFree(more);
+        destroyNdArray(values);
+        destroyNdArray(ints);
+        return nil;
+    end;
+
+    -- decode refuses bytes that are cut, of another type, or a Bool other
+    -- than 0 or 1, as Mirco.Wire does.
+    function testDecodeRefuses(): Unit is
+        let ints: NdArray[Int32] := pair(1, 2);
+        var bytes: Buffer[Nat8] := allocateEmpty();
+        let written: Index := encode(&ints, &!bytes);
+        var cut: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!cut, nth(&bytes, 0));
+        insertBack(&!cut, nth(&bytes, 1));
+        let got_cut: Either[WireError, NdArray[Int32]] := decode(wholeSpan(&cut));
+        case got_cut of
+            when Left(left as why: WireError) do
+                assertTrue(wireReason(why) = 1, "two bytes refused as too short");
+            when Right(right as back: NdArray[Int32]) do
+                destroyNdArray(back);
+                assertTrue(false, "two bytes refused");
+        end case;
+        let got_other: Either[WireError, NdArray[Float32]] := decode(wholeSpan(&bytes));
+        case got_other of
+            when Left(left as why: WireError) do
+                assertTrue(wireReason(why) = 5, "Int32 bytes asked as Float32 refused as of another type");
+            when Right(right as back: NdArray[Float32]) do
+                destroyNdArray(back);
+                assertTrue(false, "Int32 bytes asked as Float32 refused");
+        end case;
+        let flags: NdArray[Bool] := pair(true, false);
+        var flag_bytes: Buffer[Nat8] := allocateEmpty();
+        let wrote_flags: Index := encode(&flags, &!flag_bytes);
+        var bad: Buffer[Nat8] := allocateEmpty();
+        var at: Index := 0;
+        while at < wrote_flags do
+            if at = (wrote_flags - 1) then
+                insertBack(&!bad, 2);
+            else
+                insertBack(&!bad, nth(&flag_bytes, at));
+            end if;
+            at := at + 1;
+        end while;
+        let got_bad: Either[WireError, NdArray[Bool]] := decode(wholeSpan(&bad));
+        case got_bad of
+            when Left(left as why: WireError) do
+                assertTrue(wireReason(why) = 10, "a Bool of 2 refused as no element");
+            when Right(right as back: NdArray[Bool]) do
+                destroyNdArray(back);
+                assertTrue(false, "a Bool of 2 refused");
+        end case;
+        destroyFree(bytes);
+        destroyFree(cut);
+        destroyFree(flag_bytes);
+        destroyFree(bad);
+        destroyNdArray(ints);
+        destroyNdArray(flags);
+        return nil;
+    end;
+
+    function testCombineVector(): Unit is
+        let a: NdArray[Int32] := pair(1, -2);
+        let b: NdArray[Int32] := pair(3, 4);
+        case combine(&a, &b, sumReduction()) of
+            when Right(right as summed: NdArray[Int32]) do
+                let bytes: Buffer[Nat8] := wireEncode(&summed);
+                let expected: Buffer[Nat8] := fromHex(vectorSumInt32());
+                assertTrue(sameBytes(&bytes, &expected), "the sum of [1, -2] and [3, 4] has the bytes of its vector");
+                destroyFree(bytes);
+                destroyFree(expected);
+                destroyNdArray(summed);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Int32 summed");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- combine keeps the shape and reduces element by element in row-major
+    -- order, for a matrix too, which Sperli sees as a flat array.
+    function testCombineKeepsShape(): Unit is
+        let a: NdArray[Int64] := counted(2, 3);
+        let b: NdArray[Int64] := counted(2, 3);
+        case combine(&a, &b, prodReduction()) of
+            when Right(right as squared: NdArray[Int64]) do
+                assertTrue(twoBy(shape(&squared), 2, 3), "the product is 2 by 3");
+                assertTrue((flatGet(&squared, 0) = 1) and (flatGet(&squared, 4) = 25) and (flatGet(&squared, 5) = 36), "1, ..., 25, 36");
+                destroyNdArray(squared);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Int64 multiplied");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- Within 0: min, max and sum of numbers exact in binary32 and binary64.
+    function testCombineFloats(): Unit is
+        let a: NdArray[Float64] := pair(1.5, -2.0);
+        let b: NdArray[Float64] := pair(0.25, 3.0);
+        case combine(&a, &b, maxReduction()) of
+            when Right(right as most: NdArray[Float64]) do
+                assertTrue((flatGet(&most, 0) = 1.5) and (flatGet(&most, 1) = 3.0), "max 1.5 and 3.0");
+                destroyNdArray(most);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Float64 max");
+        end case;
+        case combine(&a, &b, minReduction()) of
+            when Right(right as least: NdArray[Float64]) do
+                assertTrue((flatGet(&least, 0) = 0.25) and (flatGet(&least, 1) = -2.0), "min 0.25 and -2.0");
+                destroyNdArray(least);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Float64 min");
+        end case;
+        let c: NdArray[Float32] := pair(0.5, -1.25);
+        let d: NdArray[Float32] := pair(0.25, 4.0);
+        case combine(&c, &d, sumReduction()) of
+            when Right(right as summed: NdArray[Float32]) do
+                assertTrue((flatGet(&summed, 0) = 0.75) and (flatGet(&summed, 1) = 2.75), "Float32 sum 0.75 and 2.75");
+                destroyNdArray(summed);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Float32 summed");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(b);
+        destroyNdArray(c);
+        destroyNdArray(d);
+        return nil;
+    end;
+
+    -- Whole numbers wrap around at their width under the rules of Sperli.
+    function testCombineWraps(): Unit is
+        let a: NdArray[Int32] := pair(2147483647, -2147483648);
+        let b: NdArray[Int32] := pair(1, -1);
+        case combine(&a, &b, sumReduction()) of
+            when Right(right as summed: NdArray[Int32]) do
+                assertTrue((flatGet(&summed, 0) = -2147483648) and (flatGet(&summed, 1) = 2147483647), "the sum wraps at 32 bits");
+                destroyNdArray(summed);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Int32 summed with a wrap");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- Nat8 and Bool are plain bytes for Sperli: the bitwise operations
+    -- reduce them, sum, product and the logical ones are refused.
+    function testCombineBytes(): Unit is
+        let a: NdArray[Bool] := pair(true, false);
+        let b: NdArray[Bool] := pair(true, true);
+        case combine(&a, &b, borReduction()) of
+            when Right(right as either: NdArray[Bool]) do
+                assertTrue(flatGet(&either, 0) and flatGet(&either, 1), "true or true, false or true");
+                destroyNdArray(either);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Bool or");
+        end case;
+        assertTrue(refusal(&a, &b, sumReduction()) = 2, "a sum of Bool is refused");
+        assertTrue(refusal(&a, &b, landReduction()) = 2, "a logical and of plain bytes is refused");
+        let c: NdArray[Nat8] := pair(12, 255);
+        let d: NdArray[Nat8] := pair(10, 15);
+        case combine(&c, &d, bxorReduction()) of
+            when Right(right as flipped: NdArray[Nat8]) do
+                assertTrue((flatGet(&flipped, 0) = 6) and (flatGet(&flipped, 1) = 240), "12 xor 10 is 6, 255 xor 15 is 240");
+                destroyNdArray(flipped);
+            when Left(left as why: CombineError) do
+                assertTrue(false, "Nat8 xor");
+        end case;
+        assertTrue(refusal(&c, &d, sumReduction()) = 2, "a sum of Nat8 is refused");
+        destroyNdArray(a);
+        destroyNdArray(b);
+        destroyNdArray(c);
+        destroyNdArray(d);
+        return nil;
+    end;
+
+    function testCombineRefuses(): Unit is
+        let wide: NdArray[Int64] := counted(2, 3);
+        let tall: NdArray[Int64] := counted(3, 2);
+        let flat: NdArray[Int64] := counted(1, 6);
+        assertTrue(refusal(&wide, &tall, sumReduction()) = 1, "2 by 3 and 3 by 2 are of other shapes");
+        assertTrue(refusal(&wide, &flat, sumReduction()) = 1, "2 by 3 and 1 by 6 are of other shapes");
+        assertTrue(refusal(&wide, &wide, 0) = 2, "no reduction is refused");
+        assertTrue(refusal(&wide, &wide, 11) = 2, "an unknown reduction is refused");
+        assertTrue(refusal(&wide, &wide, 255) = 2, "the reduction 255 is refused");
+        let a: NdArray[Int64] := pair(1, 2);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 1);
+        var values: Buffer[Int64] := allocateEmpty();
+        insertBack(&!values, 1);
+        insertBack(&!values, 2);
+        let column: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        assertTrue(refusal(&a, &column, sumReduction()) = 1, "the shapes 2 and 2 by 1 are other shapes, nothing is broadcast");
+        destroyFree(shape);
+        destroyFree(values);
+        destroyNdArray(wide);
+        destroyNdArray(tall);
+        destroyNdArray(flat);
+        destroyNdArray(a);
+        destroyNdArray(column);
+        return nil;
+    end;
+end module body.

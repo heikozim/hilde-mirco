@@ -1,0 +1,313 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- XXH3 by its length: up to 16 bytes the input is mixed with a few words
+-- of the secret, up to 128 and up to 240 bytes pairs of words are folded
+-- with the secret, and above that eight accumulators take stripes of 64
+-- bytes and are scrambled after each block of 16 stripes.  A shift is a
+-- multiplication modulo 2^64 or a division; the product of 128 bits is
+-- made from four products of 32 bit quarters.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, nth, nthMut, storeNth);
+
+module body Mirco.Xxh3 is
+    constant prime32a: Nat64 := 2654435761;
+    constant prime32b: Nat64 := 2246822519;
+    constant prime32c: Nat64 := 3266489917;
+    constant prime64a: Nat64 := 11400714785074694791;
+    constant prime64b: Nat64 := 14029467366897019727;
+    constant prime64c: Nat64 := 1609587929392839161;
+    constant prime64d: Nat64 := 9650029242287828579;
+    constant prime64e: Nat64 := 2870177450012600261;
+    constant mixer1: Nat64 := 1609587791953885689;
+    constant mixer2: Nat64 := 11507291218515648293;
+    constant two_to32: Nat64 := 4294967296;
+    constant low_half: Nat64 := 4294967295;
+
+    -- The default secret, in hex.
+    constant secret_hex: Span[Nat8, Static] := "b8fe6c3923a44bbe7c01812cf721ad1cded46de9839097db7240a4a4b7b3671fcb79e64eccc0e578825ad07dccff7221b8084674f743248ee03590e6813a264c3c2852bb91c300cb88d0658b1b532ea371644897a20df94e3819ef46a9deacd8a8fa763fe39c343ff9dcbbc7c70b4f1d8a51e04bcdb45931c89f7ec9d9787364eac5ac8334d3ebc3c581a0fffa1363eb170ddd51b7f0da49d316552629d4689e2b16be587d47a1fc8ff8b8d17ad031ce45cb3a8f95160428afd7fbcabb4b407e";
+
+    function nat(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function count(n: Index): Nat64 is
+        case toNat64(n) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function nibble(c: Nat8): Nat64 is
+        if c >= 97 then
+            return nat(c) - 87;
+        end if;
+        return nat(c) - 48;
+    end;
+
+    -- n bytes of the secret from k on, little endian.
+    function secretWord(k: Index, n: Index): Nat64 is
+        let table: Span[Nat8, Static] := secret_hex;
+        var v: Nat64 := 0;
+        var i: Index := n;
+        while i > 0 do
+            let at: Index := 2 * ((k + i) - 1);
+            v := (v * 256) + ((nibble(table[at]) * 16) + nibble(table[at + 1]));
+            i := i - 1;
+        end while;
+        return v;
+    end;
+
+    function key(k: Index): Nat64 is
+        return secretWord(k, 8);
+    end;
+
+    -- n bytes of data from at on, little endian.
+    generic [R: Region]
+    function word(data: Span[Nat8, R], at: Index, n: Index): Nat64 is
+        var v: Nat64 := 0;
+        var i: Index := n;
+        while i > 0 do
+            v := (v * 256) + nat(data[(at + i) - 1]);
+            i := i - 1;
+        end while;
+        return v;
+    end;
+
+    function twoTo(k: Nat64): Nat64 is
+        var value: Nat64 := 1;
+        var i: Nat64 := 0;
+        while i < k do
+            value := value * 2;
+            i := i + 1;
+        end while;
+        return value;
+    end;
+
+    function rotateLeft(x: Nat64, r: Nat64): Nat64 is
+        return bitwiseOr(modularMultiply(x, twoTo(r)), x / twoTo(64 - r));
+    end;
+
+    function swapBytes(x: Nat64): Nat64 is
+        var rest: Nat64 := x;
+        var out: Nat64 := 0;
+        var i: Index := 0;
+        while i < 8 do
+            out := (out * 256) + rem(rest, 256);
+            rest := rest / 256;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- The low and the high half of the product of a and b, joined by xor.
+    function fold(a: Nat64, b: Nat64): Nat64 is
+        let a0: Nat64 := bitwiseAnd(a, low_half);
+        let a1: Nat64 := a / two_to32;
+        let b0: Nat64 := bitwiseAnd(b, low_half);
+        let b1: Nat64 := b / two_to32;
+        let p00: Nat64 := a0 * b0;
+        let p01: Nat64 := a0 * b1;
+        let p10: Nat64 := a1 * b0;
+        let p11: Nat64 := a1 * b1;
+        let middle: Nat64 := (p00 / two_to32) + bitwiseAnd(p01, low_half) + bitwiseAnd(p10, low_half);
+        let low: Nat64 := modularAdd(bitwiseAnd(p00, low_half), modularMultiply(middle, two_to32));
+        let high: Nat64 := p11 + (p01 / two_to32) + (p10 / two_to32) + (middle / two_to32);
+        return bitwiseXor(low, high);
+    end;
+
+    function avalanche64(x: Nat64): Nat64 is
+        var h: Nat64 := bitwiseXor(x, x / twoTo(33));
+        h := modularMultiply(h, prime64b);
+        h := bitwiseXor(h, h / twoTo(29));
+        h := modularMultiply(h, prime64c);
+        return bitwiseXor(h, h / twoTo(32));
+    end;
+
+    function avalanche3(x: Nat64): Nat64 is
+        var h: Nat64 := bitwiseXor(x, x / twoTo(37));
+        h := modularMultiply(h, mixer1);
+        return bitwiseXor(h, h / twoTo(32));
+    end;
+
+    function rrmxmx(x: Nat64, n: Index): Nat64 is
+        var h: Nat64 := bitwiseXor(x, bitwiseXor(rotateLeft(x, 49), rotateLeft(x, 24)));
+        h := modularMultiply(h, mixer2);
+        h := bitwiseXor(h, (h / twoTo(35)) + count(n));
+        h := modularMultiply(h, mixer2);
+        return bitwiseXor(h, h / twoTo(28));
+    end;
+
+    -- Sixteen bytes of data from at, folded with sixteen of the secret from k.
+    generic [R: Region]
+    function mix16(data: Span[Nat8, R], at: Index, k: Index): Nat64 is
+        let low: Nat64 := bitwiseXor(word(data, at, 8), key(k));
+        let high: Nat64 := bitwiseXor(word(data, at + 8, 8), key(k + 8));
+        return fold(low, high);
+    end;
+
+    generic [R: Region]
+    function upTo16(data: Span[Nat8, R], n: Index): Nat64 is
+        if n = 0 then
+            return avalanche64(bitwiseXor(key(56), key(64)));
+        end if;
+        if n <= 3 then
+            let c1: Nat64 := nat(data[0]);
+            let c2: Nat64 := nat(data[n / 2]);
+            let c3: Nat64 := nat(data[n - 1]);
+            let combined: Nat64 := (c1 * 65536) + (c2 * 16777216) + c3 + (count(n) * 256);
+            let flip3: Nat64 := bitwiseXor(secretWord(0, 4), secretWord(4, 4));
+            return avalanche64(bitwiseXor(combined, flip3));
+        end if;
+        if n <= 8 then
+            let first: Nat64 := word(data, 0, 4);
+            let second: Nat64 := word(data, n - 4, 4);
+            let flip8: Nat64 := bitwiseXor(key(8), key(16));
+            return rrmxmx(bitwiseXor(second + (first * two_to32), flip8), n);
+        end if;
+        let low: Nat64 := bitwiseXor(word(data, 0, 8), bitwiseXor(key(24), key(32)));
+        let high: Nat64 := bitwiseXor(word(data, n - 8, 8), bitwiseXor(key(40), key(48)));
+        let acc: Nat64 := modularAdd(modularAdd(count(n), swapBytes(low)), modularAdd(high, fold(low, high)));
+        return avalanche3(acc);
+    end;
+
+    generic [R: Region]
+    function upTo128(data: Span[Nat8, R], n: Index): Nat64 is
+        var acc: Nat64 := modularMultiply(count(n), prime64a);
+        if n > 32 then
+            if n > 64 then
+                if n > 96 then
+                    acc := modularAdd(acc, mix16(data, 48, 96));
+                    acc := modularAdd(acc, mix16(data, n - 64, 112));
+                end if;
+                acc := modularAdd(acc, mix16(data, 32, 64));
+                acc := modularAdd(acc, mix16(data, n - 48, 80));
+            end if;
+            acc := modularAdd(acc, mix16(data, 16, 32));
+            acc := modularAdd(acc, mix16(data, n - 32, 48));
+        end if;
+        acc := modularAdd(acc, mix16(data, 0, 0));
+        acc := modularAdd(acc, mix16(data, n - 16, 16));
+        return avalanche3(acc);
+    end;
+
+    generic [R: Region]
+    function upTo240(data: Span[Nat8, R], n: Index): Nat64 is
+        var acc: Nat64 := modularMultiply(count(n), prime64a);
+        var i: Index := 0;
+        while i < 8 do
+            acc := modularAdd(acc, mix16(data, 16 * i, 16 * i));
+            i := i + 1;
+        end while;
+        var tail: Nat64 := mix16(data, n - 16, 119);
+        acc := avalanche3(acc);
+        let rounds: Index := n / 16;
+        i := 8;
+        while i < rounds do
+            tail := modularAdd(tail, mix16(data, 16 * i, (16 * (i - 8)) + 3));
+            i := i + 1;
+        end while;
+        return avalanche3(modularAdd(acc, tail));
+    end;
+
+    -- One stripe of 64 bytes from at into the accumulators, with the
+    -- secret from k: each lane is added to its neighbour, and the product
+    -- of the halves of the lane keyed by the secret to its own.
+    generic [R: Region, S: Region]
+    function stripe(data: Span[Nat8, R], at: Index, k: Index, acc: &![Buffer[Nat64], S]): Unit is
+        var i: Index := 0;
+        while i < 8 do
+            let value: Nat64 := word(data, at + (8 * i), 8);
+            let keyed: Nat64 := bitwiseXor(value, key(k + (8 * i)));
+            var partner: Index := i + 1;
+            if rem(i, 2) = 1 then
+                partner := i - 1;
+            end if;
+            let other: Nat64 := nthMut(&~acc, partner);
+            storeNth(&~acc, partner, modularAdd(other, value));
+            let own: Nat64 := nthMut(&~acc, i);
+            storeNth(&~acc, i, modularAdd(own, bitwiseAnd(keyed, low_half) * (keyed / two_to32)));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function stripes(data: Span[Nat8, R], at: Index, n: Index, acc: &![Buffer[Nat64], S]): Unit is
+        var s: Index := 0;
+        while s < n do
+            stripe(data, at + (64 * s), 8 * s, &~acc);
+            s := s + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [S: Region]
+    function scramble(acc: &![Buffer[Nat64], S]): Unit is
+        var i: Index := 0;
+        while i < 8 do
+            var a: Nat64 := nthMut(&~acc, i);
+            a := bitwiseXor(a, a / twoTo(47));
+            a := bitwiseXor(a, key(128 + (8 * i)));
+            storeNth(&~acc, i, modularMultiply(a, prime32a));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function above240(data: Span[Nat8, R], n: Index): Nat64 is
+        var acc: Buffer[Nat64] := allocateEmpty();
+        insertBack(&!acc, prime32c);
+        insertBack(&!acc, prime64a);
+        insertBack(&!acc, prime64b);
+        insertBack(&!acc, prime64c);
+        insertBack(&!acc, prime64d);
+        insertBack(&!acc, prime32b);
+        insertBack(&!acc, prime64e);
+        insertBack(&!acc, prime32a);
+        let blocks: Index := (n - 1) / 1024;
+        var b: Index := 0;
+        while b < blocks do
+            stripes(data, b * 1024, 16, &!acc);
+            scramble(&!acc);
+            b := b + 1;
+        end while;
+        let last: Index := ((n - 1) - (blocks * 1024)) / 64;
+        stripes(data, blocks * 1024, last, &!acc);
+        stripe(data, n - 64, 121, &!acc);
+        var result: Nat64 := modularMultiply(count(n), prime64a);
+        var i: Index := 0;
+        while i < 4 do
+            let a0: Nat64 := nth(&acc, 2 * i);
+            let a1: Nat64 := nth(&acc, (2 * i) + 1);
+            result := modularAdd(result, fold(bitwiseXor(a0, key(11 + (16 * i))), bitwiseXor(a1, key(19 + (16 * i)))));
+            i := i + 1;
+        end while;
+        destroyFree(acc);
+        return avalanche3(result);
+    end;
+
+    generic [R: Region]
+    function xxh3(data: Span[Nat8, R]): Nat64 is
+        let n: Index := spanLength(data);
+        if n <= 16 then
+            return upTo16(data, n);
+        else if n <= 128 then
+            return upTo128(data, n);
+        else if n <= 240 then
+            return upTo240(data, n);
+        end if;
+        return above240(data, n);
+    end;
+end module body.

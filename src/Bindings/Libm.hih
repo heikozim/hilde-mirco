@@ -1,0 +1,95 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the functions of the C mathematics library on binary64 numbers.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.Math is the safe module built on it, and the one a programme imports.
+- Each function is the one of C with the same meaning, on double.
+
+    let root: Float64 := squareRoot(2.0);
+"""
+module Mirco.Bindings.Libm is
+    """
+    The square root, sqrt of C.
+    No contract: a binding to C; its caller Mirco.Math.squareRoot states the contract.
+    """
+    function squareRoot(x: Float64): Float64;
+
+    """
+    e to the power of x, exp of C.
+    No contract: a binding to C; its caller Mirco.Math.exponential states the contract.
+    """
+    function exponential(x: Float64): Float64;
+
+    """
+    The natural logarithm, log of C.
+    No contract: a binding to C; its caller Mirco.Math.logarithm states the contract.
+    """
+    function logarithm(x: Float64): Float64;
+
+    """
+    The natural logarithm of 1 + x, exact for a small x, log1p of C.
+    No contract: a binding to C; its caller Mirco.Math.logarithmOnePlus states the contract.
+    """
+    function logarithmOnePlus(x: Float64): Float64;
+
+    """
+    The logarithm to base 10, log10 of C.
+    No contract: a binding to C; its caller Mirco.Math.logarithm10 states the contract.
+    """
+    function logarithm10(x: Float64): Float64;
+
+    """
+    base to the power of exponent, pow of C.
+    No contract: no precondition, since C defines pow for every pair of binary64 numbers, and Mirco.Math.power has none either.
+    """
+    function power(base: Float64, exponent: Float64): Float64;
+
+    """
+    The sine of an angle in radians, sin of C.
+    No contract: a binding to C; its caller Mirco.Math.sine states the contract.
+    """
+    function sine(x: Float64): Float64;
+
+    """
+    The cosine of an angle in radians, cos of C.
+    No contract: a binding to C; its caller Mirco.Math.cosine states the contract.
+    """
+    function cosine(x: Float64): Float64;
+
+    """
+    The tangent of an angle in radians, tan of C.
+    No contract: no precondition, since C defines tan for every binary64 number, and Mirco.Math.tangent has none either.
+    """
+    function tangent(x: Float64): Float64;
+
+    """
+    The angle of the point x, y in radians, atan2 of C.
+    No contract: a binding to C; its caller Mirco.Math.arcTangent2 states the contract.
+    """
+    function arcTangent2(y: Float64, x: Float64): Float64;
+
+    """
+    The largest whole number not above x, floor of C.
+    No contract: a binding to C; its caller Mirco.Math.floor states the contract.
+    """
+    function floor(x: Float64): Float64;
+
+    """
+    The smallest whole number not below x, ceil of C.
+    No contract: a binding to C; its caller Mirco.Math.ceiling states the contract.
+    """
+    function ceiling(x: Float64): Float64;
+
+    """
+    The absolute value, fabs of C.
+    No contract: a binding to C; its caller Mirco.Math.absolute states the contract.
+    """
+    function absolute(x: Float64): Float64;
+end module.

@@ -1,0 +1,300 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The n-dimensional array of Mirco: an owning array of elements in row-major order, and views of it that borrow it.
+
+Mirco stands for Matrices, Interpolation, Random numbers, Calculus, Optimization.
+
+- Rank 1 to 32; every dimension at least 1; the count of elements fits an Index or the array is refused.
+- An owning array is linear and holds its elements contiguously; its element type is one of Mirco.Element.
+- A view borrows the array it reads, with its own offset, shape and strides; slicing a view copies no element.
+- Broadcasting follows NumPy: shapes are aligned at their last axis, and two dimensions fit when they are equal or one of them is 1.
+- An index outside a dimension stops the programme with a message.
+
+    let grid: NdArray[Float64] := zeros(wholeSpan(&dims));
+"""
+import Standard.Buffer (Buffer);
+import Mirco.Element (Element, knownCode);
+
+module Mirco.Array is
+    """
+    An owning array.  Linear: it is given back with destroyNdArray.
+    """
+    type NdArray[T: Free]: Linear;
+
+    """
+    A view of an owning array, alive while the borrow of the array lasts.
+    Linear: it is given back with destroyView.
+    """
+    type View[T: Free, R: Region]: Linear;
+
+    """
+    The highest rank an array may have.
+    """
+    function maximumRank(): Index
+        ensures result = 32;
+
+    """
+    The count of elements of an array of shape: the product of its dimensions, at least 1 for a valid shape.
+    Stops the programme when the product does not fit an Index.
+    """
+    generic [R: Region]
+    function shapeCount(shape: Span[Index, R]): Index
+        requires spanLength(shape) <= 32
+        ensures (not validShape(shape)) or (result >= 1);
+
+    """
+    Whether shape is the shape of an array: rank 1 to 32 and every dimension at least 1.
+    """
+    generic [R: Region]
+    function validShape(shape: Span[Index, R]): Bool
+        ensures (not result) or ((spanLength(shape) >= 1) and (spanLength(shape) <= 32));
+
+    """
+    A new array of shape, every element the zero of its type.
+    """
+    generic [T: Free(Element), R: Region]
+    function zeros(shape: Span[Index, R]): NdArray[T]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape)
+        ensures (rank(&result) = spanLength(shape)) and (count(&result) = shapeCount(shape));
+
+    """
+    A new array of shape, every element value.
+    """
+    generic [T: Free(Element), R: Region]
+    function filled(shape: Span[Index, R], value: T): NdArray[T]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape)
+        ensures (rank(&result) = spanLength(shape)) and (count(&result) = shapeCount(shape));
+
+    """
+    A new array of shape whose elements are values, in row-major order.
+    """
+    generic [T: Free(Element), R: Region, S: Region]
+    function fromSpan(shape: Span[Index, R], values: Span[T, S]): NdArray[T]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape) and (spanLength(values) = shapeCount(shape))
+        ensures (count(&result) = spanLength(values)) and (rank(&result) = spanLength(shape));
+
+    """
+    Gives the array back.
+    No contract: a destroy function.
+    """
+    generic [T: Free]
+    function destroyNdArray(array: NdArray[T]): Unit;
+
+    """
+    The count of axes.
+    """
+    generic [T: Free, R: Region]
+    function rank(array: &[NdArray[T], R]): Index
+        ensures (result >= 1) and (result <= 32);
+
+    """
+    The count of axes, read through a write reference.
+    """
+    generic [T: Free, R: Region]
+    function rankMut(array: &![NdArray[T], R]): Index
+        ensures (result >= 1) and (result <= 32);
+
+    """
+    The length of axis; it reads no buffer, so a condition calls it.
+    """
+    generic [T: Free, R: Region]
+    function dimension(array: &[NdArray[T], R], axis: Index): Index
+        requires axis < rank(array)
+        ensures result >= 1;
+
+    """
+    The count of elements.
+    """
+    generic [T: Free, R: Region]
+    function count(array: &[NdArray[T], R]): Index
+        ensures result >= 1;
+
+    """
+    The count of elements, read through a write reference.
+    """
+    generic [T: Free, R: Region]
+    function countMut(array: &![NdArray[T], R]): Index
+        ensures result >= 1;
+
+    """
+    The code of the element type, as Mirco.Element names it.
+    """
+    generic [T: Free(Element), R: Region]
+    function dtypeCode(array: &[NdArray[T], R]): Nat8
+        ensures knownCode(result);
+
+    """
+    The length of every axis, borrowed.
+    """
+    generic [T: Free, R: Region]
+    function shapeOf(array: &[NdArray[T], R]): Span[Index, R]
+        ensures spanLength(result) = rank(array);
+
+    """
+    Whether index is a position inside shape: as many positions as axes, each below the length of its axis.
+    """
+    generic [R: Region, S: Region]
+    function insideShape(shape: Span[Index, R], index: Span[Index, S]): Bool
+        ensures (not result) or (spanLength(index) = spanLength(shape));
+
+    """
+    Whether index is a position inside the array: as many positions as axes, each below the length of its axis.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function insideArray(array: &[NdArray[T], R], index: Span[Index, S]): Bool
+        ensures (not result) or (spanLength(index) = rank(array));
+
+    """
+    The element at index, one position for each axis, each below the length of its axis.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function get(array: &[NdArray[T], R], index: Span[Index, S]): T
+        requires (spanLength(index) = rank(array)) and insideArray(array, index);
+
+    """
+    Stores value at index, one position for each axis, each below the length of its axis.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function set(array: &![NdArray[T], R], index: Span[Index, S], value: T): Unit
+        requires (spanLength(index) = rank(&array)) and insideArray(&array, index)
+        ensures count(&array) = old(count(&array));
+
+    """
+    The element at the position at in row-major order.
+    """
+    generic [T: Free, R: Region]
+    function flatGet(array: &[NdArray[T], R], at: Index): T
+        requires at < count(array);
+
+    """
+    The element at the position at in row-major order, read through a write reference.
+    """
+    generic [T: Free, R: Region]
+    function flatGetMut(array: &![NdArray[T], R], at: Index): T
+        requires at < count(&array);
+
+    """
+    Stores value at the position at in row-major order.
+    """
+    generic [T: Free, R: Region]
+    function flatSet(array: &![NdArray[T], R], at: Index, value: T): Unit
+        requires at < count(&array);
+
+    """
+    The elements in row-major order, borrowed.
+    """
+    generic [T: Free, R: Region]
+    function elements(array: &[NdArray[T], R]): Span[T, R]
+        ensures spanLength(result) = count(array);
+
+    """
+    The same elements under shape, which has the same count; the requires reads the count of the array before the call consumes it.
+    """
+    generic [T: Free, R: Region]
+    function reshape(array: NdArray[T], shape: Span[Index, R]): NdArray[T]
+        requires (spanLength(shape) >= 1) and (spanLength(shape) <= 32) and validShape(shape) and (count(&array) = shapeCount(shape))
+        ensures (rank(&result) = spanLength(shape)) and (count(&result) = shapeCount(shape));
+
+    """
+    A view of the whole array; it shows every element, so viewCount(&result) = count(array) as well.
+    No contract: that equality of the counts cannot be an ensures, since viewCount reaches C (viewCount -> Standard.Buffer.wholeSpan -> Hilde.Array.arrayWholeSpan -> @embed) (H3098).
+    """
+    generic [T: Free, R: Region]
+    function view(array: &[NdArray[T], R]): View[T, R]
+        ensures viewRank(&result) = rank(array);
+
+    """
+    Gives the view back; the array it read stays.
+    No contract: a destroy function.
+    """
+    generic [T: Free, R: Region]
+    function destroyView(shown: View[T, R]): Unit;
+
+    """
+    The count of axes of the view.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function viewRank(shown: &[View[T, R], S]): Index
+        ensures (result >= 1) and (result <= 32);
+
+    """
+    The length of axis of the view; it reads no buffer, so a condition calls it.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function viewDimension(shown: &[View[T, R], S], axis: Index): Index
+        requires axis < viewRank(shown)
+        ensures result >= 1;
+
+    """
+    The count of elements the view shows.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function viewCount(shown: &[View[T, R], S]): Index
+        ensures result >= 1;
+
+    """
+    The length of every axis of the view, borrowed.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function viewShapeOf(shown: &[View[T, R], S]): Span[Index, S]
+        ensures spanLength(result) = viewRank(shown);
+
+    """
+    Whether index is a position inside the view: as many positions as axes of the view, each below the length of its axis.
+    """
+    generic [T: Free, R: Region, S: Region, Q: Region]
+    function insideView(shown: &[View[T, R], S], index: Span[Index, Q]): Bool
+        ensures (not result) or (spanLength(index) = viewRank(shown));
+
+    """
+    The element of the array the view shows at index, one position for each axis of the view, each below the
+    length of its axis.
+    """
+    generic [T: Free, R: Region, S: Region, Q: Region]
+    function viewGet(shown: &[View[T, R], S], index: Span[Index, Q]): T
+        requires (spanLength(index) = viewRank(shown)) and insideView(shown, index);
+
+    """
+    A view of the positions start, start + step, ... below stop of axis; no element is copied.
+    stop is at most the length of axis; the axis of the result has the length (stop - start) / step, rounded up.
+    """
+    generic [T: Free, R: Region, S: Region]
+    function slice(shown: &[View[T, R], S], axis: Index, start: Index, stop: Index, step: Index): View[T, R]
+        requires (axis < viewRank(shown)) and (start < stop) and (step >= 1) and (stop <= viewDimension(shown, axis))
+        ensures (viewRank(&result) = viewRank(shown)) and (viewDimension(&result, axis) = (((stop - start) + (step - 1)) / step));
+
+    """
+    A new owning array with the elements the view shows, in row-major order of the view, so count(&result) = viewCount(shown) as well.
+    No contract: that equality of the counts cannot be an ensures, since viewCount reaches C, the chain of view (H3098).
+    """
+    generic [T: Free(Element), R: Region, S: Region]
+    function copyView(shown: &[View[T, R], S]): NdArray[T]
+        ensures rank(&result) = viewRank(shown);
+
+    """
+    Whether two shapes broadcast against each other under NumPy's rules.
+    No contract: no precondition, since any two spans broadcast or not; the result is the property itself.
+    """
+    generic [R: Region, S: Region]
+    function broadcastable(a: Span[Index, R], b: Span[Index, S]): Bool;
+
+    """
+    The shape two shapes broadcast to: the longer rank, each axis the larger of the two where one is 1.
+    No contract: no precondition, since two shapes that do not broadcast give None.
+    """
+    generic [R: Region, S: Region]
+    function broadcastShape(a: Span[Index, R], b: Span[Index, S]): Option[Buffer[Index]];
+
+    """
+    A view of the same elements under shape: an axis of length 1, or one the view does not have, repeats with stride 0.
+    No contract: no precondition, since a shape the view does not broadcast to gives None.
+    """
+    generic [T: Free, R: Region, S: Region, Q: Region]
+    function broadcastTo(shown: &[View[T, R], S], shape: Span[Index, Q]): Option[View[T, R]];
+end module.

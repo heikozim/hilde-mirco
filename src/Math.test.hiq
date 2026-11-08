@@ -1,0 +1,220 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Math (
+    pi,
+    euler,
+    isFinite,
+    isNaN,
+    squareRoot,
+    exponential,
+    logarithm,
+    logarithmOnePlus,
+    logarithm10,
+    power,
+    sine,
+    cosine,
+    tangent,
+    arcTangent2,
+    floor,
+    ceiling,
+    absolute
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Math.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, words, words);
+    end;
+
+    -- Whether the child for word stopped with the message of a violated
+    -- requires of name, as " of Mirco.Math.squareRoot (": the message names the
+    -- function whose requires failed, so a requires of a function the body
+    -- calls does not count.
+    function refusedByRequiresOf(test: Span[Nat8, Static], word: Span[Nat8, Static], name: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, "contract violated: the requires", name);
+    end;
+
+    -- Whether the child for word stopped with an exit other than 0 and both
+    -- words and also on its standard error.
+    function refusedInChildWith(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static], also: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words) and contains(asSpan(&text), also);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- True when a and b differ by less than tolerance.
+    function near(a: Float64, b: Float64, tolerance: Float64): Bool is
+        return absolute(a - b) < tolerance;
+    end;
+
+    function testRootsAndPowers(): Unit is
+        assertTrue(squareRoot(16.0) = 4.0, "the root of 16");
+        assertTrue(near(squareRoot(2.0) * squareRoot(2.0), 2.0, 0.000000000001), "root 2 squared");
+        assertTrue(power(2.0, 10.0) = 1024.0, "2 to the 10");
+        assertTrue(near(exponential(1.0), euler(), 0.000000000001), "e to the 1");
+        assertTrue(near(logarithm(euler()), 1.0, 0.000000000001), "log of e");
+        assertTrue(near(logarithm10(1000.0), 3.0, 0.000000000001), "log10 of 1000");
+        assertTrue(exponential(0.0) = 1.0, "e to the 0");
+        return nil;
+    end;
+
+    function testAngles(): Unit is
+        assertTrue(near(sine(pi() / 2.0), 1.0, 0.000000000001), "sine of a right angle");
+        assertTrue(near(cosine(pi()), -1.0, 0.000000000001), "cosine of pi");
+        assertTrue(near(tangent(pi() / 4.0), 1.0, 0.000000000001), "tangent of 45 degrees");
+        assertTrue(near(arcTangent2(1.0, -1.0), (3.0 * pi()) / 4.0, 0.000000000001), "the second quadrant");
+        return nil;
+    end;
+
+    function testRounding(): Unit is
+        assertTrue(floor(-1.5) = -2.0, "floor goes down");
+        assertTrue(ceiling(-1.5) = -1.0, "ceiling goes up");
+        assertTrue(absolute(-3.25) = 3.25, "absolute value");
+        assertTrue(floor(2.0) = 2.0, "floor of a whole number");
+        assertTrue(ceiling(2.0) = 2.0, "ceiling of a whole number");
+        assertTrue(floor(2.999) = 2.0, "floor just below 3");
+        assertTrue(ceiling(-2.999) = -2.0, "ceiling just above -3");
+        assertTrue(absolute(0.0) = 0.0, "absolute value of 0");
+        assertTrue(absolute(-0.0) = 0.0, "absolute value of -0");
+        -- x - result rounds to 1.0 exactly for an x this close to 0.
+        let tiny: Float64 := 0.000000000000000001;
+        assertTrue(floor(0.0 - tiny) = -1.0, "floor just below 0");
+        assertTrue(ceiling(tiny) = 1.0, "ceiling just above 0");
+        return nil;
+    end;
+
+    -- A NaN as the power of -1 to one half, which has no real value, and
+    -- an infinity as e to the 1000, past the largest binary64.
+    function testNaNAndInfinity(): Unit is
+        let nan: Float64 := power(-1.0, 0.5);
+        let infinity: Float64 := exponential(1000.0);
+        assertTrue(nan /= nan, "the power of -1 to one half is a NaN");
+        assertTrue((infinity = infinity) and (infinity > 1000000.0) and (not isFinite(infinity)), "e to the 1000 is an infinity, no NaN");
+        assertTrue(isNaN(nan), "a NaN is one");
+        assertTrue(not isNaN(1.0), "one is no NaN");
+        assertTrue(isFinite(1.0), "one is finite");
+        assertTrue(not isFinite(infinity), "an infinity is not finite");
+        assertTrue(not isFinite(nan), "a NaN is not finite");
+        assertTrue(isNaN(squareRoot(nan)), "the root of a NaN");
+        assertTrue(isNaN(sine(infinity)), "the sine of an infinity");
+        assertTrue(isNaN(logarithm(nan)), "a NaN is in the domain of the logarithm");
+        assertTrue(logarithmOnePlus(0.0) = 0.0, "the logarithm of 1 + 0");
+        assertTrue(floor(infinity) = infinity, "the floor of an infinity");
+        assertTrue(ceiling(0.0 - infinity) = (0.0 - infinity), "the ceiling of minus an infinity");
+        assertTrue(absolute(0.0 - infinity) = infinity, "the absolute value of minus an infinity");
+        assertTrue(isNaN(floor(nan)) and isNaN(ceiling(nan)) and isNaN(absolute(nan)), "rounding a NaN gives a NaN");
+        return nil;
+    end;
+
+    -- A value outside the domain of a root or a logarithm is refused by
+    -- the requires: each call runs in a child of its own, which must stop
+    -- with the message of a violated requires; the edge of each domain is
+    -- taken in a child too, and a child that calls nothing is not refused.
+    function testOutsideTheDomainIsRefused(): Unit is
+        if asChild("squareRoot") then
+            let r: Float64 := squareRoot(-1.0);
+            return nil;
+        end if;
+        if asChild("logarithm") then
+            let r: Float64 := logarithm(0.0);
+            return nil;
+        end if;
+        if asChild("logarithmOnePlus") then
+            let r: Float64 := logarithmOnePlus(-1.0);
+            return nil;
+        end if;
+        if asChild("logarithm10") then
+            let r: Float64 := logarithm10(-2.0);
+            return nil;
+        end if;
+        if asChild("edges") then
+            let a: Float64 := squareRoot(0.0);
+            let b: Float64 := logarithm(0.5);
+            let c: Float64 := logarithmOnePlus(-0.5);
+            let d: Float64 := logarithm10(0.5);
+            return nil;
+        end if;
+        if asChild("nothing") then
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testOutsideTheDomainIsRefused", "squareRoot", " of Mirco.Math.squareRoot ("), "the root of -1 is refused");
+        assertTrue(refusedByRequiresOf("testOutsideTheDomainIsRefused", "logarithm", " of Mirco.Math.logarithm ("), "the logarithm of 0 is refused");
+        assertTrue(refusedByRequiresOf("testOutsideTheDomainIsRefused", "logarithmOnePlus", " of Mirco.Math.logarithmOnePlus ("), "the logarithm of 1 + -1 is refused");
+        assertTrue(refusedByRequiresOf("testOutsideTheDomainIsRefused", "logarithm10", " of Mirco.Math.logarithm10 ("), "the logarithm to base 10 of -2 is refused");
+        assertTrue(not refusedInChild("testOutsideTheDomainIsRefused", "edges", "contract violated"), "0 for the root, 0.5 and -0.5 for the logarithms are taken");
+        assertTrue(not refusedInChild("testOutsideTheDomainIsRefused", "nothing", "contract violated"), "a child that calls nothing is not refused");
+        return nil;
+    end;
+end module body.

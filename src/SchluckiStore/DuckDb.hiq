@@ -1,0 +1,370 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The five slots of Mirco.SchluckiStore for DuckDB, and the three calls
+-- this module offers on its own.  The handles are those of
+-- Mirco.Bindings.DuckDB, the unsafe binding below the safe layer; no other
+-- module of the package reaches them.
+import Standard.Buffer (Buffer, initialize, destroyFree, getSpanMut, wholeSpan);
+import Mirco.SchluckiStore (
+    StoreError,
+    DuckHandles,
+    cannotOpen,
+    fileHeld,
+    libraryTooOld,
+    statementFailed,
+    wrongColumns,
+    wrongParameters
+);
+import Mirco.Schlucki (
+    Table,
+    Rows,
+    rowCount,
+    columnCount,
+    columnKind,
+    floatAt,
+    intAt,
+    textAt,
+    boolAt,
+    rowsFor,
+    putFloat,
+    putInt,
+    putText,
+    putBool,
+    finishRows,
+    destroyTable
+);
+import Mirco.Bindings.DuckDB (
+    Opened,
+    openSafe,
+    closeSafe,
+    openDone,
+    fileHeld as duckFileHeld,
+    libraryTooOld as duckTooOld,
+    zeroFree,
+    run,
+    query,
+    resultFailure,
+    resultColumns,
+    isIntColumn,
+    isFloatColumn,
+    isTextColumn,
+    isBoolColumn,
+    nextChunk,
+    chunkRows,
+    destroyChunk,
+    destroyResult,
+    cellValid,
+    cellFloat,
+    cellInt,
+    cellBool,
+    cellTextLength,
+    cellText,
+    Appending,
+    appendDone,
+    insertColumns,
+    openAppender,
+    appendFloat,
+    appendInt,
+    appendBool,
+    appendText,
+    appendNull,
+    endRow,
+    flushAppender,
+    dropAppender
+);
+
+module body Mirco.SchluckiStore.DuckDb is
+    function backendDuckDb(): Nat8 is
+        return 2;
+    end;
+
+    function storeError(code: Int32, detail: Int32): StoreError is
+        return StoreError(code => code, detail => detail);
+    end;
+
+    function columnNumber(c: Index): Int32 is
+        case toInt32(c) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Mirco.SchluckiStore.DuckDb: a column number above the range of Int32");
+        end case;
+    end;
+
+    ---
+    --- The slots
+    ---
+
+    pragma Implements(Name => "Mirco.SchluckiStore.duckOpen");
+    generic [R: Region]
+    function slotOpen(path: Span[Nat8, R], writable: Bool): Either[StoreError, DuckHandles] is
+        let opened: Opened := openSafe(path, not writable);
+        if opened.failure = openDone() then
+            return Right(right => DuckHandles(database => opened.database, connection => opened.connection));
+        end if;
+        if opened.failure = duckFileHeld() then
+            return Left(left => storeError(fileHeld(), opened.failure));
+        end if;
+        if opened.failure = duckTooOld() then
+            return Left(left => storeError(libraryTooOld(), opened.failure));
+        end if;
+        return Left(left => storeError(cannotOpen(), opened.failure));
+    end;
+
+    pragma Implements(Name => "Mirco.SchluckiStore.duckCreate");
+    function slotCreate(connection: Nat64, sql: Span[Nat8, Static]): Either[StoreError, Unit] is
+        if not zeroFree(sql) then
+            return Left(left => storeError(statementFailed(), 0));
+        end if;
+        let failure: Int32 := run(connection, sql);
+        if failure /= 0 then
+            return Left(left => storeError(statementFailed(), failure - 1));
+        end if;
+        return Right(right => nil);
+    end;
+
+    pragma Implements(Name => "Mirco.SchluckiStore.duckScan");
+    generic [S: Region]
+    function slotScan(connection: Nat64, sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        return scanRows(connection, sql, kinds);
+    end;
+
+    pragma Implements(Name => "Mirco.SchluckiStore.duckAppend");
+    generic [S: Region]
+    function slotAppend(connection: Nat64, sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64] is
+        return appendRows(connection, sql, t);
+    end;
+
+    pragma Implements(Name => "Mirco.SchluckiStore.duckClose");
+    function slotClose(database: Nat64, connection: Nat64): Unit is
+        closeSafe(database, connection);
+        return nil;
+    end;
+
+    ---
+    --- The calls of this module
+    ---
+
+    function openHandles(path: Span[Nat8, Static], writable: Bool): Either[StoreError, DuckHandles] is
+        return slotOpen(path, writable);
+    end;
+
+    -- The columns of the result are held against the kinds before a row is
+    -- read, so that no value is converted and no cell is read as another
+    -- type.
+    generic [S: Region]
+    function scanRows(connection: Nat64, sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows] is
+        if not zeroFree(sql) then
+            return Left(left => storeError(statementFailed(), 0));
+        end if;
+        let result: Nat64 := query(connection, sql);
+        let failure: Int32 := resultFailure(result);
+        if failure /= 0 then
+            destroyResult(result);
+            return Left(left => storeError(statementFailed(), failure - 1));
+        end if;
+        let cols: Index := spanLength(kinds);
+        let given: Index := resultColumns(result);
+        if given /= cols then
+            destroyResult(result);
+            return Left(left => storeError(wrongColumns(), columnNumber(given)));
+        end if;
+        var c: Index := 0;
+        while c < cols do
+            if not fitsKind(result, c, kinds[c]) then
+                destroyResult(result);
+                return Left(left => storeError(wrongColumns(), columnNumber(c)));
+            end if;
+            c := c + 1;
+        end while;
+        var rows: Rows := rowsFor(kinds);
+        var chunk: Nat64 := nextChunk(result);
+        while chunk /= 0 do
+            let n: Index := chunkRows(chunk);
+            var r: Index := 0;
+            while r < n do
+                c := 0;
+                while c < cols do
+                    putDuckCell(result, chunk, c, r, kinds[c], &!rows);
+                    c := c + 1;
+                end while;
+                r := r + 1;
+            end while;
+            destroyChunk(chunk);
+            chunk := nextChunk(result);
+        end while;
+        destroyResult(result);
+        return Right(right => rows);
+    end;
+
+    function fitsKind(result: Nat64, c: Index, kind: Nat8): Bool is
+        if kind = 1 then
+            return isFloatColumn(result, c);
+        end if;
+        if kind = 2 then
+            return isIntColumn(result, c);
+        end if;
+        if kind = 3 then
+            return isTextColumn(result, c);
+        end if;
+        return isBoolColumn(result, c);
+    end;
+
+    generic [R: Region]
+    function putDuckCell(result: Nat64, chunk: Nat64, c: Index, r: Index, kind: Nat8, rows: &![Rows, R]): Unit is
+        let here: Bool := cellValid(result, chunk, c, r);
+        if kind = 1 then
+            if here then
+                putFloat(rows, Some(value => cellFloat(result, chunk, c, r)));
+            else
+                let none: Option[Float64] := None();
+                putFloat(rows, none);
+            end if;
+        else if kind = 2 then
+            if here then
+                putInt(rows, Some(value => cellInt(result, chunk, c, r)));
+            else
+                let none: Option[Int64] := None();
+                putInt(rows, none);
+            end if;
+        else if kind = 4 then
+            if here then
+                putBool(rows, Some(value => cellBool(result, chunk, c, r)));
+            else
+                let none: Option[Bool] := None();
+                putBool(rows, none);
+            end if;
+        else
+            if here then
+                putDuckText(result, chunk, c, r, rows);
+            else
+                let none: Option[Span[Nat8, Static]] := None();
+                putText(rows, none);
+            end if;
+        end if;
+        return nil;
+    end;
+
+    -- The text is copied out of the chunk into bytes of its length, since
+    -- the chunk is given back before the table is made.
+    generic [R: Region]
+    function putDuckText(result: Nat64, chunk: Nat64, c: Index, r: Index, rows: &![Rows, R]): Unit is
+        let n: Index := cellTextLength(result, chunk, c, r);
+        if n = 0 then
+            putText(rows, Some(value => ""));
+            return nil;
+        end if;
+        var bytes: Buffer[Nat8] := initialize(n, 0);
+        let copied: Index := cellText(result, chunk, c, r, getSpanMut(&!bytes, 0, n - 1));
+        if copied /= n then
+            abort("Mirco.SchluckiStore.DuckDb: a text of DuckDB shorter than its length");
+        end if;
+        putText(rows, Some(value => wholeSpan(&bytes)));
+        destroyFree(bytes);
+        return nil;
+    end;
+
+    -- The Appender of DuckDB for the table and columns of sql, every row
+    -- appended and flushed in one transaction; the first value, row or
+    -- flush that fails rolls it back.  sql is taken in the one form of
+    -- insertColumns only, so its question marks are the columns.
+    generic [S: Region]
+    function appendRows(connection: Nat64, sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64] is
+        if not zeroFree(sql) then
+            return Left(left => storeError(statementFailed(), 0));
+        end if;
+        let marks: Index := insertColumns(sql);
+        if (marks = 0) or (marks /= columnCount(t)) then
+            return Left(left => storeError(wrongParameters(), columnNumber(marks)));
+        end if;
+        let begun: Int32 := run(connection, "BEGIN TRANSACTION");
+        if begun /= 0 then
+            return Left(left => storeError(statementFailed(), begun - 1));
+        end if;
+        let appending: Appending := openAppender(connection, sql);
+        if appending.failure /= appendDone() then
+            rollbackDuck(connection);
+            return Left(left => storeError(statementFailed(), 0));
+        end if;
+        let appender: Nat64 := appending.appender;
+        var changed: Nat64 := 0;
+        var r: Index := 0;
+        while r < rowCount(t) do
+            var c: Index := 0;
+            while c < columnCount(t) do
+                if appendCell(appender, t, c, r) /= 0 then
+                    dropAppender(appender);
+                    rollbackDuck(connection);
+                    return Left(left => storeError(statementFailed(), columnNumber(c)));
+                end if;
+                c := c + 1;
+            end while;
+            if endRow(appender) /= 0 then
+                dropAppender(appender);
+                rollbackDuck(connection);
+                return Left(left => storeError(statementFailed(), 0));
+            end if;
+            changed := changed + 1;
+            r := r + 1;
+        end while;
+        let flushed: Int32 := flushAppender(appender);
+        dropAppender(appender);
+        if flushed /= 0 then
+            rollbackDuck(connection);
+            return Left(left => storeError(statementFailed(), flushed - 1));
+        end if;
+        let committed: Int32 := run(connection, "COMMIT");
+        if committed /= 0 then
+            rollbackDuck(connection);
+            return Left(left => storeError(statementFailed(), committed - 1));
+        end if;
+        return Right(right => changed);
+    end;
+
+    function rollbackDuck(connection: Nat64): Unit is
+        let undone: Int32 := run(connection, "ROLLBACK");
+        return nil;
+    end;
+
+    -- The value of column c in row r as the next value of the row; 0 when
+    -- it was taken.
+    generic [S: Region]
+    function appendCell(appender: Nat64, t: &[Table, S], c: Index, r: Index): Int32 is
+        let kind: Nat8 := columnKind(t, c);
+        if kind = 1 then
+            case floatAt(t, c, r) of
+                when Some(value as v: Float64) do
+                    return appendFloat(appender, v);
+                when None do
+                    return appendNull(appender);
+            end case;
+        end if;
+        if kind = 2 then
+            case intAt(t, c, r) of
+                when Some(value as v: Int64) do
+                    return appendInt(appender, v);
+                when None do
+                    return appendNull(appender);
+            end case;
+        end if;
+        if kind = 4 then
+            case boolAt(t, c, r) of
+                when Some(value as v: Bool) do
+                    return appendBool(appender, v);
+                when None do
+                    return appendNull(appender);
+            end case;
+        end if;
+        case textAt(t, c, r) of
+            when Some(value as v: Span[Nat8, S]) do
+                return appendText(appender, v);
+            when None do
+                return appendNull(appender);
+        end case;
+    end;
+end module body.

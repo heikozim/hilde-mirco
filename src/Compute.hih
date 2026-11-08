@@ -1,0 +1,236 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The default compute layer of Mirco, in Hilde: elementwise operations with broadcasting, reductions, dot, gemv and gemm.
+
+- Elementwise operations broadcast their two arrays under NumPy's rules and give None when the shapes do not fit.
+- Every result is a new array; no operation writes into its arguments but gemv and gemm into their last one.
+- Matrix products take rank-2 arrays in row-major order; a dimension that does not fit stops the programme with a message.
+- An integer overflow and a division by zero stop the programme; floating point results follow binary64 and binary32 otherwise.
+- Reductions along an axis give partial results that combine joins, so that parts reduced apart give the result of the whole.
+- Time linear in the elements for elementwise operations and reductions, m times n times k for a product.
+
+    let c: NdArray[Float64] := matmul(&a, &b);
+"""
+import Mirco.Element (Element);
+import Mirco.Numeric (Numeric);
+import Mirco.Array (NdArray, rank, dimension, count);
+
+module Mirco.Compute is
+    """
+    a + b, element by element, broadcast.
+    No contract: no precondition on the shapes: shapes that do not broadcast give None; an integer overflow stops the programme, as the operator does.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function add(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]];
+
+    """
+    a - b, element by element, broadcast.
+    No contract: no precondition on the shapes: shapes that do not broadcast give None; an integer overflow stops the programme, as the operator does.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function subtract(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]];
+
+    """
+    a * b, element by element, broadcast.
+    No contract: no precondition on the shapes: shapes that do not broadcast give None; an integer overflow stops the programme, as the operator does.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function multiply(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]];
+
+    """
+    a / b, element by element, broadcast.
+    Shapes that do not broadcast give None; a zero in b stops the programme in the body.
+    No contract: that b holds no zero cannot be a requires, since reading the elements of b reaches C (flatGet -> Standard.Buffer.nth -> Hilde.Array.arrayNth -> Hilde.Memory.load -> @embed) (H3098).
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function divide(a: &[NdArray[T], R], b: &[NdArray[T], S]): Option[NdArray[T]];
+
+    """
+    Every element of a plus value.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function addScalar(a: &[NdArray[T], R], value: T): NdArray[T]
+        ensures (count(&result) = count(a)) and (rank(&result) = rank(a));
+
+    """
+    Every element of a times value.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function multiplyScalar(a: &[NdArray[T], R], value: T): NdArray[T]
+        ensures (count(&result) = count(a)) and (rank(&result) = rank(a));
+
+    """
+    The sum of the elements.
+    No contract: no precondition, since an array holds at least one element (count of Mirco.Array ensures result >= 1); the result is a value of the element type, of no range a contract could name.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function sum(a: &[NdArray[T], R]): T;
+
+    """
+    The product of the elements.
+    No contract: no precondition, since an array holds at least one element (count of Mirco.Array ensures result >= 1); the result is a value of the element type, of no range a contract could name.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function product(a: &[NdArray[T], R]): T;
+
+    """
+    The smallest element; a NaN is passed over unless every element is one.
+    No contract: no precondition, since an array holds at least one element (count of Mirco.Array ensures result >= 1); the result is a value of the element type, of no range a contract could name.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function minimum(a: &[NdArray[T], R]): T;
+
+    """
+    The largest element; a NaN is passed over unless every element is one.
+    No contract: no precondition, since an array holds at least one element (count of Mirco.Array ensures result >= 1); the result is a value of the element type, of no range a contract could name.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function maximum(a: &[NdArray[T], R]): T;
+
+    """
+    The sum divided by the count; for an integer type rounded towards zero.
+    No contract: no precondition, since an array holds at least one element (count of Mirco.Array ensures result >= 1); the result is a value of the element type, of no range a contract could name.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function mean(a: &[NdArray[T], R]): T;
+
+    """
+    The sums along axis: the result has the other axes, or the shape 1 for an array of rank 1, and so at most the count of a.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function sumAxis(a: &[NdArray[T], R], axis: Index): NdArray[T]
+        requires axis < rank(a)
+        ensures ((rank(&result) = 1) or (rank(&result) = (rank(a) - 1))) and (count(&result) <= count(a));
+
+    """
+    The products along axis: the result has the other axes, or the shape 1 for an array of rank 1, and so at most the count of a.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function productAxis(a: &[NdArray[T], R], axis: Index): NdArray[T]
+        requires axis < rank(a)
+        ensures ((rank(&result) = 1) or (rank(&result) = (rank(a) - 1))) and (count(&result) <= count(a));
+
+    """
+    The smallest elements along axis, a NaN passed over unless every element along the axis is one; the result has the other axes, or the shape 1 for an array of rank 1.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function minimumAxis(a: &[NdArray[T], R], axis: Index): NdArray[T]
+        requires axis < rank(a)
+        ensures ((rank(&result) = 1) or (rank(&result) = (rank(a) - 1))) and (count(&result) <= count(a));
+
+    """
+    The largest elements along axis, a NaN passed over unless every element along the axis is one; the result has the other axes, or the shape 1 for an array of rank 1.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function maximumAxis(a: &[NdArray[T], R], axis: Index): NdArray[T]
+        requires axis < rank(a)
+        ensures ((rank(&result) = 1) or (rank(&result) = (rank(a) - 1))) and (count(&result) <= count(a));
+
+    """
+    The means along axis: each sum along axis divided by the length of axis, for an integer type rounded towards zero; the result has the other axes, or the shape 1 for an array of rank 1.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function meanAxis(a: &[NdArray[T], R], axis: Index): NdArray[T]
+        requires axis < rank(a)
+        ensures ((rank(&result) = 1) or (rank(&result) = (rank(a) - 1))) and (count(&result) <= count(a));
+
+    """
+    The code of the reduction sum for combine, as Standard.SperliCollective numbers it.
+    """
+    function reductionSum(): Nat8
+        ensures result = 1;
+
+    """
+    The code of the reduction minimum for combine, as Standard.SperliCollective numbers it.
+    """
+    function reductionMinimum(): Nat8
+        ensures result = 2;
+
+    """
+    The code of the reduction maximum for combine, as Standard.SperliCollective numbers it.
+    """
+    function reductionMaximum(): Nat8
+        ensures result = 3;
+
+    """
+    The code of the reduction product for combine, as Standard.SperliCollective numbers it.
+    """
+    function reductionProduct(): Nat8
+        ensures result = 4;
+
+    """
+    Two partial results of the reduction of code reduction joined into one, first as the left operand: their sum, product, the smaller or the larger, a NaN passed over unless both are one.
+    """
+    generic [T: Free(Element, Numeric)]
+    function combineValues(first: T, second: T, reduction: Nat8): T
+        requires (reduction >= 1) and (reduction <= 4);
+
+    """
+    Two arrays of partial results of the reduction of code reduction joined element by element, as combineValues joins two values; nothing is broadcast, and two shapes that differ give None.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function combine(first: &[NdArray[T], R], second: &[NdArray[T], S], reduction: Nat8): Option[NdArray[T]]
+        requires (reduction >= 1) and (reduction <= 4);
+
+    """
+    The means of the joined sums of parts that hold total elements along the reduced axis together: every element of sums divided by total, for an integer type rounded towards zero.
+    The partial result of a mean is a sum, joined with combine and reductionSum, so that no rounding of a partial mean is carried.
+    """
+    generic [T: Free(Element, Numeric), R: Region]
+    function meanOfSums(sums: &[NdArray[T], R], total: Index): NdArray[T]
+        requires total >= 1
+        ensures (count(&result) = count(sums)) and (rank(&result) = rank(sums));
+
+    """
+    The dot product of two vectors of the same length.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function dot(a: &[NdArray[T], R], b: &[NdArray[T], S]): T
+        requires (rank(a) = 1) and (rank(b) = 1) and (count(a) = count(b));
+
+    """
+    The rows and columns exchanged.
+    """
+    generic [T: Free(Element), R: Region]
+    function transpose(a: &[NdArray[T], R]): NdArray[T]
+        requires rank(a) = 2
+        ensures (rank(&result) = 2) and (count(&result) = count(a)) and (dimension(&result, 0) = dimension(a, 1)) and (dimension(&result, 1) = dimension(a, 0));
+
+    """
+    The product of the matrix m and the vector x; the columns of m are the length of x, the result has a position for each row.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function matvec(m: &[NdArray[T], R], x: &[NdArray[T], S]): NdArray[T]
+        requires (rank(m) = 2) and (rank(x) = 1) and (dimension(m, 1) = count(x))
+        ensures (rank(&result) = 1) and (count(&result) = dimension(m, 0));
+
+    """
+    The product of the matrices a and b; the columns of a are the rows of b, the result has the rows of a and the columns of b.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function matmul(a: &[NdArray[T], R], b: &[NdArray[T], S]): NdArray[T]
+        requires (rank(a) = 2) and (rank(b) = 2) and (dimension(a, 1) = dimension(b, 0))
+        ensures (rank(&result) = 2) and (dimension(&result, 0) = dimension(a, 0)) and (dimension(&result, 1) = dimension(b, 1));
+
+    """
+    y := alpha times m times x plus beta times y, the level 2 product of the basic linear algebra subprograms; the columns of m are the length of x and its rows the length of y.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region, Q: Region]
+    function gemv(alpha: T, m: &[NdArray[T], R], x: &[NdArray[T], S], beta: T, y: &![NdArray[T], Q]): Unit
+        requires (rank(m) = 2) and (rank(x) = 1) and (rank(&y) = 1) and (dimension(m, 1) = count(x)) and (dimension(m, 0) = count(&y))
+        ensures (rank(&y) = 1) and (count(&y) = old(count(&y)));
+
+    """
+    c := alpha times a times b plus beta times c, the level 3 product of the basic linear algebra subprograms; the columns of a are the rows of b, and c has the rows of a and the columns of b.
+    """
+    generic [T: Free(Element, Numeric), R: Region, S: Region, Q: Region]
+    function gemm(alpha: T, a: &[NdArray[T], R], b: &[NdArray[T], S], beta: T, c: &![NdArray[T], Q]): Unit
+        requires (rank(a) = 2) and (rank(b) = 2) and (rank(&c) = 2) and (dimension(a, 1) = dimension(b, 0)) and (dimension(&c, 0) = dimension(a, 0)) and (dimension(&c, 1) = dimension(b, 1))
+        ensures (rank(&c) = 2) and (count(&c) = old(count(&c)));
+end module.

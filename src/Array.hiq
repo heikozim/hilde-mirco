@@ -1,0 +1,608 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    destroyFree,
+    length,
+    nth,
+    nthMut,
+    lengthMut,
+    storeNth,
+    insertBack,
+    reverse,
+    wholeSpan
+);
+import Mirco.Element (Element, zeroElement, elementCode, knownCode);
+
+module body Mirco.Array is
+    -- The length of eight axes, each in a slot of its own.
+    record Eight: Free is
+        a0: Index;
+        a1: Index;
+        a2: Index;
+        a3: Index;
+        a4: Index;
+        a5: Index;
+        a6: Index;
+        a7: Index;
+    end;
+
+    -- The length of every axis of a shape, 1 past its rank, in slots of
+    -- their own: a condition reads an axis here, since reading the buffer
+    -- of the shape ends in C (H3098).
+    record Extent: Free is
+        q0: Eight;
+        q1: Eight;
+        q2: Eight;
+        q3: Eight;
+    end;
+
+    -- The elements in row-major order, the length of every axis, the same
+    -- lengths in slots a condition reads, and their product, kept so that
+    -- a count is read in constant time.
+    record NdArray[T: Free]: Linear is
+        data: Buffer[T];
+        shape: Buffer[Index];
+        extent: Extent;
+        total: Index;
+        invariant length(&data) = total;
+        invariant length(&shape) >= 1;
+        invariant length(&shape) <= 32;
+    end;
+
+    -- The array read, the position of the first element shown, and for
+    -- each axis of the view its length and the step in elements between
+    -- two neighbours on it; a step of 0 repeats one element.
+    record View[T: Free, R: Region]: Linear is
+        source: &[NdArray[T], R];
+        offset: Index;
+        shape: Buffer[Index];
+        extent: Extent;
+        strides: Buffer[Index];
+        invariant length(&shape) = length(&strides);
+        invariant length(&shape) >= 1;
+        invariant length(&shape) <= 32;
+    end;
+
+    function maximumRank(): Index is
+        return 32;
+    end;
+
+    -- The length of axis of shape, 1 past its rank.
+    generic [R: Region]
+    function lengthAt(shape: Span[Index, R], axis: Index): Index is
+        if axis < spanLength(shape) then
+            return shape[axis];
+        end if;
+        return 1;
+    end;
+
+    generic [R: Region]
+    function eightOf(shape: Span[Index, R], base: Index): Eight is
+        return Eight(
+            a0 => lengthAt(shape, base),
+            a1 => lengthAt(shape, base + 1),
+            a2 => lengthAt(shape, base + 2),
+            a3 => lengthAt(shape, base + 3),
+            a4 => lengthAt(shape, base + 4),
+            a5 => lengthAt(shape, base + 5),
+            a6 => lengthAt(shape, base + 6),
+            a7 => lengthAt(shape, base + 7)
+        );
+    end;
+
+    generic [R: Region]
+    function extentOf(shape: Span[Index, R]): Extent is
+        return Extent(q0 => eightOf(shape, 0), q1 => eightOf(shape, 8), q2 => eightOf(shape, 16), q3 => eightOf(shape, 24));
+    end;
+
+    function lengthInEight(eight: Eight, at: Index): Index is
+        if at = 0 then
+            return eight.a0;
+        else if at = 1 then
+            return eight.a1;
+        else if at = 2 then
+            return eight.a2;
+        else if at = 3 then
+            return eight.a3;
+        else if at = 4 then
+            return eight.a4;
+        else if at = 5 then
+            return eight.a5;
+        else if at = 6 then
+            return eight.a6;
+        end if;
+        return eight.a7;
+    end;
+
+    -- The length of axis, 1 past 32 axes; it reads no buffer, so a
+    -- condition calls it.
+    function lengthInExtent(extent: Extent, axis: Index): Index is
+        if axis < 8 then
+            return lengthInEight(extent.q0, axis);
+        else if axis < 16 then
+            return lengthInEight(extent.q1, axis - 8);
+        else if axis < 24 then
+            return lengthInEight(extent.q2, axis - 16);
+        else if axis < 32 then
+            return lengthInEight(extent.q3, axis - 24);
+        end if;
+        return 1;
+    end;
+
+    generic [R: Region]
+    function shapeCount(shape: Span[Index, R]): Index is
+        var product: Index := 1;
+        var axis: Index := 0;
+        while axis < spanLength(shape) do
+            product := product * shape[axis];
+            axis := axis + 1;
+        end while;
+        return product;
+    end;
+
+    generic [R: Region]
+    function validShape(shape: Span[Index, R]): Bool is
+        if (spanLength(shape) < 1) or (spanLength(shape) > 32) then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < spanLength(shape) do
+            if shape[axis] < 1 then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    -- The shape as a buffer of its own, every dimension checked.
+    generic [R: Region]
+    function copyShape(shape: Span[Index, R]): Buffer[Index] is
+        if not validShape(shape) then
+            abort("Mirco.Array: a shape needs rank 1 to 32 and every dimension at least 1");
+        end if;
+        var out: Buffer[Index] := allocateEmpty();
+        var axis: Index := 0;
+        while axis < spanLength(shape) do
+            insertBack(&!out, shape[axis]);
+            axis := axis + 1;
+        end while;
+        return out;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function zeros(shape: Span[Index, R]): NdArray[T] is
+        let zero: T := zeroElement();
+        return filled(shape, zero);
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function filled(shape: Span[Index, R], value: T): NdArray[T] is
+        let dims: Buffer[Index] := copyShape(shape);
+        let total: Index := shapeCount(shape);
+        let data: Buffer[T] := initialize(total, value);
+        return NdArray(data => data, shape => dims, extent => extentOf(shape), total => total);
+    end;
+
+    generic [T: Free(Element), R: Region, S: Region]
+    function fromSpan(shape: Span[Index, R], values: Span[T, S]): NdArray[T] is
+        let dims: Buffer[Index] := copyShape(shape);
+        let total: Index := shapeCount(shape);
+        if total /= spanLength(values) then
+            abort("Mirco.Array: the count of values is not the count of the shape");
+        end if;
+        var data: Buffer[T] := allocateEmpty();
+        var at: Index := 0;
+        while at < total do
+            insertBack(&!data, values[at]);
+            at := at + 1;
+        end while;
+        return NdArray(data => data, shape => dims, extent => extentOf(shape), total => total);
+    end;
+
+    generic [T: Free]
+    function destroyNdArray(array: NdArray[T]): Unit is
+        let { data: Buffer[T], shape: Buffer[Index], extent: Extent, total: Index } := array;
+        destroyFree(data);
+        destroyFree(shape);
+        return nil;
+    end;
+
+    generic [T: Free, R: Region]
+    function rank(array: &[NdArray[T], R]): Index is
+        return length(&(array->shape));
+    end;
+
+    -- A path through a write reference uses the reference up, and a
+    -- public function keeps its own for the check of the invariant; so
+    -- the paths are taken in these functions, over a reborrow.
+    generic [T: Free, R: Region]
+    function shapeLength(array: &![NdArray[T], R]): Index is
+        return lengthMut(&!(array->shape));
+    end;
+
+    generic [T: Free, R: Region]
+    function readData(array: &![NdArray[T], R], at: Index): T is
+        return nthMut(&!(array->data), at);
+    end;
+
+    generic [T: Free, R: Region]
+    function storeData(array: &![NdArray[T], R], at: Index, value: T): Unit is
+        storeNth(&!(array->data), at, value);
+        return nil;
+    end;
+
+    generic [T: Free, R: Region]
+    function rankMut(array: &![NdArray[T], R]): Index is
+        return shapeLength(&~array);
+    end;
+
+    generic [T: Free, R: Region]
+    function dimension(array: &[NdArray[T], R], axis: Index): Index is
+        let extent: Extent := array->extent;
+        return lengthInExtent(extent, axis);
+    end;
+
+    generic [T: Free, R: Region]
+    function count(array: &[NdArray[T], R]): Index is
+        return array->total;
+    end;
+
+    generic [T: Free, R: Region]
+    function countMut(array: &![NdArray[T], R]): Index is
+        return array->total;
+    end;
+
+    generic [T: Free, R: Region]
+    function shapeOf(array: &[NdArray[T], R]): Span[Index, R] is
+        return wholeSpan(&(array->shape));
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function dtypeCode(array: &[NdArray[T], R]): Nat8 is
+        let zero: T := zeroElement();
+        return elementCode(zero);
+    end;
+
+    -- The position in row-major order of index, every component checked
+    -- against its dimension.
+    generic [R: Region, S: Region]
+    function flatPosition(shape: &[Buffer[Index], R], index: Span[Index, S]): Index is
+        var at: Index := 0;
+        var axis: Index := 0;
+        while axis < spanLength(index) do
+            let dim: Index := nth(shape, axis);
+            if index[axis] >= dim then
+                abort("Mirco.Array: an index outside its dimension");
+            end if;
+            at := (at * dim) + index[axis];
+            axis := axis + 1;
+        end while;
+        return at;
+    end;
+
+    generic [R: Region, S: Region]
+    function insideShape(shape: Span[Index, R], index: Span[Index, S]): Bool is
+        if spanLength(index) /= spanLength(shape) then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < spanLength(index) do
+            if index[axis] >= shape[axis] then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function insideArray(array: &[NdArray[T], R], index: Span[Index, S]): Bool is
+        if spanLength(index) /= rank(array) then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < spanLength(index) do
+            if index[axis] >= dimension(array, axis) then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function get(array: &[NdArray[T], R], index: Span[Index, S]): T is
+        let at: Index := flatPosition(&(array->shape), index);
+        return nth(&(array->data), at);
+    end;
+
+    -- The position in row-major order of index, read through a write
+    -- reference; a reference to one slot uses up the reference it is
+    -- taken through, so this is a function of its own.
+    generic [T: Free, R: Region, S: Region]
+    function shapePosition(array: &![NdArray[T], R], index: Span[Index, S]): Index is
+        var dims: &![Buffer[Index], R] := &!(array->shape);
+        var at: Index := 0;
+        var axis: Index := 0;
+        while axis < spanLength(index) do
+            let dim: Index := nthMut(&~dims, axis);
+            if index[axis] >= dim then
+                abort("Mirco.Array: an index outside its dimension");
+            end if;
+            at := (at * dim) + index[axis];
+            axis := axis + 1;
+        end while;
+        return at;
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function set(array: &![NdArray[T], R], index: Span[Index, S], value: T): Unit is
+        let at: Index := shapePosition(&~array, index);
+        storeData(&~array, at, value);
+        return nil;
+    end;
+
+    generic [T: Free, R: Region]
+    function flatGet(array: &[NdArray[T], R], at: Index): T is
+        return nth(&(array->data), at);
+    end;
+
+    generic [T: Free, R: Region]
+    function flatGetMut(array: &![NdArray[T], R], at: Index): T is
+        return readData(&~array, at);
+    end;
+
+    generic [T: Free, R: Region]
+    function flatSet(array: &![NdArray[T], R], at: Index, value: T): Unit is
+        storeData(&~array, at, value);
+        return nil;
+    end;
+
+    generic [T: Free, R: Region]
+    function elements(array: &[NdArray[T], R]): Span[T, R] is
+        return wholeSpan(&(array->data));
+    end;
+
+    generic [T: Free, R: Region]
+    function reshape(array: NdArray[T], shape: Span[Index, R]): NdArray[T] is
+        let dims: Buffer[Index] := copyShape(shape);
+        let { data: Buffer[T], shape as old_shape: Buffer[Index], extent as old_extent: Extent, total: Index } := array;
+        destroyFree(old_shape);
+        if shapeCount(wholeSpan(&dims)) /= total then
+            abort("Mirco.Array: a reshape must keep the count of elements");
+        end if;
+        return NdArray(data => data, shape => dims, extent => extentOf(shape), total => total);
+    end;
+
+    -- The steps in elements of the axes of an array in row-major order.
+    generic [R: Region]
+    function rowMajorStrides(shape: &[Buffer[Index], R]): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        var step: Index := 1;
+        var axis: Index := length(shape);
+        while axis > 0 do
+            axis := axis - 1;
+            insertBack(&!out, step);
+            step := step * nth(shape, axis);
+        end while;
+        reverse(&!out);
+        return out;
+    end;
+
+    generic [R: Region]
+    function copyBuffer(original: &[Buffer[Index], R]): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        var at: Index := 0;
+        while at < length(original) do
+            insertBack(&!out, nth(original, at));
+            at := at + 1;
+        end while;
+        return out;
+    end;
+
+    generic [T: Free, R: Region]
+    function view(array: &[NdArray[T], R]): View[T, R] is
+        let dims: Buffer[Index] := copyBuffer(&(array->shape));
+        let steps: Buffer[Index] := rowMajorStrides(&(array->shape));
+        let extent: Extent := array->extent;
+        return View(source => array, offset => 0, shape => dims, extent => extent, strides => steps);
+    end;
+
+    generic [T: Free, R: Region]
+    function destroyView(shown: View[T, R]): Unit is
+        let { source: &[NdArray[T], R], offset: Index, shape: Buffer[Index], extent: Extent, strides: Buffer[Index] } := shown;
+        destroyFree(shape);
+        destroyFree(strides);
+        return nil;
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function viewRank(shown: &[View[T, R], S]): Index is
+        return length(&(shown->shape));
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function viewDimension(shown: &[View[T, R], S], axis: Index): Index is
+        let extent: Extent := shown->extent;
+        return lengthInExtent(extent, axis);
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function viewShapeOf(shown: &[View[T, R], S]): Span[Index, S] is
+        return wholeSpan(&(shown->shape));
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function viewCount(shown: &[View[T, R], S]): Index is
+        return shapeCount(wholeSpan(&(shown->shape)));
+    end;
+
+    generic [T: Free, R: Region, S: Region, Q: Region]
+    function insideView(shown: &[View[T, R], S], index: Span[Index, Q]): Bool is
+        if spanLength(index) /= viewRank(shown) then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < spanLength(index) do
+            if index[axis] >= viewDimension(shown, axis) then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    generic [T: Free, R: Region, S: Region, Q: Region]
+    function viewGet(shown: &[View[T, R], S], index: Span[Index, Q]): T is
+        var at: Index := shown->offset;
+        var axis: Index := 0;
+        while axis < spanLength(index) do
+            if index[axis] >= nth(&(shown->shape), axis) then
+                abort("Mirco.Array: an index outside its dimension");
+            end if;
+            at := at + (index[axis] * nth(&(shown->strides), axis));
+            axis := axis + 1;
+        end while;
+        let source: &[NdArray[T], R] := shown->source;
+        return flatGet(source, at);
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function slice(shown: &[View[T, R], S], axis: Index, start: Index, stop: Index, step: Index): View[T, R] is
+        var dims: Buffer[Index] := copyBuffer(&(shown->shape));
+        var steps: Buffer[Index] := copyBuffer(&(shown->strides));
+        if stop > nth(&(shown->shape), axis) then
+            abort("Mirco.Array: a slice past the length of its axis");
+        end if;
+        let stride: Index := nth(&(shown->strides), axis);
+        storeNth(&!dims, axis, ((stop - start) + (step - 1)) / step);
+        storeNth(&!steps, axis, stride * step);
+        let offset: Index := (shown->offset) + (start * stride);
+        let extent: Extent := extentOf(wholeSpan(&dims));
+        return View(source => shown->source, offset => offset, shape => dims, extent => extent, strides => steps);
+    end;
+
+    generic [T: Free(Element), R: Region, S: Region]
+    function copyView(shown: &[View[T, R], S]): NdArray[T] is
+        let dims: Buffer[Index] := copyBuffer(&(shown->shape));
+        let total: Index := shapeCount(wholeSpan(&dims));
+        var data: Buffer[T] := allocateEmpty();
+        var index: Buffer[Index] := initialize(length(&dims), 0);
+        var done: Index := 0;
+        while done < total do
+            insertBack(&!data, viewGet(shown, wholeSpan(&index)));
+            done := done + 1;
+            -- The next index in row-major order: the last axis counts up
+            -- and carries into the one before it.
+            var axis: Index := length(&dims);
+            var carrying: Bool := true;
+            while carrying and (axis > 0) do
+                axis := axis - 1;
+                let next: Index := nth(&index, axis) + 1;
+                if next < nth(&dims, axis) then
+                    storeNth(&!index, axis, next);
+                    carrying := false;
+                else
+                    storeNth(&!index, axis, 0);
+                end if;
+            end while;
+        end while;
+        destroyFree(index);
+        let extent: Extent := extentOf(wholeSpan(&dims));
+        return NdArray(data => data, shape => dims, extent => extent, total => total);
+    end;
+
+    -- The dimension of shape at the axis counted from its end, 1 past its rank.
+    generic [R: Region]
+    function fromEnd(shape: Span[Index, R], back: Index): Index is
+        if back >= spanLength(shape) then
+            return 1;
+        end if;
+        return shape[(spanLength(shape) - 1) - back];
+    end;
+
+    generic [R: Region, S: Region]
+    function broadcastable(a: Span[Index, R], b: Span[Index, S]): Bool is
+        var back: Index := 0;
+        while (back < spanLength(a)) or (back < spanLength(b)) do
+            let da: Index := fromEnd(a, back);
+            let db: Index := fromEnd(b, back);
+            if (da /= db) and (da /= 1) and (db /= 1) then
+                return false;
+            end if;
+            back := back + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function broadcastShape(a: Span[Index, R], b: Span[Index, S]): Option[Buffer[Index]] is
+        if not broadcastable(a, b) then
+            let none: Option[Buffer[Index]] := None();
+            return none;
+        end if;
+        var out: Buffer[Index] := allocateEmpty();
+        var back: Index := 0;
+        while (back < spanLength(a)) or (back < spanLength(b)) do
+            let da: Index := fromEnd(a, back);
+            let db: Index := fromEnd(b, back);
+            if da = 1 then
+                insertBack(&!out, db);
+            else
+                insertBack(&!out, da);
+            end if;
+            back := back + 1;
+        end while;
+        reverse(&!out);
+        return Some(value => out);
+    end;
+
+    generic [T: Free, R: Region, S: Region, Q: Region]
+    function broadcastTo(shown: &[View[T, R], S], shape: Span[Index, Q]): Option[View[T, R]] is
+        let have: Index := length(&(shown->shape));
+        if (not validShape(shape)) or (spanLength(shape) < have) then
+            let none: Option[View[T, R]] := None();
+            return none;
+        end if;
+        let lead: Index := spanLength(shape) - have;
+        var dims: Buffer[Index] := allocateEmpty();
+        var steps: Buffer[Index] := allocateEmpty();
+        var fits: Bool := true;
+        var axis: Index := 0;
+        while axis < spanLength(shape) do
+            insertBack(&!dims, shape[axis]);
+            if axis < lead then
+                insertBack(&!steps, 0);
+            else
+                let own: Index := nth(&(shown->shape), axis - lead);
+                if own = shape[axis] then
+                    insertBack(&!steps, nth(&(shown->strides), axis - lead));
+                else if own = 1 then
+                    insertBack(&!steps, 0);
+                else
+                    insertBack(&!steps, 0);
+                    fits := false;
+                end if;
+            end if;
+            axis := axis + 1;
+        end while;
+        if not fits then
+            destroyFree(dims);
+            destroyFree(steps);
+            let none: Option[View[T, R]] := None();
+            return none;
+        end if;
+        let extent: Extent := extentOf(wholeSpan(&dims));
+        let made: View[T, R] := View(source => shown->source, offset => shown->offset, shape => dims, extent => extent, strides => steps);
+        return Some(value => made);
+    end;
+end module body.

@@ -1,0 +1,305 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, wholeSpan, getSpanMut, nth);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, elements, shapeOf, fromSpan, maximumRank);
+import Mirco.Bindings.Hdf5 (
+    quiet,
+    createFile,
+    openFile,
+    closeFile,
+    createDataset,
+    openDataset,
+    closeDataset,
+    typeClass,
+    typeSize,
+    typeSigned,
+    rankOf,
+    dimensionsOf,
+    writeFloat64 as rawWriteFloat64,
+    writeInt64 as rawWriteInt64,
+    readFloat64 as rawReadFloat64,
+    readInt64 as rawReadInt64
+);
+
+module body Mirco.Hdf5 is
+    generic [R: Region]
+    function openForWrite(path: Span[Nat8, R], fresh: Bool): Int64 is
+        quiet();
+        if fresh then
+            return createFile(path);
+        end if;
+        return openFile(path, true);
+    end;
+
+    generic [R: Region]
+    function wideShape(shape: Span[Index, R]): Buffer[Nat64] is
+        var out: Buffer[Nat64] := allocateEmpty();
+        var i: Index := 0;
+        while i < spanLength(shape) do
+            let d: Index := shape[i];
+            case toNat64(d) of
+                when Some(value as w: Nat64) do
+                    insertBack(&!out, w);
+                when None do
+                    insertBack(&!out, 0);
+            end case;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- A dataset made for the shape; negative when the file or the dataset
+    -- could not be made, and then the file is closed again.
+    generic [R: Region, S: Region, Q: Region]
+    function startWrite(path: Span[Nat8, R], name: Span[Nat8, S], shape: Span[Index, Q], fresh: Bool, floating: Bool): Either[Hdf5Fault, Opened] is
+        let file: Int64 := openForWrite(path, fresh);
+        if file < 0 then
+            return Left(left => CannotOpen());
+        end if;
+        let dims: Buffer[Nat64] := wideShape(shape);
+        let dataset: Int64 := createDataset(file, name, wholeSpan(&dims), floating);
+        destroyFree(dims);
+        if dataset < 0 then
+            let closed: Int32 := closeFile(file);
+            return Left(left => NoDataset());
+        end if;
+        return Right(right => pairOf(file, dataset));
+    end;
+
+    record Opened: Free is
+        file: Int64;
+        dataset: Int64;
+    end;
+
+    function pairOf(file: Int64, dataset: Int64): Opened is
+        return Opened(file => file, dataset => dataset);
+    end;
+
+    function finish(file: Int64, dataset: Int64, written: Int32): Either[Hdf5Fault, Unit] is
+        let closed_set: Int32 := closeDataset(dataset);
+        let closed_file: Int32 := closeFile(file);
+        if (written < 0) or ((closed_set < 0) or (closed_file < 0)) then
+            return Left(left => Failed());
+        end if;
+        return Right(right => nil);
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function writeFloat64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Float64], Q], fresh: Bool): Either[Hdf5Fault, Unit] is
+        case startWrite(path, name, shapeOf(array), fresh, true) of
+            when Right(right as pair: Opened) do
+                let written: Int32 := rawWriteFloat64(pair.dataset, elements(array));
+                return finish(pair.file, pair.dataset, written);
+            when Left(left as fault: Hdf5Fault) do
+                return Left(left => fault);
+        end case;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function writeInt64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Int64], Q], fresh: Bool): Either[Hdf5Fault, Unit] is
+        case startWrite(path, name, shapeOf(array), fresh, false) of
+            when Right(right as pair: Opened) do
+                let written: Int32 := rawWriteInt64(pair.dataset, elements(array));
+                return finish(pair.file, pair.dataset, written);
+            when Left(left as fault: Hdf5Fault) do
+                return Left(left => fault);
+        end case;
+    end;
+
+    -- The shape of a dataset as Index, or None when its rank is no rank of
+    -- an array or a dimension does not fit.
+    function shapeOfDataset(dataset: Int64): Option[Buffer[Index]] is
+        let rank: Int32 := rankOf(dataset);
+        if (rank < 1) or (rank > 32) then
+            return None();
+        end if;
+        var size: Index := 0;
+        case toIndex(rank) of
+            when Some(value as r: Index) do
+                size := r;
+            when None do
+                return None();
+        end case;
+        if size > maximumRank() then
+            return None();
+        end if;
+        var wide: Buffer[Nat64] := initialize(size, 0);
+        let found: Int32 := dimensionsOf(dataset, getSpanMut(&!wide, 0, size - 1));
+        if found /= rank then
+            destroyFree(wide);
+            return None();
+        end if;
+        var shape: Buffer[Index] := allocateEmpty();
+        var i: Index := 0;
+        var fits: Bool := true;
+        while i < size do
+            case toIndex(nth(&wide, i)) of
+                when Some(value as d: Index) do
+                    insertBack(&!shape, d);
+                when None do
+                    fits := false;
+                    insertBack(&!shape, 0);
+            end case;
+            i := i + 1;
+        end while;
+        destroyFree(wide);
+        if not fits then
+            destroyFree(shape);
+            return None();
+        end if;
+        return Some(value => shape);
+    end;
+
+    -- The most elements one read of a dataset makes, as the interface
+    -- promises it.
+    function readElementLimit(): Index is
+        return 4294967296;
+    end;
+
+    -- The count of elements of shape, or None when a dimension is 0, the
+    -- product does not fit an Index or goes above readElementLimit(): the
+    -- product is held at or below the limit while it is formed, so that no
+    -- multiplication overflows.  The rank of the shape, 1 to 32, is checked
+    -- by shapeOfDataset before this runs.
+    generic [R: Region]
+    function countedElements(shape: Span[Index, R]): Option[Index] is
+        var total: Index := 1;
+        var axis: Index := 0;
+        while axis < spanLength(shape) do
+            let dim: Index := shape[axis];
+            if dim < 1 then
+                return None();
+            end if;
+            if dim > (readElementLimit() / total) then
+                return None();
+            end if;
+            total := total * dim;
+            axis := axis + 1;
+        end while;
+        return Some(value => total);
+    end;
+
+    -- The file and the dataset opened for reading, with the class and size
+    -- of the elements checked; negative identifiers never come back.
+    generic [R: Region, S: Region]
+    function startRead(path: Span[Nat8, R], name: Span[Nat8, S], floating: Bool): Either[Hdf5Fault, Opened] is
+        quiet();
+        let file: Int64 := openFile(path, false);
+        if file < 0 then
+            return Left(left => CannotOpen());
+        end if;
+        let dataset: Int64 := openDataset(file, name);
+        if dataset < 0 then
+            let closed: Int32 := closeFile(file);
+            return Left(left => NoDataset());
+        end if;
+        var wanted: Int32 := 0;
+        if floating then
+            wanted := 1;
+        end if;
+        var right: Bool := (typeClass(dataset) = wanted) and (typeSize(dataset) = 8);
+        if not floating then
+            right := right and (typeSigned(dataset) = 1);
+        end if;
+        if not right then
+            let closed_set: Int32 := closeDataset(dataset);
+            let closed_file: Int32 := closeFile(file);
+            return Left(left => WrongType());
+        end if;
+        return Right(right => pairOf(file, dataset));
+    end;
+
+    function closeBoth(pair: Opened): Unit is
+        let closed_set: Int32 := closeDataset(pair.dataset);
+        let closed_file: Int32 := closeFile(pair.file);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function readFloat64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[Hdf5Fault, NdArray[Float64]] is
+        case startRead(path, name, true) of
+            when Right(right as pair: Opened) do
+                case shapeOfDataset(pair.dataset) of
+                    when Some(value as shape: Buffer[Index]) do
+                        case countedElements(wholeSpan(&shape)) of
+                            when Some(value as total: Index) do
+                                let filled: Either[Hdf5Fault, NdArray[Float64]] := fillFloat64(pair, wholeSpan(&shape), total);
+                                destroyFree(shape);
+                                return filled;
+                            when None do
+                                destroyFree(shape);
+                                closeBoth(pair);
+                                return Left(left => BadShape());
+                        end case;
+                    when None do
+                        closeBoth(pair);
+                        return Left(left => BadShape());
+                end case;
+            when Left(left as fault: Hdf5Fault) do
+                return Left(left => fault);
+        end case;
+    end;
+
+    -- Reads the elements of the dataset of pair into an array of shape,
+    -- which holds total elements, a count countedElements has checked; the
+    -- file and the dataset are closed whichever way the reading ends.
+    generic [R: Region]
+    function fillFloat64(pair: Opened, shape: Span[Index, R], total: Index): Either[Hdf5Fault, NdArray[Float64]] is
+        var values: Buffer[Float64] := initialize(total, 0.0);
+        let read: Int32 := rawReadFloat64(pair.dataset, getSpanMut(&!values, 0, total - 1));
+        closeBoth(pair);
+        if read < 0 then
+            destroyFree(values);
+            return Left(left => Failed());
+        end if;
+        let made: NdArray[Float64] := fromSpan(shape, wholeSpan(&values));
+        destroyFree(values);
+        return Right(right => made);
+    end;
+
+    generic [R: Region, S: Region]
+    function readInt64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[Hdf5Fault, NdArray[Int64]] is
+        case startRead(path, name, false) of
+            when Right(right as pair: Opened) do
+                case shapeOfDataset(pair.dataset) of
+                    when Some(value as shape: Buffer[Index]) do
+                        case countedElements(wholeSpan(&shape)) of
+                            when Some(value as total: Index) do
+                                let filled: Either[Hdf5Fault, NdArray[Int64]] := fillInt64(pair, wholeSpan(&shape), total);
+                                destroyFree(shape);
+                                return filled;
+                            when None do
+                                destroyFree(shape);
+                                closeBoth(pair);
+                                return Left(left => BadShape());
+                        end case;
+                    when None do
+                        closeBoth(pair);
+                        return Left(left => BadShape());
+                end case;
+            when Left(left as fault: Hdf5Fault) do
+                return Left(left => fault);
+        end case;
+    end;
+
+    -- fillFloat64 for an array of Int64.
+    generic [R: Region]
+    function fillInt64(pair: Opened, shape: Span[Index, R], total: Index): Either[Hdf5Fault, NdArray[Int64]] is
+        var values: Buffer[Int64] := initialize(total, 0);
+        let read: Int32 := rawReadInt64(pair.dataset, getSpanMut(&!values, 0, total - 1));
+        closeBoth(pair);
+        if read < 0 then
+            destroyFree(values);
+            return Left(left => Failed());
+        end if;
+        let made: NdArray[Int64] := fromSpan(shape, wholeSpan(&values));
+        destroyFree(values);
+        return Right(right => made);
+    end;
+end module body.

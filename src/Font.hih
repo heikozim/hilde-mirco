@@ -1,0 +1,24 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A pixel font of five columns by seven rows for the printable characters of ASCII, which Mirco.Yompi draws into PNG images.
+
+- Each character from 32 to 126 has a glyph; every other byte draws as a space.
+- A row is five bits, the leftmost pixel the highest, so 16 is a pixel at the left edge alone.
+
+    let top: Nat8 := glyphRow(65, 0);
+"""
+module Mirco.Font is
+    """
+    The row of the glyph of the character c, row 0 at the top and row 6 at the bottom: five bits, the leftmost
+    pixel the highest.
+    """
+    function glyphRow(c: Nat8, row: Index): Nat8
+        requires row < 7
+        ensures result < 32;
+end module.

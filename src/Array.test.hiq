@@ -1,0 +1,694 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, length, nth, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (codeInt64, codeFloat64);
+import Mirco.Array (
+    NdArray,
+    View,
+    zeros,
+    filled,
+    fromSpan,
+    destroyNdArray,
+    rank,
+    dimension,
+    count,
+    dtypeCode,
+    get,
+    set,
+    flatGet,
+    flatGetMut,
+    flatSet,
+    elements,
+    reshape,
+    view,
+    destroyView,
+    viewRank,
+    viewDimension,
+    viewCount,
+    viewGet,
+    slice,
+    copyView,
+    broadcastable,
+    broadcastShape,
+    broadcastTo,
+    shapeCount,
+    validShape,
+    shapeOf,
+    insideShape,
+    insideArray,
+    insideView,
+    viewShapeOf
+);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Array.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, words, words);
+    end;
+
+    -- Whether the child for word stopped with the message of a violated
+    -- requires of name, as " of Mirco.Array.get (": the message names the
+    -- function whose requires failed, so a requires of a function the body
+    -- calls does not count.
+    function refusedByRequiresOf(test: Span[Nat8, Static], word: Span[Nat8, Static], name: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, "contract violated: the requires", name);
+    end;
+
+    -- Whether the child for word stopped with an exit other than 0 and both
+    -- words and also on its standard error.
+    function refusedInChildWith(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static], also: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words) and contains(asSpan(&text), also);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function dims1(a: Index): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        insertBack(&!out, a);
+        return out;
+    end;
+
+    function dims2(a: Index, b: Index): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        insertBack(&!out, a);
+        insertBack(&!out, b);
+        return out;
+    end;
+
+    function dims3(a: Index, b: Index, c: Index): Buffer[Index] is
+        var out: Buffer[Index] := allocateEmpty();
+        insertBack(&!out, a);
+        insertBack(&!out, b);
+        insertBack(&!out, c);
+        return out;
+    end;
+
+    -- The array of shape 3 by 4 that holds 0 to 11 in row-major order.
+    function counting(): NdArray[Int64] is
+        let shape: Buffer[Index] := dims2(3, 4);
+        var values: Buffer[Int64] := allocateEmpty();
+        var at: Int64 := 0;
+        while at < 12 do
+            insertBack(&!values, at);
+            at := at + 1;
+        end while;
+        let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    function testZerosHaveTheirShape(): Unit is
+        let shape: Buffer[Index] := dims2(2, 3);
+        let grid: NdArray[Float64] := zeros(wholeSpan(&shape));
+        assertTrue(rank(&grid) = 2, "rank 2");
+        assertTrue(dimension(&grid, 0) = 2, "two rows");
+        assertTrue(dimension(&grid, 1) = 3, "three columns");
+        assertTrue(count(&grid) = 6, "six elements");
+        assertTrue(dtypeCode(&grid) = codeFloat64(), "the code of Float64");
+        assertTrue(flatGet(&grid, 5) = 0.0, "every element is zero");
+        destroyNdArray(grid);
+        destroyFree(shape);
+        return nil;
+    end;
+
+    function testSetAndGetByIndex(): Unit is
+        let shape: Buffer[Index] := dims3(2, 3, 4);
+        var cube: NdArray[Int32] := filled(wholeSpan(&shape), 7);
+        let at: Buffer[Index] := dims3(1, 2, 3);
+        set(&!cube, wholeSpan(&at), 99);
+        assertTrue(get(&cube, wholeSpan(&at)) = 99, "the element set is read back");
+        assertTrue(flatGet(&cube, 23) = 99, "index (1, 2, 3) is position 23 in row-major order");
+        assertTrue(flatGet(&cube, 22) = 7, "its neighbour keeps the value it was filled with");
+        flatSet(&!cube, 0, 5);
+        let first: Buffer[Index] := dims3(0, 0, 0);
+        assertTrue(get(&cube, wholeSpan(&first)) = 5, "position 0 is index (0, 0, 0)");
+        destroyNdArray(cube);
+        destroyFree(shape);
+        destroyFree(at);
+        destroyFree(first);
+        return nil;
+    end;
+
+    function testElementsInRowMajorOrder(): Unit is
+        let grid: NdArray[Int64] := counting();
+        borrow g: &[NdArray[Int64], Q] := &grid do
+            let all: Span[Int64, Q] := elements(g);
+            assertTrue(spanLength(all) = 12, "twelve elements");
+            assertTrue(all[7] = 7, "position 7 holds 7");
+            let at: Buffer[Index] := dims2(2, 1);
+            assertTrue(get(&grid, wholeSpan(&at)) = 9, "row 2, column 1 is 2 * 4 + 1");
+            destroyFree(at);
+        end borrow;
+        destroyNdArray(grid);
+        return nil;
+    end;
+
+    function testReshapeKeepsTheElements(): Unit is
+        let grid: NdArray[Int64] := counting();
+        let shape: Buffer[Index] := dims3(2, 2, 3);
+        let cube: NdArray[Int64] := reshape(grid, wholeSpan(&shape));
+        assertTrue(rank(&cube) = 3, "rank 3 after the reshape");
+        let at: Buffer[Index] := dims3(1, 1, 2);
+        assertTrue(get(&cube, wholeSpan(&at)) = 11, "the last element is still 11");
+        destroyFree(at);
+        destroyFree(shape);
+        destroyNdArray(cube);
+        return nil;
+    end;
+
+    -- insideShape tells one position for each axis, each below the length
+    -- of its axis, from a position too far or of another count of axes.
+    function testAnIndexOutsideTheShapeIsRefused(): Unit is
+        let grid: NdArray[Int64] := counting();
+        let last: Buffer[Index] := dims2(2, 3);
+        let past_rows: Buffer[Index] := dims2(3, 0);
+        let past_columns: Buffer[Index] := dims2(0, 4);
+        let too_short: Buffer[Index] := dims1(1);
+        let too_long: Buffer[Index] := dims3(0, 0, 0);
+        assertTrue(insideShape(shapeOf(&grid), wholeSpan(&last)), "the last element is inside 3 by 4");
+        assertFalse(insideShape(shapeOf(&grid), wholeSpan(&past_rows)), "row 3 is outside 3 rows");
+        assertFalse(insideShape(shapeOf(&grid), wholeSpan(&past_columns)), "column 4 is outside 4 columns");
+        assertFalse(insideShape(shapeOf(&grid), wholeSpan(&too_short)), "one position is too few for two axes");
+        assertFalse(insideShape(shapeOf(&grid), wholeSpan(&too_long)), "three positions are too many for two axes");
+        assertTrue(insideArray(&grid, wholeSpan(&last)), "insideArray: the last element is inside 3 by 4");
+        assertFalse(insideArray(&grid, wholeSpan(&past_rows)), "insideArray: row 3 is outside 3 rows");
+        assertFalse(insideArray(&grid, wholeSpan(&past_columns)), "insideArray: column 4 is outside 4 columns");
+        assertFalse(insideArray(&grid, wholeSpan(&too_short)), "insideArray: one position is too few for two axes");
+        assertFalse(insideArray(&grid, wholeSpan(&too_long)), "insideArray: three positions are too many for two axes");
+        borrow g: &[NdArray[Int64], Q] := &grid do
+            let whole: View[Int64, Q] := view(g);
+            assertTrue(insideShape(viewShapeOf(&whole), wholeSpan(&last)), "the view holds the last element");
+            assertFalse(insideShape(viewShapeOf(&whole), wholeSpan(&past_columns)), "column 4 is outside the view");
+            assertTrue(insideView(&whole, wholeSpan(&last)), "insideView: the view holds the last element");
+            assertFalse(insideView(&whole, wholeSpan(&past_rows)), "insideView: row 3 is outside the view");
+            assertFalse(insideView(&whole, wholeSpan(&too_short)), "insideView: one position is too few for two axes");
+            let odd: View[Int64, Q] := slice(&whole, 1, 1, 4, 2);
+            let second: Buffer[Index] := dims2(2, 1);
+            let past_slice: Buffer[Index] := dims2(0, 2);
+            assertTrue(insideView(&odd, wholeSpan(&second)), "insideView: column 1 of the two the slice shows");
+            assertFalse(insideView(&odd, wholeSpan(&past_rows)), "insideView: row 3 is outside the slice");
+            assertFalse(insideView(&odd, wholeSpan(&past_slice)), "insideView: column 2 is outside the slice of two columns");
+            destroyFree(second);
+            destroyFree(past_slice);
+            destroyView(odd);
+            destroyView(whole);
+        end borrow;
+        destroyFree(last);
+        destroyFree(past_rows);
+        destroyFree(past_columns);
+        destroyFree(too_short);
+        destroyFree(too_long);
+        destroyNdArray(grid);
+        return nil;
+    end;
+
+    function testShapes(): Unit is
+        let good: Buffer[Index] := dims2(2, 3);
+        let zero: Buffer[Index] := dims2(2, 0);
+        assertTrue(validShape(wholeSpan(&good)), "2 by 3 is a shape");
+        assertFalse(validShape(wholeSpan(&zero)), "a dimension of 0 is refused");
+        assertTrue(shapeCount(wholeSpan(&good)) = 6, "2 by 3 holds six");
+        destroyFree(good);
+        destroyFree(zero);
+        return nil;
+    end;
+
+    -- A slice with a step shows every other column and copies nothing: a
+    -- change of the array after the slice is seen through it.
+    function testSliceIsAView(): Unit is
+        var grid: NdArray[Int64] := counting();
+        flatSet(&!grid, 3, 103);
+        borrow g: &[NdArray[Int64], Q] := &grid do
+            let whole: View[Int64, Q] := view(g);
+            assertTrue(viewRank(&whole) = 2, "the view has the rank of the array");
+            let odd: View[Int64, Q] := slice(&whole, 1, 1, 4, 2);
+            assertTrue(viewDimension(&odd, 1) = 2, "columns 1 and 3");
+            assertTrue(viewCount(&odd) = 6, "three rows of two");
+            let at: Buffer[Index] := dims2(0, 1);
+            assertTrue(viewGet(&odd, wholeSpan(&at)) = 103, "row 0, column 3 through the view");
+            let copied: NdArray[Int64] := copyView(&odd);
+            assertTrue(flatGet(&copied, 0) = 1, "the copy starts with column 1");
+            assertTrue(flatGet(&copied, 5) = 11, "and ends with row 2, column 3");
+            destroyNdArray(copied);
+            destroyFree(at);
+            destroyView(odd);
+            destroyView(whole);
+        end borrow;
+        destroyNdArray(grid);
+        return nil;
+    end;
+
+    function testSliceOfASlice(): Unit is
+        let grid: NdArray[Int64] := counting();
+        borrow g: &[NdArray[Int64], Q] := &grid do
+            let whole: View[Int64, Q] := view(g);
+            let lower: View[Int64, Q] := slice(&whole, 0, 1, 3, 1);
+            let corner: View[Int64, Q] := slice(&lower, 1, 2, 4, 1);
+            let at: Buffer[Index] := dims2(1, 1);
+            assertTrue(viewGet(&corner, wholeSpan(&at)) = 11, "rows 1 and 2, columns 2 and 3: the last is 11");
+            assertTrue(viewCount(&corner) = 4, "a 2 by 2 corner");
+            destroyFree(at);
+            destroyView(corner);
+            destroyView(lower);
+            destroyView(whole);
+        end borrow;
+        destroyNdArray(grid);
+        return nil;
+    end;
+
+    function testBroadcastRules(): Unit is
+        let column: Buffer[Index] := dims2(3, 1);
+        let row: Buffer[Index] := dims1(4);
+        let wide: Buffer[Index] := dims2(2, 3);
+        let two: Buffer[Index] := dims1(2);
+        let three: Buffer[Index] := dims1(3);
+        assertTrue(broadcastable(wholeSpan(&column), wholeSpan(&row)), "3x1 and 4 broadcast");
+        assertTrue(broadcastable(wholeSpan(&wide), wholeSpan(&three)), "2x3 and 3 broadcast");
+        assertFalse(broadcastable(wholeSpan(&wide), wholeSpan(&two)), "2x3 and 2 do not");
+        case broadcastShape(wholeSpan(&column), wholeSpan(&row)) of
+            when Some(value as shape: Buffer[Index]) do
+                assertTrue(length(&shape) = 2, "the result has rank 2");
+                assertTrue(nth(&shape, 0) = 3, "3 rows");
+                assertTrue(nth(&shape, 1) = 4, "4 columns");
+                destroyFree(shape);
+            when None do
+                assertTrue(false, "3x1 and 4 have a shape");
+        end case;
+        case broadcastShape(wholeSpan(&wide), wholeSpan(&two)) of
+            when Some(value as shape: Buffer[Index]) do
+                destroyFree(shape);
+                assertTrue(false, "2x3 and 2 have no shape");
+            when None do
+                assertTrue(true, "2x3 and 2 have no shape");
+        end case;
+        destroyFree(column);
+        destroyFree(row);
+        destroyFree(wide);
+        destroyFree(two);
+        destroyFree(three);
+        return nil;
+    end;
+
+    -- A row of three repeats over two rows with stride 0, and a shape it
+    -- does not fit is refused.
+    function testBroadcastToRepeats(): Unit is
+        let shape: Buffer[Index] := dims1(3);
+        var values: Buffer[Int64] := allocateEmpty();
+        insertBack(&!values, 10);
+        insertBack(&!values, 20);
+        insertBack(&!values, 30);
+        let row: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        borrow r: &[NdArray[Int64], Q] := &row do
+            let seen: View[Int64, Q] := view(r);
+            let target: Buffer[Index] := dims2(2, 3);
+            case broadcastTo(&seen, wholeSpan(&target)) of
+                when Some(value as wide: View[Int64, Q]) do
+                    let at: Buffer[Index] := dims2(1, 2);
+                    assertTrue(viewGet(&wide, wholeSpan(&at)) = 30, "row 1 repeats row 0");
+                    assertTrue(viewCount(&wide) = 6, "two rows of three");
+                    destroyFree(at);
+                    destroyView(wide);
+                when None do
+                    assertTrue(false, "3 broadcasts to 2x3");
+            end case;
+            let other: Buffer[Index] := dims2(2, 4);
+            case broadcastTo(&seen, wholeSpan(&other)) of
+                when Some(value as wide: View[Int64, Q]) do
+                    destroyView(wide);
+                    assertTrue(false, "3 does not broadcast to 2x4");
+                when None do
+                    assertTrue(true, "3 does not broadcast to 2x4");
+            end case;
+            destroyFree(other);
+            destroyFree(target);
+            destroyView(seen);
+        end borrow;
+        destroyNdArray(row);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function testDtypeOfInt64(): Unit is
+        let grid: NdArray[Int64] := counting();
+        assertTrue(dtypeCode(&grid) = codeInt64(), "the code of Int64");
+        destroyNdArray(grid);
+        return nil;
+    end;
+
+    -- The requires of get, set and viewGet asks for one position for each
+    -- axis, and the one of reshape for the count of the array: a call
+    -- against them runs in a child of its own, which must stop with the
+    -- message of a violated requires.  A position past the length of its
+    -- axis, for get, set and viewGet, and a slice past the length of its
+    -- axis are refused by the requires too.  The last position and a
+    -- reshape of the same count are taken.
+    function testAWrongIndexIsRefused(): Unit is
+        if asChild("getTooShort") then
+            let grid: NdArray[Int64] := counting();
+            let at: Buffer[Index] := dims1(1);
+            let got: Int64 := get(&grid, wholeSpan(&at));
+            destroyFree(at);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("setTooLong") then
+            var grid: NdArray[Int64] := counting();
+            let at: Buffer[Index] := dims3(0, 0, 0);
+            set(&!grid, wholeSpan(&at), 1);
+            destroyFree(at);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("viewGetTooShort") then
+            let grid: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let at: Buffer[Index] := dims1(0);
+                let got: Int64 := viewGet(&whole, wholeSpan(&at));
+                destroyFree(at);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("reshapeOtherCount") then
+            let shape: Buffer[Index] := dims2(5, 5);
+            let other: NdArray[Int64] := reshape(counting(), wholeSpan(&shape));
+            destroyNdArray(other);
+            destroyFree(shape);
+            return nil;
+        end if;
+        if asChild("getPastRows") then
+            let grid: NdArray[Int64] := counting();
+            let at: Buffer[Index] := dims2(3, 0);
+            let got: Int64 := get(&grid, wholeSpan(&at));
+            destroyFree(at);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("setPastColumns") then
+            var grid: NdArray[Int64] := counting();
+            let at: Buffer[Index] := dims2(0, 4);
+            set(&!grid, wholeSpan(&at), 1);
+            destroyFree(at);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("viewGetPastColumns") then
+            let grid: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let at: Buffer[Index] := dims2(0, 4);
+                let got: Int64 := viewGet(&whole, wholeSpan(&at));
+                destroyFree(at);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("slicePastColumns") then
+            let grid: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let wide: View[Int64, Q] := slice(&whole, 1, 0, 5, 1);
+                destroyView(wide);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("inside") then
+            var grid: NdArray[Int64] := counting();
+            let at: Buffer[Index] := dims2(2, 3);
+            set(&!grid, wholeSpan(&at), 1);
+            let got: Int64 := get(&grid, wholeSpan(&at));
+            let shape: Buffer[Index] := dims2(2, 6);
+            let other: NdArray[Int64] := reshape(grid, wholeSpan(&shape));
+            destroyNdArray(other);
+            destroyFree(shape);
+            destroyFree(at);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "getTooShort", " of Mirco.Array.get ("), "get with one position for two axes is refused");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "setTooLong", " of Mirco.Array.set ("), "set with three positions for two axes is refused");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "viewGetTooShort", " of Mirco.Array.viewGet ("), "viewGet with one position for two axes is refused");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "reshapeOtherCount", " of Mirco.Array.reshape ("), "a reshape of 12 elements to 5 by 5 is refused");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "getPastRows", " of Mirco.Array.get ("), "get of row 3 of 3 rows is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "setPastColumns", " of Mirco.Array.set ("), "set of column 4 of 4 columns is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "viewGetPastColumns", " of Mirco.Array.viewGet ("), "viewGet of column 4 of 4 columns is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongIndexIsRefused", "slicePastColumns", " of Mirco.Array.slice ("), "a slice to column 5 of 4 columns is refused by the requires");
+        assertTrue(not refusedInChild("testAWrongIndexIsRefused", "inside", "Mirco.Array"), "the last position and a reshape to 2 by 6 are taken");
+        assertTrue(not refusedInChild("testAWrongIndexIsRefused", "inside", "contract violated"), "the last position and a reshape to 2 by 6 break no contract");
+        return nil;
+    end;
+
+    -- The requires of flatGet and flatSet asks for a position below the
+    -- count, the one of dimension and viewDimension for an axis below the
+    -- rank, the one of zeros for a valid shape and the one of fromSpan for
+    -- as many values as the shape holds: a call against them runs in a child
+    -- of its own, which must stop with the message of a violated requires.
+    -- The last position, the last axis and a fitting shape are taken.
+    function testAWrongPositionAxisOrShapeIsRefused(): Unit is
+        if asChild("flatGetPastTheCount") then
+            let grid: NdArray[Int64] := counting();
+            let got: Int64 := flatGet(&grid, 12);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("flatSetPastTheCount") then
+            var grid: NdArray[Int64] := counting();
+            flatSet(&!grid, 12, 1);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("dimensionPastTheRank") then
+            let grid: NdArray[Int64] := counting();
+            let d: Index := dimension(&grid, 2);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("viewDimensionPastTheRank") then
+            let grid: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let d: Index := viewDimension(&whole, 2);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("zerosOfAZeroDimension") then
+            let shape: Buffer[Index] := dims2(2, 0);
+            let grid: NdArray[Float64] := zeros(wholeSpan(&shape));
+            destroyNdArray(grid);
+            destroyFree(shape);
+            return nil;
+        end if;
+        if asChild("fromSpanOfTooFewValues") then
+            let shape: Buffer[Index] := dims2(2, 3);
+            var values: Buffer[Int64] := allocateEmpty();
+            insertBack(&!values, 1);
+            insertBack(&!values, 2);
+            insertBack(&!values, 3);
+            insertBack(&!values, 4);
+            insertBack(&!values, 5);
+            let grid: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+            destroyNdArray(grid);
+            destroyFree(values);
+            destroyFree(shape);
+            return nil;
+        end if;
+        if asChild("inside") then
+            var grid: NdArray[Int64] := counting();
+            flatSet(&!grid, 11, 1);
+            let got: Int64 := flatGet(&grid, 11);
+            let d: Index := dimension(&grid, 1);
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let e: Index := viewDimension(&whole, 1);
+                destroyView(whole);
+            end borrow;
+            let shape: Buffer[Index] := dims2(2, 1);
+            let small: NdArray[Float64] := zeros(wholeSpan(&shape));
+            destroyNdArray(small);
+            destroyFree(shape);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testAWrongPositionAxisOrShapeIsRefused", "flatGetPastTheCount", " of Mirco.Array.flatGet ("), "flatGet at 12 of 12 elements is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongPositionAxisOrShapeIsRefused", "flatSetPastTheCount", " of Mirco.Array.flatSet ("), "flatSet at 12 of 12 elements is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongPositionAxisOrShapeIsRefused", "dimensionPastTheRank", " of Mirco.Array.dimension ("), "dimension of axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongPositionAxisOrShapeIsRefused", "viewDimensionPastTheRank", " of Mirco.Array.viewDimension ("), "viewDimension of axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongPositionAxisOrShapeIsRefused", "zerosOfAZeroDimension", " of Mirco.Array.zeros ("), "zeros of 2 by 0 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAWrongPositionAxisOrShapeIsRefused", "fromSpanOfTooFewValues", " of Mirco.Array.fromSpan ("), "fromSpan of 5 values for 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testAWrongPositionAxisOrShapeIsRefused", "fromSpanOfTooFewValues", "Mirco.Array: the"), "fromSpan of 5 values for 2 by 3 does not reach the body");
+        assertTrue(not refusedInChild("testAWrongPositionAxisOrShapeIsRefused", "inside", "Mirco.Array"), "the last position, the last axis and zeros of 2 by 1 are taken");
+        assertTrue(not refusedInChild("testAWrongPositionAxisOrShapeIsRefused", "inside", "contract violated"), "the last position, the last axis and zeros of 2 by 1 break no contract");
+        return nil;
+    end;
+
+    -- The requires of filled asks for a valid shape, the one of flatGetMut
+    -- for a position below the count, the one of shapeCount for at most 32
+    -- axes and the one of slice for a start below the stop and a step of at
+    -- least 1: a call against them runs in a child of its own, which must
+    -- stop with the message of a violated requires.  The edge of each is
+    -- taken.
+    function testFilledFlatGetMutShapeCountAndSliceRefuse(): Unit is
+        if asChild("filledOfAZeroDimension") then
+            let shape: Buffer[Index] := dims2(0, 3);
+            let grid: NdArray[Int64] := filled(wholeSpan(&shape), 7);
+            destroyNdArray(grid);
+            destroyFree(shape);
+            return nil;
+        end if;
+        if asChild("flatGetMutPastTheCount") then
+            var grid: NdArray[Int64] := counting();
+            let got: Int64 := flatGetMut(&!grid, 12);
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("shapeCountOf33Axes") then
+            var shape: Buffer[Index] := allocateEmpty();
+            var axis: Index := 0;
+            while axis < 33 do
+                insertBack(&!shape, 1);
+                axis := axis + 1;
+            end while;
+            let n: Index := shapeCount(wholeSpan(&shape));
+            destroyFree(shape);
+            return nil;
+        end if;
+        if asChild("sliceStartAtStop") then
+            let grid: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let none: View[Int64, Q] := slice(&whole, 1, 2, 2, 1);
+                destroyView(none);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("sliceStepZero") then
+            let grid: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &grid do
+                let whole: View[Int64, Q] := view(g);
+                let still: View[Int64, Q] := slice(&whole, 1, 0, 4, 0);
+                destroyView(still);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(grid);
+            return nil;
+        end if;
+        if asChild("inside") then
+            let shape: Buffer[Index] := dims2(1, 3);
+            let grid: NdArray[Int64] := filled(wholeSpan(&shape), 7);
+            destroyNdArray(grid);
+            destroyFree(shape);
+            var other: NdArray[Int64] := counting();
+            let got: Int64 := flatGetMut(&!other, 11);
+            destroyNdArray(other);
+            var axes: Buffer[Index] := allocateEmpty();
+            var axis: Index := 0;
+            while axis < 32 do
+                insertBack(&!axes, 1);
+                axis := axis + 1;
+            end while;
+            let n: Index := shapeCount(wholeSpan(&axes));
+            destroyFree(axes);
+            let third: NdArray[Int64] := counting();
+            borrow g: &[NdArray[Int64], Q] := &third do
+                let whole: View[Int64, Q] := view(g);
+                let last: View[Int64, Q] := slice(&whole, 1, 3, 4, 1);
+                destroyView(last);
+                destroyView(whole);
+            end borrow;
+            destroyNdArray(third);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testFilledFlatGetMutShapeCountAndSliceRefuse", "filledOfAZeroDimension", " of Mirco.Array.filled ("), "filled of 0 by 3 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testFilledFlatGetMutShapeCountAndSliceRefuse", "flatGetMutPastTheCount", " of Mirco.Array.flatGetMut ("), "flatGetMut at 12 of 12 elements is refused by the requires");
+        assertTrue(refusedByRequiresOf("testFilledFlatGetMutShapeCountAndSliceRefuse", "shapeCountOf33Axes", " of Mirco.Array.shapeCount ("), "shapeCount of 33 axes is refused by the requires");
+        assertTrue(refusedByRequiresOf("testFilledFlatGetMutShapeCountAndSliceRefuse", "sliceStartAtStop", " of Mirco.Array.slice ("), "a slice from 2 to 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testFilledFlatGetMutShapeCountAndSliceRefuse", "sliceStepZero", " of Mirco.Array.slice ("), "a slice of step 0 is refused by the requires");
+        assertTrue(not refusedInChild("testFilledFlatGetMutShapeCountAndSliceRefuse", "inside", "Mirco.Array"), "filled of 1 by 3, the last position, 32 axes and the last column are taken");
+        assertTrue(not refusedInChild("testFilledFlatGetMutShapeCountAndSliceRefuse", "inside", "contract violated"), "filled of 1 by 3, the last position, 32 axes and the last column break no contract");
+        return nil;
+    end;
+end module body.

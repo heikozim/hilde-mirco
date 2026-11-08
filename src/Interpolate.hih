@@ -1,0 +1,69 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Interpolates between known points, linearly as NumPy's interp does or by a natural cubic spline.
+
+- The points xp are to be increasing; a point is found by bisection, in time logarithmic in their count.
+- Outside the points the linear interpolation takes the value at the nearer end, as NumPy does.
+- A spline is made in time linear in the count of points and is zero in its second derivative at both ends.
+
+    let y: Float64 := interpolate(2.5, &xp, &fp);
+"""
+import Mirco.Array (NdArray, count);
+
+module Mirco.Interpolate is
+    """
+    The cubic pieces of a natural spline through a set of points.
+    """
+    type Spline: Linear;
+
+    """
+    The value at x of the line through the points xp, fp next to x.
+    That xp increases is no requires: a condition cannot read the elements, whose reading reaches C, and the body does not check it.
+    """
+    generic [R: Region, S: Region]
+    function interpolate(x: Float64, xp: &[NdArray[Float64], R], fp: &[NdArray[Float64], S]): Float64
+        requires (count(xp) > 0) and (count(xp) = count(fp));
+
+    """
+    interpolate at every element of xs, as a new vector.
+    """
+    generic [Q: Region, R: Region, S: Region]
+    function interpolateAll(xs: &[NdArray[Float64], Q], xp: &[NdArray[Float64], R], fp: &[NdArray[Float64], S]): NdArray[Float64]
+        requires (count(xp) > 0) and (count(xp) = count(fp)) and (count(xs) > 0)
+        ensures count(&result) = count(xs);
+
+    """
+    The natural cubic spline through the points xp, fp, at least two.
+    That xp strictly increases is no requires: a condition cannot read the elements, whose reading reaches C, and the body does not check it.
+    """
+    generic [R: Region, S: Region]
+    function spline(xp: &[NdArray[Float64], R], fp: &[NdArray[Float64], S]): Spline
+        requires (count(xp) >= 2) and (count(xp) = count(fp))
+        ensures splinePoints(&result) = count(xp);
+
+    """
+    The count of points the spline goes through.
+    """
+    generic [R: Region]
+    function splinePoints(s: &[Spline, R]): Index
+        ensures result >= 2;
+
+    """
+    The value of the spline at x; outside the points the end pieces go on.
+    No contract: every x has a value, since the end pieces go on, and every Float64 is a possible result.
+    """
+    generic [R: Region]
+    function splineAt(s: &[Spline, R], x: Float64): Float64;
+
+    """
+    Gives the spline back.
+    No contract: a destroy function.
+    """
+    function destroySpline(s: Spline): Unit;
+end module.

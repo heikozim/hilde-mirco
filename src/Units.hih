@@ -1,0 +1,242 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Quantities of Float64 with their unit in the type, Quantity[Meter] and the like, checked by the compiler.
+
+- Two quantities are added, subtracted or compared only when their units are the same type.
+- A derived unit comes only from the fixed table of the international system below: a velocity is a length divided by a time.
+- A quantity carries no more at run time than its Float64 and an empty marker of its unit.
+
+    let v: Quantity[MeterPerSecond] := velocity(meters(100.0), seconds(9.58));
+"""
+import Standard.String (String, length);
+
+module Mirco.Units is
+    """
+    The units, each a type with an empty value of its own.
+    """
+    type Meter: Free;
+    type Second: Free;
+    type Kilogram: Free;
+    type Ampere: Free;
+    type Kelvin: Free;
+    type SquareMeter: Free;
+    type CubicMeter: Free;
+    type MeterPerSecond: Free;
+    type MeterPerSecondSquared: Free;
+    type Newton: Free;
+    type Joule: Free;
+    type Watt: Free;
+    type Pascal: Free;
+    type Hertz: Free;
+    type Coulomb: Free;
+    type Volt: Free;
+    type Ohm: Free;
+    type KilogramPerCubicMeter: Free;
+
+    """
+    A unit of the international system, with the symbol it is written with.
+    """
+    typeclass SiUnit(T: Free) is
+        """
+        The symbol of the unit, m for the metre.
+        No contract: a method takes no requires or ensures in the language; it has no precondition, the symbol is the instance's constant.
+        """
+        method symbol(unit: T): Span[Nat8, Static];
+    end;
+
+    instance SiUnit(Meter);
+    instance SiUnit(Second);
+    instance SiUnit(Kilogram);
+    instance SiUnit(Ampere);
+    instance SiUnit(Kelvin);
+    instance SiUnit(SquareMeter);
+    instance SiUnit(CubicMeter);
+    instance SiUnit(MeterPerSecond);
+    instance SiUnit(MeterPerSecondSquared);
+    instance SiUnit(Newton);
+    instance SiUnit(Joule);
+    instance SiUnit(Watt);
+    instance SiUnit(Pascal);
+    instance SiUnit(Hertz);
+    instance SiUnit(Coulomb);
+    instance SiUnit(Volt);
+    instance SiUnit(Ohm);
+    instance SiUnit(KilogramPerCubicMeter);
+
+    """
+    A number of a unit U.
+    """
+    type Quantity[U: Free]: Free;
+
+    """
+    The number of the quantity, in its unit.
+    No contract: no precondition, since every quantity holds a number.
+    """
+    generic [U: Free]
+    function valueOf(q: Quantity[U]): Float64;
+
+    """
+    a and b, of the same unit, added.
+    """
+    generic [U: Free]
+    function add(a: Quantity[U], b: Quantity[U]): Quantity[U]
+        ensures (valueOf(result) = (valueOf(a) + valueOf(b))) or (valueOf(result) /= valueOf(result));
+
+    """
+    b, of the same unit, taken from a.
+    """
+    generic [U: Free]
+    function subtract(a: Quantity[U], b: Quantity[U]): Quantity[U]
+        ensures (valueOf(result) = (valueOf(a) - valueOf(b))) or (valueOf(result) /= valueOf(result));
+
+    """
+    a times a number without unit.
+    """
+    generic [U: Free]
+    function scale(a: Quantity[U], factor: Float64): Quantity[U]
+        ensures (valueOf(result) = (valueOf(a) * factor)) or (valueOf(result) /= valueOf(result));
+
+    """
+    How many times b goes into a, a number without unit; b must not be zero.
+    """
+    generic [U: Free]
+    function ratio(a: Quantity[U], b: Quantity[U]): Float64
+        requires valueOf(b) /= 0.0
+        ensures (result = (valueOf(a) / valueOf(b))) or (result /= result);
+
+    """
+    True when a is less than b, both of the same unit.
+    """
+    generic [U: Free]
+    function less(a: Quantity[U], b: Quantity[U]): Bool
+        ensures result = (valueOf(a) < valueOf(b));
+
+    """
+    The quantity written with its unit, as 3.5 m/s.
+    """
+    generic [U: Free(SiUnit)]
+    function format(q: Quantity[U]): String
+        ensures length(&result) > 0;
+
+    """
+    A length in metres.
+    """
+    function meters(v: Float64): Quantity[Meter]
+        ensures (valueOf(result) = v) or (v /= v);
+
+    """
+    A time in seconds.
+    """
+    function seconds(v: Float64): Quantity[Second]
+        ensures (valueOf(result) = v) or (v /= v);
+
+    """
+    A mass in kilograms.
+    """
+    function kilograms(v: Float64): Quantity[Kilogram]
+        ensures (valueOf(result) = v) or (v /= v);
+
+    """
+    A current in amperes.
+    """
+    function amperes(v: Float64): Quantity[Ampere]
+        ensures (valueOf(result) = v) or (v /= v);
+
+    """
+    A temperature in kelvin.
+    """
+    function kelvins(v: Float64): Quantity[Kelvin]
+        ensures (valueOf(result) = v) or (v /= v);
+
+    """
+    The area of a rectangle of the two lengths.
+    """
+    function area(a: Quantity[Meter], b: Quantity[Meter]): Quantity[SquareMeter]
+        ensures (valueOf(result) = (valueOf(a) * valueOf(b))) or (valueOf(result) /= valueOf(result));
+
+    """
+    An area times a length.
+    """
+    function volume(a: Quantity[SquareMeter], b: Quantity[Meter]): Quantity[CubicMeter]
+        ensures (valueOf(result) = (valueOf(a) * valueOf(b))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A length divided by a time; the time must not be zero.
+    """
+    function velocity(d: Quantity[Meter], t: Quantity[Second]): Quantity[MeterPerSecond]
+        requires valueOf(t) /= 0.0
+        ensures (valueOf(result) = (valueOf(d) / valueOf(t))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A velocity divided by a time; the time must not be zero.
+    """
+    function acceleration(v: Quantity[MeterPerSecond], t: Quantity[Second]): Quantity[MeterPerSecondSquared]
+        requires valueOf(t) /= 0.0
+        ensures (valueOf(result) = (valueOf(v) / valueOf(t))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A mass times an acceleration.
+    """
+    function force(m: Quantity[Kilogram], a: Quantity[MeterPerSecondSquared]): Quantity[Newton]
+        ensures (valueOf(result) = (valueOf(m) * valueOf(a))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A force times a length.
+    """
+    function work(f: Quantity[Newton], d: Quantity[Meter]): Quantity[Joule]
+        ensures (valueOf(result) = (valueOf(f) * valueOf(d))) or (valueOf(result) /= valueOf(result));
+
+    """
+    An energy divided by a time; the time must not be zero.
+    """
+    function powerOf(e: Quantity[Joule], t: Quantity[Second]): Quantity[Watt]
+        requires valueOf(t) /= 0.0
+        ensures (valueOf(result) = (valueOf(e) / valueOf(t))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A force divided by an area; the area must not be zero.
+    """
+    function pressure(f: Quantity[Newton], a: Quantity[SquareMeter]): Quantity[Pascal]
+        requires valueOf(a) /= 0.0
+        ensures (valueOf(result) = (valueOf(f) / valueOf(a))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A count of events in a time; the time must not be zero.
+    """
+    function frequency(events: Float64, t: Quantity[Second]): Quantity[Hertz]
+        requires valueOf(t) /= 0.0
+        ensures (valueOf(result) = (events / valueOf(t))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A current times a time.
+    """
+    function charge(i: Quantity[Ampere], t: Quantity[Second]): Quantity[Coulomb]
+        ensures (valueOf(result) = (valueOf(i) * valueOf(t))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A power divided by a current; the current must not be zero.
+    """
+    function voltage(p: Quantity[Watt], i: Quantity[Ampere]): Quantity[Volt]
+        requires valueOf(i) /= 0.0
+        ensures (valueOf(result) = (valueOf(p) / valueOf(i))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A voltage divided by a current; the current must not be zero.
+    """
+    function resistance(u: Quantity[Volt], i: Quantity[Ampere]): Quantity[Ohm]
+        requires valueOf(i) /= 0.0
+        ensures (valueOf(result) = (valueOf(u) / valueOf(i))) or (valueOf(result) /= valueOf(result));
+
+    """
+    A mass divided by a volume; the volume must not be zero.
+    """
+    function density(m: Quantity[Kilogram], v: Quantity[CubicMeter]): Quantity[KilogramPerCubicMeter]
+        requires valueOf(v) /= 0.0
+        ensures (valueOf(result) = (valueOf(m) / valueOf(v))) or (valueOf(result) /= valueOf(result));
+end module.

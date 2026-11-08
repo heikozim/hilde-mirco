@@ -1,0 +1,258 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Standard.Csv (CsvFault);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, rank, dimension, flatGet);
+import Mirco.Csv (MatrixFault, MatrixError, readMatrix, readMatrixWith, writeMatrix);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Csv.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A header, two rows, an empty field: a 2 by 2 matrix with a NaN.
+    function testRead(): Unit is
+        case readMatrix("a,b\n1,2\n3,\n", true) of
+            when Right(right as m: NdArray[Float64]) do
+                assertTrue((rank(&m) = 2) and (dimension(&m, 0) = 2) and (dimension(&m, 1) = 2), "two by two");
+                assertTrue((flatGet(&m, 0) = 1.0) and (flatGet(&m, 1) = 2.0) and (flatGet(&m, 2) = 3.0), "the numbers");
+                let last: Float64 := flatGet(&m, 3);
+                assertTrue(last /= last, "an empty field is a NaN");
+                destroyNdArray(m);
+            when Left(left as e: MatrixError) do
+                assertTrue(false, "a table of numbers is read");
+        end case;
+        case readMatrixWith("1.5;-2\n", 59, false) of
+            when Right(right as m: NdArray[Float64]) do
+                assertTrue((dimension(&m, 0) = 1) and (flatGet(&m, 1) = -2.0), "the semicolon");
+                destroyNdArray(m);
+            when Left(left as e: MatrixError) do
+                assertTrue(false, "a semicolon as the separator");
+        end case;
+        return nil;
+    end;
+
+    function faultCode(e: MatrixError): Int32 is
+        case e.fault of
+            when NotCsv(csv as c: CsvFault) do
+                return 1;
+            when NotANumber do
+                return 2;
+            when NoRows do
+                return 3;
+        end case;
+    end;
+
+    -- Each refusal with its kind, its line and its column.
+    function testRefusals(): Unit is
+        case readMatrix("1,2\n3,x\n", false) of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "x is no number");
+            when Left(left as e: MatrixError) do
+                assertTrue((faultCode(e) = 2) and (e.line = 2) and (e.column = 1), "line 2, column 1");
+        end case;
+        case readMatrix("1,2\n3\n", false) of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "a ragged row");
+            when Left(left as e: MatrixError) do
+                assertTrue((faultCode(e) = 1) and (e.line = 2), "refused by Standard.Csv on line 2");
+        end case;
+        case readMatrix("a,b\n", true) of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "a header alone");
+            when Left(left as e: MatrixError) do
+                assertTrue(faultCode(e) = 3, "no rows");
+        end case;
+        return nil;
+    end;
+
+    -- Whether readMatrixWith refused text with separator as a bad separator
+    -- of Standard.Csv, on line 1 and column 0, rather than stopping.
+    function refusedSeparator(separator: Nat8): Bool is
+        case readMatrixWith("1,2\n", separator, false) of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                return false;
+            when Left(left as e: MatrixError) do
+                case e.fault of
+                    when NotCsv(csv as c: CsvFault) do
+                        case c of
+                            when BadSeparator do
+                                return (e.line = 1) and (e.column = 0);
+                            when QuoteInPlainField do
+                                return false;
+                            when TextAfterQuote do
+                                return false;
+                            when UnclosedQuote do
+                                return false;
+                            when NotUtf8 do
+                                return false;
+                            when RaggedRow do
+                                return false;
+                        end case;
+                    when NotANumber do
+                        return false;
+                    when NoRows do
+                        return false;
+                end case;
+        end case;
+    end;
+
+    -- A double quote, a carriage return and a line feed as the separator are
+    -- a MatrixError, which is why readMatrixWith has no requires on it.
+    function testBadSeparator(): Unit is
+        assertTrue(refusedSeparator(34), "a double quote as the separator is BadSeparator");
+        assertTrue(refusedSeparator(13), "a carriage return as the separator is BadSeparator");
+        assertTrue(refusedSeparator(10), "a line feed as the separator is BadSeparator");
+        return nil;
+    end;
+
+    -- Written and read back: the same matrix.
+    function testWriteAndBack(): Unit is
+        case readMatrix("1,2.5\n0.1,-4\n", false) of
+            when Right(right as m: NdArray[Float64]) do
+                case writeMatrix(&m) of
+                    when Some(value as text: String) do
+                        assertTrue(equal(asSpan(&text), "1,2.5\r\n0.1,-4\r\n"), "shortest numbers, CR LF");
+                        destroyString(text);
+                    when None do
+                        assertTrue(false, "a matrix is written");
+                end case;
+                destroyNdArray(m);
+            when Left(left as e: MatrixError) do
+                assertTrue(false, "the matrix to write");
+        end case;
+        return nil;
+    end;
+
+    -- An array of rank axes, each of length 1, holding 1.5.
+    function ofRank(axes: Index): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        var axis: Index := 0;
+        while axis < axes do
+            insertBack(&!shape, 1);
+            axis := axis + 1;
+        end while;
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.5);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- writeMatrix of an array of rank axes, its text given back.
+    function writeOfRank(axes: Index): Unit is
+        let a: NdArray[Float64] := ofRank(axes);
+        case writeMatrix(&a) of
+            when Some(value as text: String) do
+                destroyString(text);
+            when None do
+                skip;
+        end case;
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- An array of rank 3 and of rank 32 is refused by the requires of
+    -- writeMatrix; rank 1 and rank 2 are taken.
+    function testWriteRefusals(): Unit is
+        if asChild("writeRankThree") then
+            writeOfRank(3);
+            return nil;
+        end if;
+        if asChild("writeRankThirtyTwo") then
+            writeOfRank(32);
+            return nil;
+        end if;
+        if asChild("fits") then
+            writeOfRank(1);
+            writeOfRank(2);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testWriteRefusals", "writeRankThree", "contract violated: the requires"), "writeMatrix of rank 3 is refused by the requires");
+        assertTrue(refusedInChild("testWriteRefusals", "writeRankThirtyTwo", "contract violated: the requires"), "writeMatrix of rank 32 is refused by the requires");
+        assertTrue(not refusedInChild("testWriteRefusals", "fits", "contract violated"), "rank 1 and rank 2 break no contract");
+        assertTrue(not refusedInChild("testWriteRefusals", "fits", "Mirco"), "rank 1 and rank 2 are taken");
+        return nil;
+    end;
+end module body.

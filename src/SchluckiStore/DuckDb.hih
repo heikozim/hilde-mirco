@@ -1,0 +1,85 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The backend DuckDB of Mirco.SchluckiStore, as the opt-in module of that interface.
+
+- A programme that wants DuckDB imports this module; one that does not never sees it, and its build holds
+  no DuckDB and no C++.
+- The five slots of Mirco.SchluckiStore are implemented here, so a call site names no backend of its own:
+  openStore, createTable, scan, query, append and closeStore reach this module through the slots and
+  nothing else.
+- The database is opened with the safe layer of Mirco.Bindings.DuckDB: external access off, the
+  configuration locked, no extension, no file but its own.
+- A file of DuckDB is written by one programme at a time, and a reader beside a writer is refused; within
+  a programme a second store of the same file shares its database.
+- A column of a query is read only as the kind asked for; another type is refused, never converted.
+
+    import Mirco.SchluckiStore.DuckDb (backendDuckDb);
+    import Mirco.SchluckiStore (openStore, closeStore);
+"""
+import Mirco.SchluckiStore (
+    StoreError,
+    DuckHandles,
+    cannotOpen,
+    fileHeld,
+    libraryTooOld,
+    statementFailed,
+    wrongColumns,
+    wrongParameters
+);
+import Mirco.Schlucki (
+    Table,
+    Rows,
+    rowCount,
+    columnCount,
+    columnKind,
+    floatAt,
+    intAt,
+    textAt,
+    boolAt,
+    rowsFor,
+    putFloat,
+    putInt,
+    putText,
+    putBool,
+    finishRows,
+    destroyTable
+);
+
+module Mirco.SchluckiStore.DuckDb is
+    """
+    The backend DuckDB, the value openStore takes for a database of DuckDB; it is the same code
+    Mirco.SchluckiStore gives.
+    """
+    function backendDuckDb(): Nat8
+        ensures result = 2;
+
+    """
+    The database and the connection of an open file of DuckDB, both 0 when there is none, as the slot
+    duckOpen of Mirco.SchluckiStore gives them.
+    No contract: an Either result, which an ensures cannot look into; the answer is the work of the backend.
+    """
+    function openHandles(path: Span[Nat8, Static], writable: Bool): Either[StoreError, DuckHandles];
+
+    """
+    The rows of a statement of DuckDB, a column for each kind of kinds, read only as the kind asked for:
+    another type is refused with wrongColumns and the column, never converted.
+    No contract: an Either result, which an ensures cannot look into; sql is a literal, so no input of the programme reaches it.
+    """
+    generic [S: Region]
+    function scanRows(connection: Nat64, sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows];
+
+    """
+    The rows of t appended to the columns of sql through the Appender of DuckDB in one transaction, the
+    count of rows appended; the first value, row or flush that fails rolls the transaction back, and
+    nothing is written.
+    No contract: an Either result, which an ensures cannot look into; sql is a literal, so no input of the programme reaches it.
+    """
+    generic [S: Region]
+    function appendRows(connection: Nat64, sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64];
+end module.

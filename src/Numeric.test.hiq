@@ -1,0 +1,174 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Numeric (Numeric, plus, minus, times, dividedBy, less, isNaN, oneOf, fromCount);
+import Standard.Bits (float64FromBits);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Numeric.Test is
+    -- Whether this run is the child that stoppedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0.
+    function stoppedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) /= 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function testFloatingPoint(): Unit is
+        assertTrue(plus(1.5, 2.5) = 4.0, "1.5 + 2.5");
+        assertTrue(minus(1.5, 2.5) = -1.0, "1.5 - 2.5");
+        assertTrue(times(1.5, 2.5) = 3.75, "1.5 * 2.5");
+        assertTrue(dividedBy(7.0, 2.0) = 3.5, "7 / 2 in Float64");
+        let a: Float32 := 1.5;
+        let b: Float32 := 0.5;
+        let sum: Float32 := plus(a, b);
+        let quotient: Float32 := dividedBy(a, b);
+        let two: Float32 := 2.0;
+        let three: Float32 := 3.0;
+        assertTrue((sum = two) and (quotient = three), "1.5 + 0.5 and 1.5 / 0.5 in Float32");
+        return nil;
+    end;
+
+    -- An integer division rounds towards zero, as the operator does.
+    function testIntegers(): Unit is
+        assertTrue(dividedBy(7, 2) = 3, "7 / 2 in Int32");
+        assertTrue(dividedBy(-7, 2) = -3, "-7 / 2 in Int32 is -3");
+        let big: Int64 := 3000000000;
+        let half: Int64 := dividedBy(big, 2);
+        assertTrue(half = 1500000000, "3e9 / 2 in Int64");
+        let x: Nat8 := 200;
+        let y: Nat8 := 55;
+        let all: Nat8 := plus(x, y);
+        assertTrue(all = 255, "200 + 55 in Nat8");
+        assertTrue(less(-1, 0) and (not less(0, 0)), "the order of Int32");
+        return nil;
+    end;
+
+    -- less is false when either operand is a NaN; isNaN is never true for
+    -- an integer type.
+    function testNaN(): Unit is
+        let nan: Float64 := float64FromBits(9221120237041090560);
+        assertTrue(isNaN(nan) and (not isNaN(1.0)), "a NaN and a number");
+        assertFalse(less(nan, 1.0) or less(1.0, nan) or less(nan, nan), "no order with a NaN");
+        assertFalse(isNaN(0), "an Int32 is no NaN");
+        return nil;
+    end;
+
+    function testOneAndCount(): Unit is
+        let one_float: Float64 := oneOf();
+        let one_int: Int64 := oneOf();
+        let one_byte: Nat8 := oneOf();
+        assertTrue((one_float = 1.0) and (one_int = 1) and (one_byte = 1), "the one of each type");
+        let count_float: Float64 := fromCount(3);
+        let count_int: Int32 := fromCount(3);
+        assertTrue((count_float = 3.0) and (count_int = 3), "a count of 3");
+        return nil;
+    end;
+
+    -- An integer overflow and a division by zero stop the programme, also
+    -- for a floating point type: each in a child of its own, which must end
+    -- with an exit other than 0; a child that stays in range is not stopped.
+    function testOverflowAndZeroStop(): Unit is
+        if asChild("addInt32") then
+            let r: Int32 := plus(2147483647, 1);
+            return nil;
+        end if;
+        if asChild("belowNat8") then
+            let x: Nat8 := 0;
+            let y: Nat8 := 1;
+            let r: Nat8 := minus(x, y);
+            return nil;
+        end if;
+        if asChild("timesInt64") then
+            let x: Int64 := 4294967296;
+            let r: Int64 := times(x, x);
+            return nil;
+        end if;
+        if asChild("zeroInt32") then
+            let r: Int32 := dividedBy(1, 0);
+            return nil;
+        end if;
+        if asChild("zeroFloat64") then
+            let r: Float64 := dividedBy(1.0, 0.0);
+            return nil;
+        end if;
+        if asChild("inRange") then
+            let r: Int32 := plus(2147483646, 1);
+            let s: Float64 := dividedBy(1.0, 4.0);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(stoppedInChild("testOverflowAndZeroStop", "addInt32"), "2147483647 + 1 in Int32 stops");
+        assertTrue(stoppedInChild("testOverflowAndZeroStop", "belowNat8"), "0 - 1 in Nat8 stops");
+        assertTrue(stoppedInChild("testOverflowAndZeroStop", "timesInt64"), "2^32 * 2^32 in Int64 stops");
+        assertTrue(stoppedInChild("testOverflowAndZeroStop", "zeroInt32"), "1 / 0 in Int32 stops");
+        assertTrue(stoppedInChild("testOverflowAndZeroStop", "zeroFloat64"), "1.0 / 0.0 in Float64 stops");
+        assertTrue(not stoppedInChild("testOverflowAndZeroStop", "inRange"), "a sum in range and a division by 4 are taken");
+        return nil;
+    end;
+end module body.

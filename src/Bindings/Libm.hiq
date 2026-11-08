@@ -1,0 +1,67 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Each function is one call of the C library against math.h, so a
+-- prototype that changes is a compile error and not a wrong call.
+pragma Unsafe_Module;
+pragma Foreign_Library(Name => "m");
+pragma Foreign_Header(Name => "math.h");
+
+module body Mirco.Bindings.Libm is
+    function squareRoot(x: Float64): Float64 is
+        return @embed(Float64, "sqrt($1)", x);
+    end;
+
+    function exponential(x: Float64): Float64 is
+        return @embed(Float64, "exp($1)", x);
+    end;
+
+    function logarithm(x: Float64): Float64 is
+        return @embed(Float64, "log($1)", x);
+    end;
+
+    function logarithmOnePlus(x: Float64): Float64 is
+        return @embed(Float64, "log1p($1)", x);
+    end;
+
+    function logarithm10(x: Float64): Float64 is
+        return @embed(Float64, "log10($1)", x);
+    end;
+
+    function power(base: Float64, exponent: Float64): Float64 is
+        return @embed(Float64, "pow($1, $2)", base, exponent);
+    end;
+
+    function sine(x: Float64): Float64 is
+        return @embed(Float64, "sin($1)", x);
+    end;
+
+    function cosine(x: Float64): Float64 is
+        return @embed(Float64, "cos($1)", x);
+    end;
+
+    function tangent(x: Float64): Float64 is
+        return @embed(Float64, "tan($1)", x);
+    end;
+
+    function arcTangent2(y: Float64, x: Float64): Float64 is
+        return @embed(Float64, "atan2($1, $2)", y, x);
+    end;
+
+    function floor(x: Float64): Float64 is
+        return @embed(Float64, "floor($1)", x);
+    end;
+
+    function ceiling(x: Float64): Float64 is
+        return @embed(Float64, "ceil($1)", x);
+    end;
+
+    function absolute(x: Float64): Float64 is
+        return @embed(Float64, "fabs($1)", x);
+    end;
+end module body.

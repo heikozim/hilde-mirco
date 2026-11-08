@@ -1,0 +1,253 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Tables of Schlucki in a database, the backend named when the store is opened.
+
+- This module is the storage interface of Schlucki, one call for each step of a store: openStore opens,
+  createTable makes a table, append writes rows, scan reads rows, query reads them into a table, closeStore
+  closes.  A call site names these six and never a backend, so the backend is chosen by the value given to
+  openStore and by nothing else.
+- The backend is chosen when the store is opened, backendSqlite or backendDuckDb, and never guessed.
+  backendDefault is SQLite, the backend a caller passes when it names none.
+- SQLite is in this module: its calls are the bodies of openStore, createTable, append, scan, query and
+  closeStore, and Standard.Sqlite is all it needs.  A programme that imports this module alone holds no
+  DuckDB and links no libduckdb and no C++.
+- DuckDB is the opt-in backend: a programme that wants it imports Mirco.SchluckiStore.DuckDb, which
+  implements the five slots duckOpen, duckCreate, duckAppend, duckScan and duckClose.  Without that import
+  the slots give backendAbsent, so naming DuckDB is refused rather than guessed.
+- Both backends take the same calls and give the same rows: append writes every row of a table in one
+  transaction, all of them or none when one fails, and a missing value stays an Option on both sides.
+- DuckDB writes rows through its Appender, so its append takes only "INSERT INTO t (a, ...) VALUES (?, ...)".
+- Every SQL text is a literal of the programme; the values of a table go to question marks only.
+- SQLite reads a column as the kind asked for, through its own conversion when the column holds another
+  type; DuckDB refuses such a column with wrongColumns.  A kind outside kindsKnown is refused by both.
+- columnTypeOf is the one place a kind of Schlucki becomes a column type of SQLite: "REAL" for a Float64,
+  "INTEGER" for an Int64 and for a Bool, "TEXT" for a text.  A table of these types is made "STRICT", and
+  a column of any of the four may be "NULL", which scan and query read as None.
+
+    case openStore(backendDefault(), "facts.sqlite", true) of
+        when Right(right as opened: Store) do
+            var store: Store := opened;
+            let made: Either[StoreError, Unit] := createTable(&!store, "CREATE TABLE places (city TEXT, mass REAL)");
+            ...
+            closeStore(store);
+        ...
+    end case;
+"""
+import Mirco.Schlucki (
+    Table,
+    Rows,
+    kindsKnown,
+    kindFloat,
+    kindInt,
+    kindText,
+    kindBool
+);
+
+module Mirco.SchluckiStore is
+    """
+    The backend SQLite, through Standard.Sqlite. It is the default backend.
+    """
+    function backendSqlite(): Nat8
+        ensures result = 1;
+
+    """
+    The backend DuckDB, through the module Mirco.SchluckiStore.DuckDb and the libduckdb of the system.
+    """
+    function backendDuckDb(): Nat8
+        ensures result = 2;
+
+    """
+    The backend a store takes when the caller names none: SQLite. It is backendSqlite, and a store opened
+    with it is a store of SQLite as backendSqlite gives.
+    """
+    function backendDefault(): Nat8
+        ensures result = backendSqlite();
+
+    """
+    Why a store refused or failed: one of the codes below, and detail, the code of the backend: the
+    SqlError of SQLite, the error type of DuckDB, the failure of Mirco.Bindings.DuckDB.openSafe or the
+    column at fault.
+    """
+    record StoreError: Free is
+        code: Int32;
+        detail: Int32;
+    end;
+
+    """
+    The database could not be opened, or the safe layer of DuckDB did not hold.
+    """
+    function cannotOpen(): Int32
+        ensures result = 1;
+
+    """
+    Another programme holds the file of DuckDB, or this one holds it in another mode.
+    """
+    function fileHeld(): Int32
+        ensures result = 2;
+
+    """
+    The libduckdb of the system is older than 1.5.6.
+    """
+    function libraryTooOld(): Int32
+        ensures result = 3;
+
+    """
+    The backend refused or failed a statement.
+    """
+    function statementFailed(): Int32
+        ensures result = 4;
+
+    """
+    The result of a query has another count of columns than kinds, or a column of another type than its
+    kind, or kinds names a code that is no kind; detail is the column.
+    """
+    function wrongColumns(): Int32
+        ensures result = 5;
+
+    """
+    A write through a store opened for reading only.
+    """
+    function readOnly(): Int32
+        ensures result = 6;
+
+    """
+    The statement of append has another count of question marks than the table has columns, or, for
+    DuckDB, is not of the form "INSERT INTO table (column, ...) VALUES (?, ...)"; detail is the count of
+    question marks, 0 for another form.
+    """
+    function wrongParameters(): Int32
+        ensures result = 7;
+
+    """
+    The backend DuckDB is not in the programme: the module Mirco.SchluckiStore.DuckDb, which implements
+    the slots of DuckDB, was not imported, so the slots give their default body, which is this code.
+    """
+    function backendAbsent(): Int32
+        ensures result = 8;
+
+    """
+    The column type of SQLite for a kind of Schlucki: "REAL" for kindFloat, "INTEGER" for kindInt, "TEXT"
+    for kindText and "INTEGER" for kindBool, which SQLite holds as the integer 0 or 1.  This is the one
+    place a kind of Mirco becomes a column type of SQLite; a table of these types is made "STRICT", so
+    SQLite refuses a value of another type rather than converting it, and a column of any of the four may
+    be "NULL", which scan and query read as None.
+    """
+    function columnTypeOf(kind: Nat8): Span[Nat8, Static]
+        requires (kind = kindFloat()) or (kind = kindInt()) or (kind = kindText()) or (kind = kindBool())
+        ensures spanLength(result) > 0;
+
+    """
+    An open database of SQLite or DuckDB.  Linear: closeStore ends it.
+    """
+    type Store: Linear;
+
+    """
+    The handles of an open database of DuckDB: its database and its connection, both 0 when it is none.
+    """
+    record DuckHandles: Free is
+        database: Nat64;
+        connection: Nat64;
+    end;
+
+    """
+    Opens the database at path with the backend named, for writing when writable holds, creating the file
+    then; ":memory:" is a database in memory. A file of DuckDB is written by one programme at a time and
+    not read by another meanwhile; within a programme a second store of the same file shares its
+    database, and one in another mode is refused with fileHeld. A file of SQLite is opened in WAL mode
+    and written by one writer at a time: a second writer, of this programme or another, is opened, and its
+    writes wait for the write lock up to five seconds and then fail with statementFailed,
+    detail 5 (SQLITE_BUSY), nothing written; readers read beside a writer.
+    """
+    generic [R: Region]
+    function openStore(backend: Nat8, path: Span[Nat8, R], writable: Bool): Either[StoreError, Store]
+        requires ((backend = backendSqlite()) or (backend = backendDuckDb())) and (spanLength(path) > 0);
+
+    """
+    Closes the store.
+    No contract: it only closes what it is given.
+    """
+    function closeStore(store: Store): Unit;
+
+    """
+    The backend of the store.
+    """
+    generic [R: Region]
+    function backendOf(store: &[Store, R]): Nat8
+        ensures (result = backendSqlite()) or (result = backendDuckDb());
+
+    """
+    Runs sql, a statement that makes, changes or drops a table and gives no rows.
+    No contract: no precondition, since a statement that fails or a store for reading only gives a StoreError; sql is a literal, so no input of the programme reaches it.
+    """
+    generic [R: Region]
+    function createTable(store: &![Store, R], sql: Span[Nat8, Static]): Either[StoreError, Unit];
+
+    """
+    The rows a statement gives, a column for each kind of kinds, a null missing. An Int64 is read from an
+    integer of 8 bytes or fewer, a Float64 from a floating point number, a Bool of SQLite from an integer,
+    0 false; DuckDB refuses a column of another type with wrongColumns.  A kind outside kindsKnown is
+    refused with wrongColumns and the column, so that no cell is read as another type.  The rows are
+    linear: query names them into a table, and a caller that scans must name them with finishRows of
+    Mirco.Schlucki or free them with destroyRows.
+    No contract: no precondition, since a statement or a connection that fails gives a StoreError; sql is a literal, so no input of the programme reaches it.
+    """
+    generic [R: Region, S: Region]
+    function scan(store: &![Store, R], sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows];
+
+    """
+    The rows a statement gives, a column for each kind of kinds, named by names joined by commas; a null is
+    missing.  It is scan and finishRows, so both backends read alike.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function query(store: &![Store, R], sql: Span[Nat8, Static], kinds: Span[Nat8, S], names: Span[Nat8, Q]): Either[StoreError, Table]
+        requires (spanLength(kinds) >= 1) and (spanLength(kinds) <= 100000) and kindsKnown(kinds);
+
+    """
+    Runs the statement sql once for each row of t in one transaction, its question marks the values of the
+    row in the order of the columns, a missing one null, a Bool 0 or 1 in SQLite and a boolean in DuckDB;
+    the count of rows changed. When one row fails, the transaction is rolled back and nothing is written.
+    DuckDB takes sql only in the form "INSERT INTO table (column, ...) VALUES (?, ...)" with plain names, and
+    appends the rows to those columns through its Appender instead of running sql; a column not named
+    takes its default.
+    No contract: no precondition, since a statement that fails or a store for reading only gives a StoreError; sql is a literal, so no input of the programme reaches it.
+    """
+    generic [R: Region, S: Region]
+    function append(store: &![Store, R], sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64];
+
+    ---
+    --- The slots of the backends
+    ---
+
+    -- The slots of DuckDB, the one place a second backend is put in without a
+    -- call site naming it: the module Mirco.SchluckiStore.DuckDb implements
+    -- each of them.  A programme that does not import that module keeps the
+    -- default bodies of this module, which give backendAbsent, and closing
+    -- gives back what no open gave.  The handles are the ones that module
+    -- opened.
+    -- No contract: each slot is an I/O result of its backend, which the
+    -- interface above states on the call that reaches it.
+
+    pragma Slot;
+    generic [R: Region]
+    function duckOpen(path: Span[Nat8, R], writable: Bool): Either[StoreError, DuckHandles];
+
+    pragma Slot;
+    function duckCreate(connection: Nat64, sql: Span[Nat8, Static]): Either[StoreError, Unit];
+
+    pragma Slot;
+    generic [S: Region]
+    function duckScan(connection: Nat64, sql: Span[Nat8, Static], kinds: Span[Nat8, S]): Either[StoreError, Rows];
+
+    pragma Slot;
+    generic [S: Region]
+    function duckAppend(connection: Nat64, sql: Span[Nat8, Static], t: &[Table, S]): Either[StoreError, Nat64];
+
+    pragma Slot;
+    function duckClose(database: Nat64, connection: Nat64): Unit;
+end module.

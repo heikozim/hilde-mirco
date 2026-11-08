@@ -1,0 +1,75 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The suite of Mirco.SchluckiStore: one set of assertions, run against every backend.
+
+- Every call here goes through the interface of Mirco.SchluckiStore and names the backend only as the value
+  openStore takes, so the same assertions run against SQLite and against DuckDB, and a backend that behaves
+  otherwise fails them.
+- The suite covers open, create table, append, scan, query and close, the mapping of the four kinds of
+  Mirco to their column types, a missing value as None on both sides, a result of no row, and the backend a
+  caller gets that names none.
+- src/SchluckiStore.test.hiq runs it against SQLite, the default backend.  A test that imports
+  Mirco.SchluckiStore.DuckDb runs the same calls with backendDuckDb.
+
+    roundTrip(backendSqlite());
+"""
+import Mirco.SchluckiStore (Store);
+
+module Mirco.SchluckiStore.Suite is
+    """
+    Makes the table places of the backend: the four columns city, mass, n and ok in the column types of
+    that backend, n the primary key, the table "STRICT" in SQLite.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    generic [R: Region]
+    function createPlacesTable(store: &![Store, R], backend: Nat8): Unit;
+
+    """
+    Appends three rows of places in one call, the keys n0, n1 and n2, the mass of the third one missing;
+    the count of rows appended is asserted.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    generic [R: Region]
+    function appendPlaces(store: &![Store, R], n0: Int64, n1: Int64, n2: Int64): Unit;
+
+    """
+    Opens a database in memory of the backend, makes the table places, appends three rows, reads them back
+    by query and by scan, reads a result of no row and closes the store; every step is asserted.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    function roundTrip(backend: Nat8): Unit;
+
+    """
+    Appends a key twice in one call: the statement fails and no row of the table is kept, so the rows of a
+    table are one transaction.  Then a statement with fewer question marks than the table has columns is
+    refused, and still no row is there.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    function allOrNothing(backend: Nat8): Unit;
+
+    """
+    Reads a row of four NULLs, one column of each kind, and finds None in every cell: a missing value stays
+    an Option on read and is never a value standing in for it.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    function nullRoundTrip(backend: Nat8): Unit;
+
+    """
+    Asserts the column type of each kind of Mirco, that a table of them refuses a value of another type
+    rather than converting it, and that a column of another type than the kind asked for is refused.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    function strictColumnTypes(backend: Nat8): Unit;
+
+    """
+    Asserts that backendDefault is SQLite and that a store opened with it reads and writes as one.
+    No contract: it asserts and returns nil, and a failed assertion stops the programme with its message.
+    """
+    function defaultIsSqlite(): Unit;
+end module.

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Runs a single script of Hilde with the modules of Mirco: a file holding
+# "module body Name is" and a function main of ExitCode.  It is compiled in
+# the root of the package, which gives it every module of src and of the
+# standard library, into .hilde-cache/run/, and then run with the arguments
+# after it; its exit status is the script's.  HILDE names a Hilde tree:
+# its compiler builds the script, its standard/src and bindings/generated
+# are passed as --modules.  POSIX sh.
+#
+#     HILDE=/path/to/hilde tools/mirco-run path/to/Script.hiq arguments...
+set -u
+script=${1:-}
+[ -r "$script" ] || { echo "usage: mirco-run Script.hiq arguments..." >&2; exit 9; }
+shift
+H=${HILDE:-}
+[ -n "$H" ] || { echo "ABORT: HILDE is not set" >&2; exit 9; }
+[ -x "$H/hilde" ] || { echo "ABORT: HILDE does not name a built Hilde" >&2; exit 9; }
+case "$H" in *[!A-Za-z0-9/._-]*) echo "ABORT: HILDE holds a byte other than letters, digits and / . _ -" >&2; exit 9 ;; esac
+for d in standard/src bindings/generated; do
+	[ -d "$H/$d" ] || { echo "ABORT: HILDE has no $d" >&2; exit 9; }
+done
+case "$script" in /*) ;; *) script="$PWD/$script" ;; esac
+root=$(cd "$(dirname "$0")/.." && pwd) || exit 9
+name=$(sed -n 's/^[[:space:]]*module body \([A-Za-z][A-Za-z0-9.]*\) is[[:space:]]*$/\1/p' "$script" | head -1)
+[ -n "$name" ] || { echo "ABORT: $script holds no line module body Name is" >&2; exit 9; }
+out="$root/.hilde-cache/run"
+mkdir -p "$out" || exit 9
+binary="$out/$(printf '%s' "$name" | tr . -)"
+(cd "$root" && "$H/hilde" compile "--modules=$H/standard/src:$H/bindings/generated" "$script" "--entrypoint=$name:main" "--output=$binary") > "$out/compile.log" 2>&1 || {
+	cat "$out/compile.log" >&2
+	exit 9
+}
+exec "$binary" "$@"

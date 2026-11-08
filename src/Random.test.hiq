@@ -1,0 +1,371 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Array (NdArray, destroyNdArray, rank, count, flatGet);
+import Mirco.Random (
+    defaultRng,
+    standardNormal,
+    nextStandardNormal,
+    Pcg64,
+    pcg64,
+    pcg64Wide,
+    pcg64Dxsm,
+    defaultGenerator,
+    nextNat64,
+    nextBelow,
+    nextFloat64,
+    nextNormal,
+    uniform,
+    normal,
+    integers
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Random.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The first six outputs of pcg64 with seed 42 and stream 54 of the
+    -- reference implementation in C, 0x86b1da1d72062b68 and onwards.
+    function testReferenceOutputs(): Unit is
+        var g: Pcg64 := pcg64(42, 54);
+        assertTrue(nextNat64(&!g) = 9705778491962043240, "output 1");
+        assertTrue(nextNat64(&!g) = 1370407407632858425, "output 2");
+        assertTrue(nextNat64(&!g) = 11774395822783136600, "output 3");
+        assertTrue(nextNat64(&!g) = 17944889938176486912, "output 4");
+        assertTrue(nextNat64(&!g) = 14437308781460811564, "output 5");
+        assertTrue(nextNat64(&!g) = 6944869453235589526, "output 6");
+        return nil;
+    end;
+
+    -- A seed and a stream above 2 to the 64 reach the upper halves.
+    function testWideSeed(): Unit is
+        var g: Pcg64 := pcg64Wide(7, 42, 1, 54);
+        assertTrue(nextNat64(&!g) = 12809729369094591433, "wide output 1");
+        assertTrue(nextNat64(&!g) = 9026368430624119466, "wide output 2");
+        var h: Pcg64 := pcg64Wide(0, 42, 0, 54);
+        assertTrue(nextNat64(&!h) = 9705778491962043240, "zero upper halves are pcg64");
+        return nil;
+    end;
+
+    function testDxsm(): Unit is
+        var g: Pcg64 := pcg64Dxsm(42, 54);
+        assertTrue(nextNat64(&!g) = 17331114245835578256, "dxsm output 1");
+        assertTrue(nextNat64(&!g) = 10267467544499227306, "dxsm output 2");
+        assertTrue(nextNat64(&!g) = 9726600296081716989, "dxsm output 3");
+        var d: Pcg64 := defaultGenerator(42, 54);
+        assertTrue(nextNat64(&!d) = 17331114245835578256, "the default is pcg64Dxsm");
+        var other: Pcg64 := defaultGenerator(42, 55);
+        assertTrue(nextNat64(&!other) /= 17331114245835578256, "another stream, other numbers");
+        return nil;
+    end;
+
+    function testFloatsAndBounds(): Unit is
+        var g: Pcg64 := pcg64(1, 1);
+        assertTrue(nextFloat64(&!g) = 0.8297300050883016, "the top 53 bits of the first output");
+        var seen: Nat64 := 0;
+        var i: Index := 0;
+        while i < 1000 do
+            let x: Nat64 := nextBelow(&!g, 6);
+            if x = 5 then
+                seen := seen + 1;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue((seen > 100) and (seen < 240), "about one in six is a five");
+        return nil;
+    end;
+
+    -- The mean and the variance of 20000 normal numbers, within four
+    -- standard errors of 0 and 1.
+    function testNormal(): Unit is
+        var g: Pcg64 := pcg64(3, 5);
+        var total: Float64 := 0.0;
+        var squares: Float64 := 0.0;
+        var i: Index := 0;
+        while i < 20000 do
+            let x: Float64 := nextNormal(&!g);
+            total := total + x;
+            squares := squares + (x * x);
+            i := i + 1;
+        end while;
+        let mean: Float64 := total / 20000.0;
+        let variance: Float64 := squares / 20000.0;
+        assertTrue((mean > -0.03) and (mean < 0.03), "mean near 0");
+        assertTrue((variance > 0.96) and (variance < 1.04), "variance near 1");
+        return nil;
+    end;
+
+    function testArrays(): Unit is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        insertBack(&!shape, 4);
+        var g: Pcg64 := pcg64(9, 9);
+        let u: NdArray[Float64] := uniform(&!g, wholeSpan(&shape));
+        assertTrue((rank(&u) = 2) and (count(&u) = 12), "a 3 by 4 array");
+        let n: NdArray[Float64] := normal(&!g, wholeSpan(&shape), 10.0, 0.0);
+        assertTrue(flatGet(&n, 7) = 10.0, "deviation 0 gives the mean");
+        let k: NdArray[Int64] := integers(&!g, wholeSpan(&shape), -3, 3);
+        var inside: Index := 0;
+        var at: Index := 0;
+        while at < 12 do
+            if (flatGet(&k, at) >= -3) and (flatGet(&k, at) < 3) then
+                inside := inside + 1;
+            end if;
+            at := at + 1;
+        end while;
+        assertTrue(inside = 12, "every integer from -3 below 3");
+        destroyNdArray(u);
+        destroyNdArray(n);
+        destroyNdArray(k);
+        destroyFree(shape);
+        return nil;
+    end;
+    -- NumPy's default_rng(42).random() gives 0.7739560485559633,
+    -- 0.4388784397520523 and 0.8585979199113825; default_rng(0).random()
+    -- gives 0.6369616873214543.
+    function testDefaultRngAsNumPy(): Unit is
+        var g: Pcg64 := defaultRng(42);
+        assertTrue(nextFloat64(&!g) = 0.7739560485559633, "the first of seed 42");
+        assertTrue(nextFloat64(&!g) = 0.4388784397520523, "the second");
+        assertTrue(nextFloat64(&!g) = 0.8585979199113825, "the third");
+        var z: Pcg64 := defaultRng(0);
+        assertTrue(nextFloat64(&!z) = 0.6369616873214543, "the first of seed 0");
+        return nil;
+    end;
+    -- NumPy's default_rng(42).standard_normal(5) gives 0.30471707975443135,
+    -- -1.0399841062404955, 0.7504511958064572, 0.9405647163912139 and
+    -- -1.9510351886538364.
+    function testStandardNormalAsNumPy(): Unit is
+        var g: Pcg64 := defaultRng(42);
+        assertTrue(nextStandardNormal(&!g) = 0.30471707975443135, "the first");
+        assertTrue(nextStandardNormal(&!g) = -1.0399841062404955, "the second");
+        assertTrue(nextStandardNormal(&!g) = 0.7504511958064572, "the third");
+        assertTrue(nextStandardNormal(&!g) = 0.9405647163912139, "the fourth");
+        assertTrue(nextStandardNormal(&!g) = -1.9510351886538364, "the fifth");
+        return nil;
+    end;
+
+    -- 200000 numbers of each normal method, so that the tail of the
+    -- ziggurat is drawn some fifty times; each call checks its ensures, and
+    -- the largest size seen lies inside it and beyond the base layer.
+    function testNormalsInsideTheirRange(): Unit is
+        var g: Pcg64 := defaultRng(7);
+        var largest: Float64 := 0.0;
+        var i: Index := 0;
+        while i < 200000 do
+            let z: Float64 := nextStandardNormal(&!g);
+            let x: Float64 := nextNormal(&!g);
+            if z > largest then
+                largest := z;
+            end if;
+            if (0.0 - z) > largest then
+                largest := 0.0 - z;
+            end if;
+            if x > largest then
+                largest := x;
+            end if;
+            if (0.0 - x) > largest then
+                largest := 0.0 - x;
+            end if;
+            i := i + 1;
+        end while;
+        assertTrue((largest > 3.92) and (largest < 9.0), "the largest size of 400000 normal numbers lies past the base layer and inside the ensures");
+        return nil;
+    end;
+
+    -- An array of shape drawn by the method which: 0 standardNormal, 1
+    -- uniform, 2 normal with deviation, 3 integers from low below high.
+    generic [S: Region]
+    function drawnOf(which: Index, shape: Span[Index, S], deviation: Float64, low: Int64, high: Int64): Unit is
+        var g: Pcg64 := pcg64(9, 9);
+        if which = 0 then
+            let a: NdArray[Float64] := standardNormal(&!g, shape);
+            destroyNdArray(a);
+        end if;
+        if which = 1 then
+            let a: NdArray[Float64] := uniform(&!g, shape);
+            destroyNdArray(a);
+        end if;
+        if which = 2 then
+            let a: NdArray[Float64] := normal(&!g, shape, 0.0, deviation);
+            destroyNdArray(a);
+        end if;
+        if which = 3 then
+            let a: NdArray[Int64] := integers(&!g, shape, low, high);
+            destroyNdArray(a);
+        end if;
+        return nil;
+    end;
+
+    -- The method which over a shape of 3 by 0, an empty shape, or 3 by 4.
+    function shapedOf(which: Index, kind: Index, deviation: Float64, low: Int64, high: Int64): Unit is
+        var shape: Buffer[Index] := allocateEmpty();
+        if kind = 0 then
+            insertBack(&!shape, 3);
+            insertBack(&!shape, 0);
+        end if;
+        if kind = 2 then
+            insertBack(&!shape, 3);
+            insertBack(&!shape, 4);
+        end if;
+        drawnOf(which, wholeSpan(&shape), deviation, low, high);
+        destroyFree(shape);
+        return nil;
+    end;
+
+    -- Each call in a child of its own: a bound of 0 for nextBelow, a shape
+    -- with an axis of 0 and an empty shape for each of the four array
+    -- methods, a deviation of -1 for normal and a low not below high for
+    -- integers are refused by the requires.  The fitting calls are taken.
+    function testRefusals(): Unit is
+        if asChild("belowZero") then
+            var g: Pcg64 := pcg64(1, 1);
+            let x: Nat64 := nextBelow(&!g, 0);
+            return nil;
+        end if;
+        if asChild("standardNormalZeroAxis") then
+            shapedOf(0, 0, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("standardNormalNoAxis") then
+            shapedOf(0, 1, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("uniformZeroAxis") then
+            shapedOf(1, 0, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("uniformNoAxis") then
+            shapedOf(1, 1, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("normalZeroAxis") then
+            shapedOf(2, 0, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("normalNoAxis") then
+            shapedOf(2, 1, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("normalNegativeDeviation") then
+            shapedOf(2, 2, -1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("integersZeroAxis") then
+            shapedOf(3, 0, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("integersNoAxis") then
+            shapedOf(3, 1, 1.0, 0, 1);
+            return nil;
+        end if;
+        if asChild("integersEmptyRange") then
+            shapedOf(3, 2, 1.0, 3, 3);
+            return nil;
+        end if;
+        if asChild("integersReversed") then
+            shapedOf(3, 2, 1.0, 3, -3);
+            return nil;
+        end if;
+        if asChild("fits") then
+            var g: Pcg64 := pcg64(1, 1);
+            let x: Nat64 := nextBelow(&!g, 1);
+            shapedOf(0, 2, 1.0, 0, 1);
+            shapedOf(1, 2, 1.0, 0, 1);
+            shapedOf(2, 2, 0.0, 0, 1);
+            shapedOf(3, 2, 1.0, -3, -2);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "belowZero", "contract violated: the requires"), "nextBelow 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "standardNormalZeroAxis", "contract violated: the requires"), "standardNormal of 3 by 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "standardNormalNoAxis", "contract violated: the requires"), "standardNormal of an empty shape is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "uniformZeroAxis", "contract violated: the requires"), "uniform of 3 by 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "uniformNoAxis", "contract violated: the requires"), "uniform of an empty shape is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "normalZeroAxis", "contract violated: the requires"), "normal of 3 by 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "normalNoAxis", "contract violated: the requires"), "normal of an empty shape is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "normalNegativeDeviation", "contract violated: the requires"), "normal with a deviation of -1 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integersZeroAxis", "contract violated: the requires"), "integers of 3 by 0 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integersNoAxis", "contract violated: the requires"), "integers of an empty shape is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integersEmptyRange", "contract violated: the requires"), "integers from 3 below 3 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "integersReversed", "contract violated: the requires"), "integers from 3 below -3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "fitting calls break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "fitting calls are taken");
+        return nil;
+    end;
+end module body.

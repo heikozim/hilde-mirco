@@ -1,0 +1,120 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray);
+import Mirco.Fft (
+    Signal,
+    signal,
+    realSignal,
+    destroySignal,
+    signalLength,
+    realAt,
+    imaginaryAt,
+    fft as plainFft,
+    inverseFft as plainInverse,
+    realFft as plainRealFft
+);
+import Mirco.Pocketfft (fft, inverseFft, realFft);
+import Mirco.Math (absolute, sine, cosine);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Pocketfft.Test is
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) <= (0.000000001 * (1.0 + absolute(b)));
+    end;
+
+    generic [R: Region, S: Region]
+    function same(a: &[Signal, R], b: &[Signal, S]): Bool is
+        if signalLength(a) /= signalLength(b) then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < signalLength(a) do
+            if not (near(realAt(a, k), realAt(b, k)) and near(imaginaryAt(a, k), imaginaryAt(b, k))) then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    function samples(n: Index, seed: Float64, wave: Bool): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        var x: Float64 := 0.0;
+        while k < n do
+            if wave then
+                insertBack(&!v, sine(seed + ((x * x) * 0.13)));
+            else
+                insertBack(&!v, cosine(seed + (x * 0.77)));
+            end if;
+            x := x + 1.0;
+            k := k + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(shape);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- One length: the complex transform, its inverse and the transform of
+    -- a real vector of pocketfft against those of Mirco.Fft.
+    function agrees(n: Index): Bool is
+        let re: NdArray[Float64] := samples(n, 0.3, true);
+        let im: NdArray[Float64] := samples(n, 1.1, false);
+        let s: Signal := signal(&re, &im);
+        let f1: Signal := fft(&s);
+        let f2: Signal := plainFft(&s);
+        let i1: Signal := inverseFft(&s);
+        let i2: Signal := plainInverse(&s);
+        let r1: Signal := realFft(&re);
+        let r2: Signal := plainRealFft(&re);
+        let ok: Bool := same(&f1, &f2) and (same(&i1, &i2) and same(&r1, &r2));
+        destroySignal(f1);
+        destroySignal(f2);
+        destroySignal(i1);
+        destroySignal(i2);
+        destroySignal(r1);
+        destroySignal(r2);
+        destroySignal(s);
+        destroyNdArray(re);
+        destroyNdArray(im);
+        return ok;
+    end;
+
+    -- Powers of two, lengths of the codelets 3, 5, 7 and 11, a prime of
+    -- Bluestein and the length one.
+    function testLengths(): Unit is
+        assertTrue(agrees(1), "length 1");
+        assertTrue(agrees(2), "length 2");
+        assertTrue(agrees(8), "length 8");
+        assertTrue(agrees(12), "length 12");
+        assertTrue(agrees(35), "length 35");
+        assertTrue(agrees(77), "length 77");
+        assertTrue(agrees(97), "length 97, a prime");
+        assertTrue(agrees(256), "length 256");
+        return nil;
+    end;
+
+    -- The transform and its inverse give the signal back.
+    function testRoundTrip(): Unit is
+        let re: NdArray[Float64] := samples(60, 0.5, true);
+        let s: Signal := realSignal(&re);
+        let f: Signal := fft(&s);
+        let back: Signal := inverseFft(&f);
+        assertTrue(same(&back, &s), "the inverse of the transform");
+        destroySignal(back);
+        destroySignal(f);
+        destroySignal(s);
+        destroyNdArray(re);
+        return nil;
+    end;
+end module body.

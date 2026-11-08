@@ -1,0 +1,124 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Csv (
+    CsvFault,
+    CsvError,
+    CsvTable,
+    CsvWriter,
+    readCsvWith,
+    destroyCsv,
+    rowCount,
+    columnCount,
+    fieldAt,
+    makeCsvWriter,
+    writeField,
+    endRow,
+    finishCsv
+);
+import Standard.Bits (float64FromBits);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, dimension, count, flatGet, fromSpan);
+import Mirco.Text (parseFloat64, formatFloat64);
+
+module body Mirco.Csv is
+    constant nan_bits: Nat64 := 9221120237041090560;
+
+    function refused(fault: MatrixFault, line: Index, column: Index): Either[MatrixError, NdArray[Float64]] is
+        let e: Either[MatrixError, NdArray[Float64]] := Left(left => MatrixError(fault => fault, line => line, column => column));
+        return e;
+    end;
+
+    generic [R: Region]
+    function readMatrix(text: Span[Nat8, R], header: Bool): Either[MatrixError, NdArray[Float64]] is
+        return readMatrixWith(text, 44, header);
+    end;
+
+    -- The line of a row is its position from 1, which holds for a table
+    -- without line breaks inside quotes, the only kind numbers make.
+    generic [R: Region]
+    function readMatrixWith(text: Span[Nat8, R], separator: Nat8, header: Bool): Either[MatrixError, NdArray[Float64]] is
+        case readCsvWith(text, separator) of
+            when Left(left as e: CsvError) do
+                return refused(NotCsv(csv => e.fault), e.line, 0);
+            when Right(right as table: CsvTable) do
+                let result: Either[MatrixError, NdArray[Float64]] := numbersOf(&table, header);
+                destroyCsv(table);
+                return result;
+        end case;
+    end;
+
+    generic [R: Region]
+    function numbersOf(table: &[CsvTable, R], header: Bool): Either[MatrixError, NdArray[Float64]] is
+        var first: Index := 0;
+        if header then
+            first := 1;
+        end if;
+        let rows: Index := rowCount(table);
+        let cols: Index := columnCount(table);
+        if (rows <= first) or (cols = 0) then
+            return refused(NoRows(), 1, 0);
+        end if;
+        var values: Buffer[Float64] := allocateEmpty();
+        var r: Index := first;
+        while r < rows do
+            var c: Index := 0;
+            while c < cols do
+                case fieldAt(table, r, c) of
+                    when Some(value as field: Span[Nat8, R]) do
+                        if spanLength(field) = 0 then
+                            insertBack(&!values, float64FromBits(nan_bits));
+                        else
+                            case parseFloat64(field) of
+                                when Some(value as x: Float64) do
+                                    insertBack(&!values, x);
+                                when None do
+                                    destroyFree(values);
+                                    return refused(NotANumber(), r + 1, c);
+                            end case;
+                        end if;
+                    when None do
+                        destroyFree(values);
+                        return refused(NotANumber(), r + 1, c);
+                end case;
+                c := c + 1;
+            end while;
+            r := r + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows - first);
+        insertBack(&!shape, cols);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        let good: Either[MatrixError, NdArray[Float64]] := Right(right => made);
+        return good;
+    end;
+
+    generic [R: Region]
+    function writeMatrix(a: &[NdArray[Float64], R]): Option[String] is
+        var cols: Index := 1;
+        if rank(a) = 2 then
+            cols := dimension(a, 1);
+        end if;
+        let n: Index := count(a);
+        var w: CsvWriter := makeCsvWriter();
+        var at: Index := 0;
+        while at < n do
+            let text: String := formatFloat64(flatGet(a, at));
+            writeField(&!w, asSpan(&text));
+            destroyString(text);
+            at := at + 1;
+            if rem(at, cols) = 0 then
+                endRow(&!w);
+            end if;
+        end while;
+        return finishCsv(w);
+    end;
+end module body.

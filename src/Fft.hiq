@@ -1,0 +1,335 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    destroyFree,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    swapIndex,
+    wholeSpan
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, count, flatGet, zeros, flatSet, countMut);
+import Mirco.Math (squareRoot, sine, cosine, pi);
+
+module body Mirco.Fft is
+    record Signal: Linear is
+        real: Buffer[Float64];
+        imaginary: Buffer[Float64];
+        invariant (length(&real) = length(&imaginary)) and (length(&real) > 0);
+    end;
+
+    function wide(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as w: Float64) do
+                return w;
+            when None do
+                abort("Mirco.Fft: a count that is no Float64");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function signal(real: &[NdArray[Float64], R], imaginary: &[NdArray[Float64], S]): Signal is
+        let n: Index := count(real);
+        var re: Buffer[Float64] := allocateEmpty();
+        var im: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!re, flatGet(real, at));
+            insertBack(&!im, flatGet(imaginary, at));
+            at := at + 1;
+        end while;
+        return Signal(real => re, imaginary => im);
+    end;
+
+    generic [R: Region]
+    function realSignal(real: &[NdArray[Float64], R]): Signal is
+        let n: Index := count(real);
+        var re: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!re, flatGet(real, at));
+            at := at + 1;
+        end while;
+        let im: Buffer[Float64] := initialize(n, 0.0);
+        return Signal(real => re, imaginary => im);
+    end;
+
+    function destroySignal(s: Signal): Unit is
+        let { real: Buffer[Float64], imaginary: Buffer[Float64] } := s;
+        destroyFree(real);
+        destroyFree(imaginary);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function signalLength(s: &[Signal, R]): Index is
+        return length(&(s->real));
+    end;
+
+    generic [R: Region]
+    function realAt(s: &[Signal, R], k: Index): Float64 is
+        return nth(&(s->real), k);
+    end;
+
+    generic [R: Region]
+    function imaginaryAt(s: &[Signal, R], k: Index): Float64 is
+        return nth(&(s->imaginary), k);
+    end;
+
+    generic [R: Region]
+    function magnitude(s: &[Signal, R]): NdArray[Float64] is
+        let n: Index := signalLength(s);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        var made: NdArray[Float64] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        var at: Index := 0;
+        while at < n do
+            let r: Float64 := realAt(s, at);
+            let i: Float64 := imaginaryAt(s, at);
+            flatSet(&!made, at, squareRoot((r * r) + (i * i)));
+            at := at + 1;
+        end while;
+        return made;
+    end;
+
+    function isPowerOfTwo(n: Index): Bool is
+        var p: Index := 1;
+        while p < n do
+            p := p * 2;
+        end while;
+        return p = n;
+    end;
+
+    -- True when the bit of value bit, a power of two, is set in j.
+    function hasBit(j: Index, bit: Index): Bool is
+        return rem(j / bit, 2) = 1;
+    end;
+
+    -- Puts the elements into the order of the reversed bits of their
+    -- positions, as the transform in place needs them.
+    generic [R: Region, S: Region]
+    function reorder(re: &![Buffer[Float64], R], im: &![Buffer[Float64], S], n: Index): Unit is
+        var j: Index := 0;
+        var i: Index := 1;
+        while i < n do
+            var bit: Index := n / 2;
+            var carrying: Bool := true;
+            while carrying do
+                if bit = 0 then
+                    carrying := false;
+                else
+                    if hasBit(j, bit) then
+                        j := j - bit;
+                        bit := bit / 2;
+                    else
+                        carrying := false;
+                    end if;
+                end if;
+            end while;
+            j := j + bit;
+            if i < j then
+                swapIndex(&~re, i, j);
+                swapIndex(&~im, i, j);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The transform in place of n values, n a power of two, with the
+    -- exponent sign times 2 pi i / n; not scaled.
+    generic [R: Region, S: Region]
+    function radix2(re: &![Buffer[Float64], R], im: &![Buffer[Float64], S], n: Index, sign: Float64): Unit is
+        reorder(&~re, &~im, n);
+        var size: Index := 2;
+        while size <= n do
+            let half: Index := size / 2;
+            let step: Float64 := (sign * 2.0 * pi()) / wide(size);
+            var start: Index := 0;
+            while start < n do
+                var k: Index := 0;
+                while k < half do
+                    let angle: Float64 := step * wide(k);
+                    let wr: Float64 := cosine(angle);
+                    let wi: Float64 := sine(angle);
+                    let p: Index := start + k;
+                    let q: Index := p + half;
+                    let ur: Float64 := nthMut(&~re, p);
+                    let ui: Float64 := nthMut(&~im, p);
+                    let xr: Float64 := nthMut(&~re, q);
+                    let xi: Float64 := nthMut(&~im, q);
+                    let vr: Float64 := (xr * wr) - (xi * wi);
+                    let vi: Float64 := (xr * wi) + (xi * wr);
+                    storeNth(&~re, p, ur + vr);
+                    storeNth(&~im, p, ui + vi);
+                    storeNth(&~re, q, ur - vr);
+                    storeNth(&~im, q, ui - vi);
+                    k := k + 1;
+                end while;
+                start := start + size;
+            end while;
+            size := size * 2;
+        end while;
+        return nil;
+    end;
+
+    -- Any length n as a convolution of length m, a power of two: with the
+    -- chirp w at k = e to the sign i pi k k / n, X at k is w at k times the
+    -- sum of x at j w at j and the conjugate of w at k - j.  k k is taken
+    -- modulo 2 n, where the chirp repeats, to keep the angle small.
+    generic [R: Region, S: Region]
+    function bluestein(re: &![Buffer[Float64], R], im: &![Buffer[Float64], S], n: Index, sign: Float64): Unit is
+        var m: Index := 1;
+        while m < ((2 * n) - 1) do
+            m := m * 2;
+        end while;
+        var ar: Buffer[Float64] := initialize(m, 0.0);
+        var ai: Buffer[Float64] := initialize(m, 0.0);
+        var br: Buffer[Float64] := initialize(m, 0.0);
+        var bi: Buffer[Float64] := initialize(m, 0.0);
+        var cr: Buffer[Float64] := allocateEmpty();
+        var ci: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            let t: Float64 := (pi() * wide(rem(k * k, 2 * n))) / wide(n);
+            let wr: Float64 := cosine(t);
+            let wi: Float64 := sign * sine(t);
+            insertBack(&!cr, wr);
+            insertBack(&!ci, wi);
+            let xr: Float64 := nthMut(&~re, k);
+            let xi: Float64 := nthMut(&~im, k);
+            storeNth(&!ar, k, (xr * wr) - (xi * wi));
+            storeNth(&!ai, k, (xr * wi) + (xi * wr));
+            storeNth(&!br, k, wr);
+            storeNth(&!bi, k, 0.0 - wi);
+            if k > 0 then
+                storeNth(&!br, m - k, wr);
+                storeNth(&!bi, m - k, 0.0 - wi);
+            end if;
+            k := k + 1;
+        end while;
+        radix2(&!ar, &!ai, m, -1.0);
+        radix2(&!br, &!bi, m, -1.0);
+        var j: Index := 0;
+        while j < m do
+            let pr: Float64 := nthMut(&!ar, j);
+            let pi2: Float64 := nthMut(&!ai, j);
+            let qr: Float64 := nthMut(&!br, j);
+            let qi: Float64 := nthMut(&!bi, j);
+            storeNth(&!ar, j, (pr * qr) - (pi2 * qi));
+            storeNth(&!ai, j, (pr * qi) + (pi2 * qr));
+            j := j + 1;
+        end while;
+        radix2(&!ar, &!ai, m, 1.0);
+        let scale: Float64 := wide(m);
+        k := 0;
+        while k < n do
+            let sr: Float64 := nthMut(&!ar, k) / scale;
+            let si: Float64 := nthMut(&!ai, k) / scale;
+            let wr: Float64 := nthMut(&!cr, k);
+            let wi: Float64 := nthMut(&!ci, k);
+            storeNth(&~re, k, (sr * wr) - (si * wi));
+            storeNth(&~im, k, (sr * wi) + (si * wr));
+            k := k + 1;
+        end while;
+        destroyFree(ar);
+        destroyFree(ai);
+        destroyFree(br);
+        destroyFree(bi);
+        destroyFree(cr);
+        destroyFree(ci);
+        return nil;
+    end;
+
+    -- The transform of copies of the parts of s; the inverse divides by n.
+    generic [R: Region]
+    function transformed(s: &[Signal, R], sign: Float64, inverse: Bool): Signal is
+        let n: Index := signalLength(s);
+        var re: Buffer[Float64] := allocateEmpty();
+        var im: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!re, realAt(s, at));
+            insertBack(&!im, imaginaryAt(s, at));
+            at := at + 1;
+        end while;
+        if isPowerOfTwo(n) then
+            radix2(&!re, &!im, n, sign);
+        else
+            bluestein(&!re, &!im, n, sign);
+        end if;
+        if inverse then
+            let scale: Float64 := wide(n);
+            at := 0;
+            while at < n do
+                let r: Float64 := nthMut(&!re, at);
+                let i: Float64 := nthMut(&!im, at);
+                storeNth(&!re, at, r / scale);
+                storeNth(&!im, at, i / scale);
+                at := at + 1;
+            end while;
+        end if;
+        return Signal(real => re, imaginary => im);
+    end;
+
+    generic [R: Region]
+    function fft(s: &[Signal, R]): Signal is
+        return transformed(s, -1.0, false);
+    end;
+
+    generic [R: Region]
+    function inverseFft(s: &[Signal, R]): Signal is
+        return transformed(s, 1.0, true);
+    end;
+
+    generic [R: Region]
+    function realFft(real: &[NdArray[Float64], R]): Signal is
+        let input: Signal := realSignal(real);
+        let whole: Signal := fft(&input);
+        destroySignal(input);
+        let kept: Index := (count(real) / 2) + 1;
+        var re: Buffer[Float64] := allocateEmpty();
+        var im: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < kept do
+            insertBack(&!re, realAt(&whole, at));
+            insertBack(&!im, imaginaryAt(&whole, at));
+            at := at + 1;
+        end while;
+        destroySignal(whole);
+        return Signal(real => re, imaginary => im);
+    end;
+
+    -- The positive frequencies first, from 0 up, then the negative ones.
+    function fftFrequencies(n: Index, spacing: Float64): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        var made: NdArray[Float64] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        let unit: Float64 := 1.0 / (spacing * wide(n));
+        let positive: Index := (n + 1) / 2;
+        var at: Index := 0;
+        while at < n do
+            if at < positive then
+                flatSet(&!made, at, wide(at) * unit);
+            else
+                flatSet(&!made, at, (0.0 - wide(n - at)) * unit);
+            end if;
+            at := at + 1;
+        end while;
+        return made;
+    end;
+end module body.

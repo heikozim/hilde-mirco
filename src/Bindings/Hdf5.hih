@@ -1,0 +1,134 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the functions of the HDF5 library that write and read whole datasets of numbers.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.Hdf5 is the safe module built on it, and the one a programme imports.
+- An identifier is the hid_t of HDF5 as Int64, negative when the call failed.
+
+    let file: Int64 := createFile("out.h5");
+"""
+module Mirco.Bindings.Hdf5 is
+    """
+    Whether text holds no zero byte, which would end the name for the C library; true for an empty text.
+    Any span can be scanned, so it has no requires. It is the condition of the requires of Mirco.Hdf5.writeFloat64,
+    writeInt64, readFloat64 and readInt64.
+    """
+    generic [R: Region]
+    function zeroFree(text: Span[Nat8, R]): Bool
+        ensures (spanLength(text) > 0) or result;
+
+    """
+    Turns off the printing of the error stack of HDF5, so that a failed call only returns its code.
+    No contract: no precondition, since it takes no argument; Mirco.Hdf5.writeFloat64, writeInt64, readFloat64 and readInt64 call it before they open a file.
+    """
+    function quiet(): Unit;
+
+    """
+    Creates the file at path anew, H5Fcreate with H5F_ACC_TRUNC; its identifier, negative on failure.
+    """
+    generic [R: Region]
+    function createFile(path: Span[Nat8, R]): Int64
+        requires zeroFree(path);
+
+    """
+    Opens the file at path, for writing when writable holds, H5Fopen; its identifier, negative on failure.
+    """
+    generic [R: Region]
+    function openFile(path: Span[Nat8, R], writable: Bool): Int64
+        requires zeroFree(path);
+
+    """
+    Closes a file, H5Fclose; 0 when it was closed, negative on failure.
+    No contract: no precondition, since HDF5 refuses an identifier that is no open file, and the result is negative; Mirco.Hdf5.writeFloat64, writeInt64, readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), close only a file they opened.
+    """
+    function closeFile(file: Int64): Int32;
+
+    """
+    Creates the dataset name of the given dimensions in a file, of little endian binary64 numbers when
+    floating holds and of little endian 64 bit integers otherwise; its identifier, negative on failure.
+    """
+    generic [R: Region, S: Region]
+    function createDataset(file: Int64, name: Span[Nat8, R], dimensions: Span[Nat64, S], floating: Bool): Int64
+        requires zeroFree(name);
+
+    """
+    Opens the dataset name of a file, H5Dopen2; its identifier, negative on failure.
+    """
+    generic [R: Region]
+    function openDataset(file: Int64, name: Span[Nat8, R]): Int64
+        requires zeroFree(name);
+
+    """
+    Closes a dataset, H5Dclose; 0 when it was closed, negative on failure.
+    No contract: no precondition, since HDF5 refuses an identifier that is no open dataset, and the result is negative; Mirco.Hdf5.writeFloat64, writeInt64, readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), close only a dataset they opened.
+    """
+    function closeDataset(dataset: Int64): Int32;
+
+    """
+    The class of the type of a dataset: 0 for an integer, 1 for a floating point number, another number
+    for every other class, negative on failure.
+    No contract: no precondition, since HDF5 refuses an identifier that is no open dataset, and the result is negative; Mirco.Hdf5.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), ask it only of a dataset they opened and refuse a negative answer.
+    """
+    function typeClass(dataset: Int64): Int32;
+
+    """
+    The size in bytes of one element of a dataset, 0 on failure.
+    No contract: no precondition, since HDF5 refuses an identifier that is no open dataset, and the result is 0; Mirco.Hdf5.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), ask it only of a dataset they opened and take nothing but 8.
+    """
+    function typeSize(dataset: Int64): Index;
+
+    """
+    1 when the elements of a dataset are signed integers, 0 when not, negative on failure.
+    No contract: no precondition, since HDF5 refuses an identifier that is no open dataset, and the result is negative; Mirco.Hdf5.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), ask it only of a dataset they opened and refuse a negative answer.
+    """
+    function typeSigned(dataset: Int64): Int32;
+
+    """
+    The number of dimensions of the space of a dataset, negative on failure.
+    No contract: no precondition, since HDF5 refuses an identifier that is no open dataset, and the result is negative; Mirco.Hdf5.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), ask it only of a dataset they opened and refuse a negative answer.
+    """
+    function rankOf(dataset: Int64): Int32;
+
+    """
+    Writes the dimensions of the space of a dataset into out, which holds at least as many as its rank;
+    the rank, negative on failure.
+    No contract: no precondition, since the body gives -1 when out holds fewer than the rank, and writes nothing; Mirco.Hdf5.readFloat64 and readInt64, with their contract requires zeroFree(path) and zeroFree(name), size out from rankOf and refuse an answer other than the rank.
+    """
+    generic [R: Region]
+    function dimensionsOf(dataset: Int64, out: Span![Nat64, R]): Int32;
+
+    """
+    Writes every element of the dataset from values as binary64 numbers, H5Dwrite; 0 or negative.
+    No contract: a binding to C; the count of elements of a dataset is no value a contract can read, so the wrapper Mirco.Hdf5.writeFloat64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it makes the dataset from the shape of the array whose elements it passes.
+    """
+    generic [R: Region]
+    function writeFloat64(dataset: Int64, values: Span[Float64, R]): Int32;
+
+    """
+    Writes every element of the dataset from values as 64 bit integers, H5Dwrite; 0 or negative.
+    No contract: a binding to C; the count of elements of a dataset is no value a contract can read, so the wrapper Mirco.Hdf5.writeInt64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it makes the dataset from the shape of the array whose elements it passes.
+    """
+    generic [R: Region]
+    function writeInt64(dataset: Int64, values: Span[Int64, R]): Int32;
+
+    """
+    Reads every element of the dataset into out as binary64 numbers, H5Dread; 0 or negative.
+    No contract: a binding to C; the count of elements of a dataset is no value a contract can read, so the wrapper Mirco.Hdf5.readFloat64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it sizes out to the product of the dimensions of the dataset.
+    """
+    generic [R: Region]
+    function readFloat64(dataset: Int64, out: Span![Float64, R]): Int32;
+
+    """
+    Reads every element of the dataset into out as 64 bit integers, H5Dread; 0 or negative.
+    No contract: a binding to C; the count of elements of a dataset is no value a contract can read, so the wrapper Mirco.Hdf5.readInt64, with its contract requires zeroFree(path) and zeroFree(name), holds it in its body: it sizes out to the product of the dimensions of the dataset.
+    """
+    generic [R: Region]
+    function readInt64(dataset: Int64, out: Span![Int64, R]): Int32;
+end module.

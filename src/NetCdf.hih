@@ -1,0 +1,95 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Writes arrays into netCDF files and reads them back, through the netCDF-C library of the system.
+
+- Files are written in the format of netCDF 4; a variable of Float64 is NC_DOUBLE, one of Int64 NC_INT64.
+- The dimensions of a variable x are named x_0, x_1 and so on, one for each axis.
+- A variable is read only as the type it holds: an NC_INT64 variable is no Float64 array and the reverse.
+- Every failure of the library and a missing variable come back as a fault.
+- The lengths of the dimensions of a variable are checked before the array is made: a dimension of 0, and a count of elements that does not fit an Index or goes above readElementLimit(), come back as BadDimensions.  A dimension of 0 gives no empty result, since an array of this package holds every dimension at least 1, so a variable with such dimensions has no shape an array can have; the fault names the file, not the reader.
+- A path or a name with a zero byte is refused by a contract, since the library would read it as ended there.
+
+    let written: Either[NetCdfFault, Unit] := writeFloat64("out.nc", "x", &array, true);
+"""
+import Mirco.Array (NdArray);
+import Mirco.Bindings.NetCdf (zeroFree);
+
+module Mirco.NetCdf is
+    """
+    Why a call refused or failed.
+    """
+    union NetCdfFault: Free is
+        """
+        The file could not be created or opened.
+        """
+        case NotOpened;
+        """
+        The file has no variable of that name, or it could not be defined.
+        """
+        case NoVariable;
+        """
+        The variable holds elements of another type than the one asked for.
+        """
+        case OtherType;
+        """
+        The dimensions of the variable are not ones an array can have: its rank is 0 or above 32,
+        a length does not fit an Index or is 0, or the count of its elements goes above
+        readElementLimit().
+        """
+        case BadDimensions;
+        """
+        The library failed to write or to read the elements, or to close the file.
+        """
+        case NotDone;
+    end;
+
+    """
+    The most elements one read of a variable makes.  A read holds the product of the lengths of
+    the dimensions at or below it while it forms the product, so that the product neither
+    overflows an Index nor asks for a stretch of memory no array read in one piece needs; a
+    variable that announces more is refused as BadDimensions.  4294967296 elements of 8 bytes are
+    32 gigabyte.
+    """
+    function readElementLimit(): Index
+        ensures result = 4294967296;
+
+    """
+    Writes array as the variable name of the file at path: into a new file when fresh holds, which
+    replaces one that is there, else into the file that is there.
+    Neither path nor name holds a zero byte, which would end it for the C library.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function writeFloat64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Float64], Q], fresh: Bool): Either[NetCdfFault, Unit]
+        requires (zeroFree(path)) and (zeroFree(name));
+
+    """
+    writeFloat64 for an array of Int64.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function writeInt64(path: Span[Nat8, R], name: Span[Nat8, S], array: &[NdArray[Int64], Q], fresh: Bool): Either[NetCdfFault, Unit]
+        requires (zeroFree(path)) and (zeroFree(name));
+
+    """
+    The variable name of the file at path as an array of Float64 with its dimensions; OtherType when it
+    is not of NC_DOUBLE, BadDimensions when a length of its dimensions is 0 or the count of its
+    elements does not fit an Index or goes above readElementLimit().
+    """
+    generic [R: Region, S: Region]
+    function readFloat64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[NetCdfFault, NdArray[Float64]]
+        requires (zeroFree(path)) and (zeroFree(name));
+
+    """
+    The variable name of the file at path as an array of Int64; OtherType when it is not of NC_INT64,
+    BadDimensions when a length of its dimensions is 0 or the count of its elements does not fit an
+    Index or goes above readElementLimit().
+    """
+    generic [R: Region, S: Region]
+    function readInt64(path: Span[Nat8, R], name: Span[Nat8, S]): Either[NetCdfFault, NdArray[Int64]]
+        requires (zeroFree(path)) and (zeroFree(name));
+end module.

@@ -1,0 +1,350 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The part of tools/mirco-notebook written in Hilde, run with hilde run:
+--
+--     plan NOTEBOOK RUN    writes RUN/cells/NAME.hiq for each cell and a
+--                          line "NAME RANKS HOSTS MODULE LINE" for each on
+--                          its standard output, HOSTS - for none; exit 2
+--                          and "NOTEBOOK:LINE: why" for a text that is no
+--                          notebook
+--     record RUN CELLS     writes RUN/manifest.csv anew: the rows of the
+--                          cells not in CELLS, joined by commas, kept, and
+--                          the files of RUN/written.csv added; exit 3 when
+--                          the manifest there is no manifest
+--
+-- Every file is written next to its place and renamed into it.  Exit 9
+-- for a command line it does not take or a file it cannot read or write.
+import Standard.Buffer (Buffer, length, nthRef);
+import Standard.String (String, asSpan, destroyString);
+import Standard.StringBuilder (StringBuilder, makeStringBuilder, writeString, writeByte, finalize);
+import Standard.Text (equal, formatNat);
+import Standard.File (
+    FileDescriptor,
+    FileLookup,
+    FileStatus,
+    openRead,
+    openWrite,
+    closeFile,
+    readAll,
+    writeAll,
+    renameFile,
+    removeFileIfThere,
+    statusOf
+);
+import Standard.Arguments (processArguments, destroyArguments);
+import Mirco.Schlucki (Table, TableError, destroyTable, writeCsv);
+import Mirco.Notebook (
+    Notebook,
+    NotebookError,
+    parseNotebook,
+    destroyNotebook,
+    cellCount,
+    cellName,
+    cellRanks,
+    cellHosts,
+    cellModule,
+    cellLine,
+    cellSource,
+    isManifest,
+    isWritten,
+    emptyManifest,
+    readManifest,
+    readWritten,
+    recordCells
+);
+
+module body Tool.Notebook is
+    generic [R: Region]
+    function readFile(path: Span[Nat8, R]): Option[String] is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let text: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                return text;
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Writes data into path.part and renames it to path.
+    generic [R: Region, S: Region]
+    function writeFile(path: Span[Nat8, R], data: Span[Nat8, S]): Bool is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, path);
+        writeString(&!b, ".part");
+        let part: String := finalize(b);
+        var done: Bool := false;
+        case openWrite(asSpan(&part)) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let wrote: Bool := writeAll(&!file, data);
+                let closed: Bool := closeFile(file);
+                if wrote and closed then
+                    done := renameFile(asSpan(&part), path);
+                end if;
+            when None do
+                done := false;
+        end case;
+        if not done then
+            let gone: Bool := removeFileIfThere(asSpan(&part));
+        end if;
+        destroyString(part);
+        return done;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function joined(a: Span[Nat8, R], b: Span[Nat8, S], c: Span[Nat8, Q]): String is
+        var builder: StringBuilder := makeStringBuilder();
+        writeString(&!builder, a);
+        writeString(&!builder, b);
+        writeString(&!builder, c);
+        return finalize(builder);
+    end;
+
+    function number(n: Index): String is
+        case toNat64(n) of
+            when Some(value as v: Nat64) do
+                return formatNat(v);
+            when None do
+                return formatNat(0);
+        end case;
+    end;
+
+    function why(code: Int32): Span[Nat8, Static] is
+        if code = 1 then
+            return "no line \"--- cell NAME\" begins a cell";
+        end if;
+        if code = 2 then
+            return "a cell begins with \"--- cell NAME\" or \"--- cell NAME sperli RANKS HOSTS\"";
+        end if;
+        if code = 3 then
+            return "a name of a cell is 1 to 48 small letters, digits and hyphens, the first a letter";
+        end if;
+        if code = 4 then
+            return "the name of this cell is taken by a cell before it";
+        end if;
+        if code = 5 then
+            return "the count of ranks is a number from 1 to 4096 without a leading zero";
+        end if;
+        if code = 6 then
+            return "the file of hosts is a plain name of a file beside the notebook";
+        end if;
+        if code = 7 then
+            return "this cell has no line \"module body Name is\"";
+        end if;
+        if code = 8 then
+            return "a notebook has at most 1000 cells";
+        end if;
+        return "the text holds a zero byte";
+    end;
+
+    -- The line of the plan of cell i.
+    generic [R: Region]
+    function planLine(nb: &[Notebook, R], i: Index): String is
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, cellName(nb, i));
+        writeByte(&!b, 32);
+        let ranks: String := number(cellRanks(nb, i));
+        writeString(&!b, asSpan(&ranks));
+        destroyString(ranks);
+        writeByte(&!b, 32);
+        if spanLength(cellHosts(nb, i)) = 0 then
+            writeByte(&!b, 45);
+        else
+            writeString(&!b, cellHosts(nb, i));
+        end if;
+        writeByte(&!b, 32);
+        writeString(&!b, cellModule(nb, i));
+        writeByte(&!b, 32);
+        let line: String := number(cellLine(nb, i));
+        writeString(&!b, asSpan(&line));
+        destroyString(line);
+        return finalize(b);
+    end;
+
+    -- Writes the source of each cell and prints the plan; 0, or 9 when a
+    -- source could not be written.
+    generic [R: Region, S: Region]
+    function planCells(nb: &[Notebook, R], run: Span[Nat8, S]): Int32 is
+        var i: Index := 0;
+        while i < cellCount(nb) do
+            let path: String := joined(run, "/cells/", cellName(nb, i));
+            let file: String := joined(asSpan(&path), ".hiq", "");
+            destroyString(path);
+            let source: String := cellSource(nb, i);
+            let wrote: Bool := writeFile(asSpan(&file), asSpan(&source));
+            destroyString(source);
+            destroyString(file);
+            if not wrote then
+                printLn("mirco-notebook: a source of a cell could not be written below the directory of the run");
+                return 9;
+            end if;
+            let line: String := planLine(nb, i);
+            printLn(asSpan(&line));
+            destroyString(line);
+            i := i + 1;
+        end while;
+        return 0;
+    end;
+
+    generic [R: Region, S: Region]
+    function plan(notebook: Span[Nat8, R], run: Span[Nat8, S]): Int32 is
+        case readFile(notebook) of
+            when Some(value as text: String) do
+                let parsed: Either[NotebookError, Notebook] := parseNotebook(asSpan(&text));
+                destroyString(text);
+                case parsed of
+                    when Right(right as nb: Notebook) do
+                        let code: Int32 := planCells(&nb, run);
+                        destroyNotebook(nb);
+                        return code;
+                    when Left(left as e: NotebookError) do
+                        print(notebook);
+                        print(":");
+                        print(e.line);
+                        print(": ");
+                        printLn(why(e.code));
+                        return 2;
+                end case;
+            when None do
+                printLn("mirco-notebook: the notebook could not be read");
+                return 9;
+        end case;
+    end;
+
+    -- Whether there is anything at path.
+    generic [R: Region]
+    function there(path: Span[Nat8, R]): Bool is
+        case statusOf(path) of
+            when FileMissing do
+                return false;
+            when FileUnreadable do
+                return true;
+            when FileFound(status as s: FileStatus) do
+                return true;
+        end case;
+    end;
+
+    -- The manifest of the run, empty when there is none yet; None when the
+    -- file there cannot be read or is no manifest, which is then left be.
+    generic [R: Region]
+    function oldManifest(path: Span[Nat8, R]): Option[Table] is
+        if not there(path) then
+            return Some(value => emptyManifest());
+        end if;
+        case readFile(path) of
+            when Some(value as text: String) do
+                let read: Either[TableError, Table] := readManifest(asSpan(&text));
+                destroyString(text);
+                case read of
+                    when Right(right as t: Table) do
+                        if isManifest(&t) then
+                            return Some(value => t);
+                        end if;
+                        destroyTable(t);
+                        return None();
+                    when Left(left as e: TableError) do
+                        return None();
+                end case;
+            when None do
+                return None();
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function recordRun(run: Span[Nat8, R], ran: Span[Nat8, S]): Int32 is
+        let manifest_path: String := joined(run, "/manifest.csv", "");
+        let written_path: String := joined(run, "/written.csv", "");
+        var code: Int32 := 0;
+        case oldManifest(asSpan(&manifest_path)) of
+            when Some(value as old: Table) do
+                case readFile(asSpan(&written_path)) of
+                    when Some(value as text: String) do
+                        let read: Either[TableError, Table] := readWritten(asSpan(&text));
+                        destroyString(text);
+                        case read of
+                            when Right(right as written: Table) do
+                                if isWritten(&written) then
+                                    code := store(asSpan(&manifest_path), &old, ran, &written);
+                                else
+                                    printLn("mirco-notebook: written.csv has not the columns cell, file and bytes");
+                                    code := 9;
+                                end if;
+                                destroyTable(written);
+                            when Left(left as e: TableError) do
+                                printLn("mirco-notebook: written.csv is no table of cell, file and bytes");
+                                code := 9;
+                        end case;
+                    when None do
+                        printLn("mirco-notebook: written.csv could not be read");
+                        code := 9;
+                end case;
+                destroyTable(old);
+            when None do
+                printLn("mirco-notebook: manifest.csv is no manifest and is left as it is");
+                code := 3;
+        end case;
+        destroyString(manifest_path);
+        destroyString(written_path);
+        return code;
+    end;
+
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function store(path: Span[Nat8, R], old: &[Table, S], ran: Span[Nat8, Q], written: &[Table, P]): Int32 is
+        let made: Table := recordCells(old, ran, written);
+        var code: Int32 := 0;
+        case writeCsv(&made) of
+            when Some(value as text: String) do
+                if not writeFile(path, asSpan(&text)) then
+                    printLn("mirco-notebook: manifest.csv could not be written");
+                    code := 9;
+                end if;
+                destroyString(text);
+            when None do
+                printLn("mirco-notebook: the manifest holds a text that is not UTF-8");
+                code := 9;
+        end case;
+        destroyTable(made);
+        return code;
+    end;
+
+    generic [R: Region]
+    function word(words: &[Buffer[String], R], k: Index): Span[Nat8, R] is
+        return asSpan(nthRef(words, k));
+    end;
+
+    function exitWith(code: Int32): ExitCode is
+        if code = 0 then
+            return ExitSuccess();
+        end if;
+        if code = 2 then
+            return ExitStatus(status => 2);
+        end if;
+        if code = 3 then
+            return ExitStatus(status => 3);
+        end if;
+        return ExitStatus(status => 9);
+    end;
+
+    function main(): ExitCode is
+        let words: Buffer[String] := processArguments();
+        var code: Int32 := 9;
+        if (length(&words) = 3) and equal(word(&words, 0), "plan") then
+            code := plan(word(&words, 1), word(&words, 2));
+        else
+            if (length(&words) = 3) and equal(word(&words, 0), "record") then
+                code := recordRun(word(&words, 1), word(&words, 2));
+            else
+                printLn("usage: NotebookTool.hiq plan NOTEBOOK RUN | record RUN CELLS");
+            end if;
+        end if;
+        destroyArguments(words);
+        return exitWith(code);
+    end;
+end module body.

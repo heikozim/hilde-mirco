@@ -1,0 +1,249 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, count, flatGet);
+import Mirco.Interpolate (
+    Spline,
+    interpolate,
+    interpolateAll,
+    spline,
+    splinePoints,
+    splineAt,
+    destroySpline
+);
+import Mirco.Math (absolute);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Interpolate.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) < 0.000000000001;
+    end;
+
+    -- A vector of the n values 0, 1, ..., n - 1.
+    function rising(n: Index): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        var v: Float64 := 0.0;
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!values, v);
+            v := v + 1.0;
+            at := at + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    function three(a: Float64, b: Float64, c: Float64): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, a);
+        insertBack(&!values, b);
+        insertBack(&!values, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- At x = 1, 2 and 3 the values 3, 2 and 0.
+    function testLinear(): Unit is
+        let xp: NdArray[Float64] := three(1.0, 2.0, 3.0);
+        let fp: NdArray[Float64] := three(3.0, 2.0, 0.0);
+        assertTrue(interpolate(2.5, &xp, &fp) = 1.0, "half way from 2 to 0");
+        assertTrue(interpolate(1.5, &xp, &fp) = 2.5, "half way from 3 to 2");
+        assertTrue(interpolate(2.0, &xp, &fp) = 2.0, "at a point");
+        assertTrue(interpolate(0.0, &xp, &fp) = 3.0, "below the first point");
+        assertTrue(interpolate(5.0, &xp, &fp) = 0.0, "above the last point");
+        let xs: NdArray[Float64] := three(1.25, 2.75, 9.0);
+        let ys: NdArray[Float64] := interpolateAll(&xs, &xp, &fp);
+        assertTrue(count(&ys) = 3, "one value for each");
+        assertTrue(near(flatGet(&ys, 0), 2.75) and near(flatGet(&ys, 1), 0.5), "two inside");
+        destroyNdArray(xs);
+        destroyNdArray(ys);
+        destroyNdArray(xp);
+        destroyNdArray(fp);
+        return nil;
+    end;
+
+    -- Through 0 0, 1 1 and 2 0 the natural spline is 1.5 x - 0.5 x cubed
+    -- on the first piece: 0.6875 at 0.5.
+    function testSplineThreePoints(): Unit is
+        let xp: NdArray[Float64] := three(0.0, 1.0, 2.0);
+        let fp: NdArray[Float64] := three(0.0, 1.0, 0.0);
+        let s: Spline := spline(&xp, &fp);
+        assertTrue(splinePoints(&s) = 3, "three points");
+        assertTrue(near(splineAt(&s, 0.5), 0.6875), "1.5 x - 0.5 x cubed at 0.5");
+        assertTrue(near(splineAt(&s, 1.5), 0.6875), "the mirror image");
+        assertTrue(near(splineAt(&s, 1.0), 1.0), "through the middle point");
+        destroySpline(s);
+        destroyNdArray(xp);
+        destroyNdArray(fp);
+        return nil;
+    end;
+
+    -- A natural spline through points on a line is the line.
+    function testSplineLine(): Unit is
+        let xp: NdArray[Float64] := three(0.0, 1.0, 4.0);
+        let fp: NdArray[Float64] := three(1.0, 3.0, 9.0);
+        let s: Spline := spline(&xp, &fp);
+        assertTrue(near(splineAt(&s, 2.5), 6.0), "2 x + 1 at 2.5");
+        assertTrue(near(splineAt(&s, 0.25), 1.5), "2 x + 1 at 0.25");
+        destroySpline(s);
+        destroyNdArray(xp);
+        destroyNdArray(fp);
+        return nil;
+    end;
+
+    -- interpolate, interpolateAll and spline over xp of points points and fp
+    -- of values values; the results are not asked for.
+    function interpolateOf(points: Index, values: Index): Unit is
+        let xp: NdArray[Float64] := rising(points);
+        let fp: NdArray[Float64] := rising(values);
+        let y: Float64 := interpolate(0.5, &xp, &fp);
+        destroyNdArray(fp);
+        destroyNdArray(xp);
+        return nil;
+    end;
+
+    function interpolateAllOf(points: Index, values: Index): Unit is
+        let xs: NdArray[Float64] := rising(2);
+        let xp: NdArray[Float64] := rising(points);
+        let fp: NdArray[Float64] := rising(values);
+        let ys: NdArray[Float64] := interpolateAll(&xs, &xp, &fp);
+        destroyNdArray(ys);
+        destroyNdArray(fp);
+        destroyNdArray(xp);
+        destroyNdArray(xs);
+        return nil;
+    end;
+
+    function splineOf(points: Index, values: Index): Unit is
+        let xp: NdArray[Float64] := rising(points);
+        let fp: NdArray[Float64] := rising(values);
+        let s: Spline := spline(&xp, &fp);
+        destroySpline(s);
+        destroyNdArray(fp);
+        destroyNdArray(xp);
+        return nil;
+    end;
+
+    -- Each call in a child of its own: an fp of another count than xp is
+    -- refused by the requires of interpolate, interpolateAll and spline, a
+    -- spline through one point by that of spline.  The fitting calls, a
+    -- spline through two points among them, are taken.
+    function testRefusals(): Unit is
+        if asChild("interpolateOtherCount") then
+            interpolateOf(3, 2);
+            return nil;
+        end if;
+        if asChild("interpolateAllOtherCount") then
+            interpolateAllOf(2, 3);
+            return nil;
+        end if;
+        if asChild("splineOtherCount") then
+            splineOf(3, 4);
+            return nil;
+        end if;
+        if asChild("splineOnePoint") then
+            splineOf(1, 1);
+            return nil;
+        end if;
+        if asChild("fits") then
+            interpolateOf(1, 1);
+            interpolateAllOf(3, 3);
+            splineOf(2, 2);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "interpolateOtherCount", "contract violated: the requires"), "interpolate over 3 points and 2 values is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "interpolateAllOtherCount", "contract violated: the requires"), "interpolateAll over 2 points and 3 values is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "splineOtherCount", "contract violated: the requires"), "a spline over 3 points and 4 values is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "splineOnePoint", "contract violated: the requires"), "a spline through one point is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "fitting calls break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "fitting calls are taken");
+        return nil;
+    end;
+end module body.

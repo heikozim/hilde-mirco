@@ -1,0 +1,587 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, dimension, flatGet);
+import Mirco.Linalg (
+    Decomposition,
+    parts,
+    part,
+    destroyDecomposition,
+    solve,
+    determinant,
+    inverse,
+    cholesky,
+    qr,
+    lstsq,
+    eigenSymmetric,
+    svd
+);
+import Mirco.Math (absolute, squareRoot);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Linalg.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) < 0.000000001;
+    end;
+
+    -- A matrix of rows and cols from the values in row-major order.
+    generic [R: Region]
+    function matrix(rows: Index, cols: Index, values: &[Buffer[Float64], R]): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    generic [R: Region]
+    function vector(values: &[Buffer[Float64], R]): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, spanLength(wholeSpan(values)));
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    function two(a: Float64, b: Float64, c: Float64, d: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        insertBack(&!v, d);
+        let made: NdArray[Float64] := matrix(2, 2, &v);
+        destroyFree(v);
+        return made;
+    end;
+
+    function pair(a: Float64, b: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        let made: NdArray[Float64] := vector(&v);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- 3 x + y = 9 and x + 2 y = 8 have x = 2 and y = 3.
+    function testSolve(): Unit is
+        let a: NdArray[Float64] := two(3.0, 1.0, 1.0, 2.0);
+        let b: NdArray[Float64] := pair(9.0, 8.0);
+        case solve(&a, &b) of
+            when Some(value as x: NdArray[Float64]) do
+                assertTrue(near(flatGet(&x, 0), 2.0) and near(flatGet(&x, 1), 3.0), "x = 2, y = 3");
+                destroyNdArray(x);
+            when None do
+                assertTrue(false, "a regular system has a solution");
+        end case;
+        let singular: NdArray[Float64] := two(1.0, 2.0, 2.0, 4.0);
+        case solve(&singular, &b) of
+            when Some(value as x: NdArray[Float64]) do
+                destroyNdArray(x);
+                assertTrue(false, "a singular system has none");
+            when None do
+                assertTrue(true, "a singular system has none");
+        end case;
+        assertTrue(determinant(&singular) = 0.0, "the determinant of a singular matrix");
+        destroyNdArray(singular);
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- The first pivot is zero, so the rows must be exchanged; the
+    -- determinant of 0 2 1, 1 1 1, 2 1 0 is 3.
+    function testPivotingAndDeterminant(): Unit is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, 0.0);
+        insertBack(&!v, 2.0);
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 2.0);
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 0.0);
+        let a: NdArray[Float64] := matrix(3, 3, &v);
+        destroyFree(v);
+        assertTrue(near(determinant(&a), 3.0), "det = 3 after an exchange of rows");
+        let b: NdArray[Float64] := two(1.0, 2.0, 3.0, 4.0);
+        assertTrue(near(determinant(&b), -2.0), "det of 1 2, 3 4");
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- The inverse of 4 7, 2 6 is 0.6 -0.7, -0.2 0.4.
+    function testInverse(): Unit is
+        let a: NdArray[Float64] := two(4.0, 7.0, 2.0, 6.0);
+        case inverse(&a) of
+            when Some(value as x: NdArray[Float64]) do
+                assertTrue(near(flatGet(&x, 0), 0.6) and near(flatGet(&x, 1), -0.7), "first row");
+                assertTrue(near(flatGet(&x, 2), -0.2) and near(flatGet(&x, 3), 0.4), "second row");
+                destroyNdArray(x);
+            when None do
+                assertTrue(false, "a regular matrix has an inverse");
+        end case;
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- The example of the textbooks: 4 12 -16, 12 37 -43, -16 -43 98 is l l^T
+    -- with l = 2 0 0, 6 1 0, -8 5 3.
+    function testCholesky(): Unit is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, 4.0);
+        insertBack(&!v, 12.0);
+        insertBack(&!v, -16.0);
+        insertBack(&!v, 12.0);
+        insertBack(&!v, 37.0);
+        insertBack(&!v, -43.0);
+        insertBack(&!v, -16.0);
+        insertBack(&!v, -43.0);
+        insertBack(&!v, 98.0);
+        let a: NdArray[Float64] := matrix(3, 3, &v);
+        destroyFree(v);
+        case cholesky(&a) of
+            when Some(value as l: NdArray[Float64]) do
+                assertTrue(near(flatGet(&l, 0), 2.0) and near(flatGet(&l, 3), 6.0) and near(flatGet(&l, 4), 1.0), "first columns");
+                assertTrue(near(flatGet(&l, 6), -8.0) and near(flatGet(&l, 7), 5.0) and near(flatGet(&l, 8), 3.0), "last row");
+                assertTrue(flatGet(&l, 1) = 0.0, "zero above the diagonal");
+                destroyNdArray(l);
+            when None do
+                assertTrue(false, "positive definite");
+        end case;
+        let indefinite: NdArray[Float64] := two(1.0, 2.0, 2.0, 1.0);
+        case cholesky(&indefinite) of
+            when Some(value as l: NdArray[Float64]) do
+                destroyNdArray(l);
+                assertTrue(false, "an indefinite matrix has none");
+            when None do
+                assertTrue(true, "an indefinite matrix has none");
+        end case;
+        destroyNdArray(indefinite);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- q r gives a back, q has orthonormal columns and r is upper triangular.
+    function testQr(): Unit is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, 1.0);
+        insertBack(&!v, 2.0);
+        insertBack(&!v, 3.0);
+        insertBack(&!v, 4.0);
+        insertBack(&!v, 5.0);
+        insertBack(&!v, 6.0);
+        let a: NdArray[Float64] := matrix(3, 2, &v);
+        destroyFree(v);
+        let d: Decomposition := qr(&a);
+        assertTrue(parts(&d) = 2, "q and r");
+        let q: NdArray[Float64] := part(&d, 0);
+        let r: NdArray[Float64] := part(&d, 1);
+        assertTrue((dimension(&q, 0) = 3) and (dimension(&q, 1) = 2), "q is 3 by 2");
+        assertTrue(flatGet(&r, 2) = 0.0, "r is upper triangular");
+        var good: Index := 0;
+        var i: Index := 0;
+        while i < 3 do
+            var j: Index := 0;
+            while j < 2 do
+                let back: Float64 := (flatGet(&q, (i * 2) + 0) * flatGet(&r, j)) + (flatGet(&q, (i * 2) + 1) * flatGet(&r, 2 + j));
+                if near(back, flatGet(&a, (i * 2) + j)) then
+                    good := good + 1;
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        assertTrue(good = 6, "q r = a in all six elements");
+        var dot: Float64 := 0.0;
+        var n0: Float64 := 0.0;
+        i := 0;
+        while i < 3 do
+            dot := dot + (flatGet(&q, i * 2) * flatGet(&q, (i * 2) + 1));
+            n0 := n0 + (flatGet(&q, i * 2) * flatGet(&q, i * 2));
+            i := i + 1;
+        end while;
+        assertTrue(near(dot, 0.0) and near(n0, 1.0), "the columns of q are orthonormal");
+        destroyNdArray(q);
+        destroyNdArray(r);
+        destroyDecomposition(d);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- y = 1 + 2 x through x = 0, 1, 2, 3: the least squares give 1 and 2.
+    function testLstsq(): Unit is
+        var v: Buffer[Float64] := allocateEmpty();
+        var w: Buffer[Float64] := allocateEmpty();
+        var x: Float64 := 0.0;
+        var i: Index := 0;
+        while i < 4 do
+            insertBack(&!v, 1.0);
+            insertBack(&!v, x);
+            insertBack(&!w, 1.0 + (2.0 * x));
+            x := x + 1.0;
+            i := i + 1;
+        end while;
+        let a: NdArray[Float64] := matrix(4, 2, &v);
+        let b: NdArray[Float64] := vector(&w);
+        destroyFree(v);
+        destroyFree(w);
+        case lstsq(&a, &b) of
+            when Some(value as c: NdArray[Float64]) do
+                assertTrue(near(flatGet(&c, 0), 1.0) and near(flatGet(&c, 1), 2.0), "intercept 1, slope 2");
+                destroyNdArray(c);
+            when None do
+                assertTrue(false, "full column rank");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- 2 1, 1 2 has the eigenvalues 1 and 3, and a v = lambda v.
+    function testEigen(): Unit is
+        let a: NdArray[Float64] := two(2.0, 1.0, 1.0, 2.0);
+        let d: Decomposition := eigenSymmetric(&a);
+        let values: NdArray[Float64] := part(&d, 0);
+        let vectors: NdArray[Float64] := part(&d, 1);
+        assertTrue(near(flatGet(&values, 0), 1.0) and near(flatGet(&values, 1), 3.0), "1 and 3, ascending");
+        var good: Index := 0;
+        var k: Index := 0;
+        while k < 2 do
+            let v0: Float64 := flatGet(&vectors, k);
+            let v1: Float64 := flatGet(&vectors, 2 + k);
+            let lambda: Float64 := flatGet(&values, k);
+            if near((2.0 * v0) + v1, lambda * v0) and near(v0 + (2.0 * v1), lambda * v1) and near((v0 * v0) + (v1 * v1), 1.0) then
+                good := good + 1;
+            end if;
+            k := k + 1;
+        end while;
+        assertTrue(good = 2, "both columns are unit eigenvectors");
+        destroyNdArray(values);
+        destroyNdArray(vectors);
+        destroyDecomposition(d);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- 3 0, 4 5 has the singular values 3 times the root of 5 and the root of
+    -- 5, and u diag(s) vt gives it back.
+    function testSvd(): Unit is
+        let a: NdArray[Float64] := two(3.0, 0.0, 4.0, 5.0);
+        let d: Decomposition := svd(&a);
+        assertTrue(parts(&d) = 3, "u, s and vt");
+        let u: NdArray[Float64] := part(&d, 0);
+        let s: NdArray[Float64] := part(&d, 1);
+        let vt: NdArray[Float64] := part(&d, 2);
+        assertTrue(near(flatGet(&s, 0), 3.0 * squareRoot(5.0)), "the larger first");
+        assertTrue(near(flatGet(&s, 1), squareRoot(5.0)), "the smaller second");
+        var good: Index := 0;
+        var i: Index := 0;
+        while i < 2 do
+            var j: Index := 0;
+            while j < 2 do
+                var back: Float64 := 0.0;
+                var k: Index := 0;
+                while k < 2 do
+                    back := back + (flatGet(&u, (i * 2) + k) * flatGet(&s, k) * flatGet(&vt, (k * 2) + j));
+                    k := k + 1;
+                end while;
+                if near(back, flatGet(&a, (i * 2) + j)) then
+                    good := good + 1;
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        assertTrue(good = 4, "u diag(s) vt = a");
+        destroyNdArray(u);
+        destroyNdArray(s);
+        destroyNdArray(vt);
+        destroyDecomposition(d);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- A matrix of rows by cols with 2 on the diagonal and 0 elsewhere: of
+    -- full column rank when it is tall, symmetric positive definite when
+    -- it is square.
+    function diagonal(rows: Index, cols: Index): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < rows do
+            var j: Index := 0;
+            while j < cols do
+                if i = j then
+                    insertBack(&!v, 2.0);
+                else
+                    insertBack(&!v, 0.0);
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        let made: NdArray[Float64] := matrix(rows, cols, &v);
+        destroyFree(v);
+        return made;
+    end;
+
+    -- A vector of n ones.
+    function ones(n: Index): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            insertBack(&!v, 1.0);
+            i := i + 1;
+        end while;
+        let made: NdArray[Float64] := vector(&v);
+        destroyFree(v);
+        return made;
+    end;
+
+    function dropOption(x: Option[NdArray[Float64]]): Unit is
+        case x of
+            when Some(value as y: NdArray[Float64]) do
+                destroyNdArray(y);
+                return nil;
+            when None do
+                return nil;
+        end case;
+    end;
+
+    -- solve of a of rows by cols and a vector b of bRows.
+    function solveVectorOf(rows: Index, cols: Index, b_rows: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        let b: NdArray[Float64] := ones(b_rows);
+        dropOption(solve(&a, &b));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- solve of a of rows by cols and a matrix b of bRows by bCols.
+    function solveMatrixOf(rows: Index, cols: Index, b_rows: Index, b_cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        let b: NdArray[Float64] := diagonal(b_rows, b_cols);
+        dropOption(solve(&a, &b));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function determinantOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        let d: Float64 := determinant(&a);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function inverseOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        dropOption(inverse(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function choleskyOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        dropOption(cholesky(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function qrOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        destroyDecomposition(qr(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function lstsqOf(rows: Index, cols: Index, b_rows: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        let b: NdArray[Float64] := ones(b_rows);
+        dropOption(lstsq(&a, &b));
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function eigenOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        destroyDecomposition(eigenSymmetric(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function svdOf(rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := diagonal(rows, cols);
+        destroyDecomposition(svd(&a));
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- Each call with a matrix that is not square, too wide or of other rows
+    -- than b, in a child of its own, must stop with the message of a
+    -- violated requires and not reach the body; the fitting calls are taken.
+    function testRefusesDimensionsThatDoNotFit(): Unit is
+        if asChild("determinantNotSquare") then
+            determinantOf(2, 3);
+            return nil;
+        end if;
+        if asChild("inverseNotSquare") then
+            inverseOf(2, 3);
+            return nil;
+        end if;
+        if asChild("choleskyNotSquare") then
+            choleskyOf(3, 2);
+            return nil;
+        end if;
+        if asChild("eigenNotSquare") then
+            eigenOf(3, 2);
+            return nil;
+        end if;
+        if asChild("solveNotSquare") then
+            solveVectorOf(2, 3, 2);
+            return nil;
+        end if;
+        if asChild("solveVectorOfOtherRows") then
+            solveVectorOf(2, 2, 3);
+            return nil;
+        end if;
+        if asChild("solveMatrixOfOtherRows") then
+            solveMatrixOf(2, 2, 3, 2);
+            return nil;
+        end if;
+        if asChild("qrWide") then
+            qrOf(2, 3);
+            return nil;
+        end if;
+        if asChild("svdWide") then
+            svdOf(2, 3);
+            return nil;
+        end if;
+        if asChild("lstsqWide") then
+            lstsqOf(2, 3, 2);
+            return nil;
+        end if;
+        if asChild("lstsqOtherRows") then
+            lstsqOf(3, 2, 2);
+            return nil;
+        end if;
+        if asChild("fits") then
+            determinantOf(2, 2);
+            inverseOf(2, 2);
+            choleskyOf(2, 2);
+            eigenOf(2, 2);
+            solveVectorOf(2, 2, 2);
+            solveMatrixOf(2, 2, 2, 3);
+            qrOf(3, 2);
+            svdOf(3, 2);
+            lstsqOf(3, 2, 3);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "determinantNotSquare", "contract violated: the requires"), "determinant of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "determinantNotSquare", "Mirco.Linalg: the"), "determinant of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "inverseNotSquare", "contract violated: the requires"), "inverse of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "inverseNotSquare", "Mirco.Linalg: the"), "inverse of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "choleskyNotSquare", "contract violated: the requires"), "cholesky of 3 by 2 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "choleskyNotSquare", "Mirco.Linalg: the"), "cholesky of 3 by 2 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "eigenNotSquare", "contract violated: the requires"), "eigenSymmetric of 3 by 2 is refused by the requires");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "solveNotSquare", "contract violated: the requires"), "solve with a of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "solveNotSquare", "Mirco.Linalg: the"), "solve with a of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "solveVectorOfOtherRows", "contract violated: the requires"), "solve of 2 by 2 and a b of 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "solveVectorOfOtherRows", "Mirco.Linalg: b"), "solve of 2 by 2 and a b of 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "solveMatrixOfOtherRows", "contract violated: the requires"), "solve of 2 by 2 and a b of 3 by 2 is refused by the requires");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "qrWide", "contract violated: the requires"), "qr of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "qrWide", "Mirco.Linalg: qr"), "qr of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "svdWide", "contract violated: the requires"), "svd of 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "svdWide", "Mirco.Linalg: svd"), "svd of 2 by 3 does not reach the body");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "lstsqWide", "contract violated: the requires"), "lstsq with a of 2 by 3 is refused by the requires");
+        assertTrue(refusedInChild("testRefusesDimensionsThatDoNotFit", "lstsqOtherRows", "contract violated: the requires"), "lstsq of 3 by 2 and a b of 2 is refused by the requires");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "lstsqOtherRows", "Mirco.Linalg: b"), "lstsq of 3 by 2 and a b of 2 does not reach the body");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "fits", "Mirco.Linalg"), "fitting matrices are taken");
+        assertTrue(not refusedInChild("testRefusesDimensionsThatDoNotFit", "fits", "contract violated"), "fitting matrices break no contract");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,398 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The saves and loads run in a child: the test programme started again
+-- in a new directory of mktemp, with MIRCO_NOTEBOOK_STATE naming a
+-- directory in it, as tools/mirco-notebook starts a cell; the parent
+-- makes the directory, says whether the child ended with 0 and removes it.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString, length, nthByte);
+import Standard.Text (equal, contains, startsWith);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    FileLookup,
+    FileStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    openRead,
+    statusOf,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, rank, dimension, flatGet);
+import Mirco.Schlucki (Table, TableError, table, destroyTable, rowCount, columnCount, addFloatColumn, addTextColumn, floatAt, textAt);
+import Mirco.Wire (WireError);
+import Mirco.Yompi (Figure, figure, destroyFigure, addLine);
+import Mirco.Cell (
+    CellError,
+    stateNameLimit,
+    isStateName,
+    isInputName,
+    isEnding,
+    stateDirectory,
+    statePath,
+    saveTable,
+    loadTable,
+    saveArray,
+    loadArray,
+    saveSvg,
+    savePng,
+    saveText,
+    readState,
+    loadInputTable
+);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Cell.Test is
+    function testNames(): Unit is
+        assertTrue(stateNameLimit() = 64, "64 bytes at most");
+        assertTrue(isStateName("sales") and isStateName("Sales_2-b") and isStateName("x"), "letters, digits, underscores, hyphens");
+        assertFalse(isStateName("") or isStateName("-a") or isStateName("a.csv") or isStateName("../a") or isStateName("a/b"), "no point, no slash");
+        assertFalse(isStateName("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcdefghijabcde"), "65 bytes");
+        assertTrue(isInputName("sales.csv") and isInputName("a_b-c.txt"), "a plain file");
+        assertFalse(isInputName("") or isInputName(".hidden") or isInputName("-a") or isInputName("../a.csv") or isInputName("/etc/passwd"), "no path");
+        assertTrue(isEnding(".csv") and isEnding(".mirc") and isEnding(".png"), "endings");
+        assertFalse(isEnding("") or isEnding(".") or isEnding("csv") or isEnding("./x") or isEnding(".CSV") or isEnding(".abcdefgh"), "no ending");
+        return nil;
+    end;
+
+    -- Whether this run is the child the parent started in its directory.
+    function asChild(): Bool is
+        case environmentValue("MIRCO_CELL_TEST") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), "child");
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere the child does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The script of the parent: a new directory with an input and a
+    -- directory of states, the child started there with the two variables,
+    -- the directory removed; its status is the child's.
+    function parentScript(): Span[Nat8, Static] is
+        return "exe=\"/proc/$PPID/exe\"; d=$(mktemp -d) || exit 9; mkdir \"$d/state\" || exit 9; \
+            \printf 'name,x\\nab,1.5\\ncd,\\n' > \"$d/input.csv\" || exit 9; \
+            \(cd \"$d\" && MIRCO_CELL_TEST=child MIRCO_NOTEBOOK_STATE=\"$d/state\" MIRCO_NOTEBOOK_WRITTEN=\"$d/written.txt\" exec \"$exe\" \"$0\"); \
+            \rc=$?; rm -rf \"$d\"; exit $rc";
+    end;
+
+    -- Whether the child, started for the test named test, ended with 0;
+    -- its standard error is read first, so that a long one cannot hold it.
+    function childPassed(test: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), parentScript()), test);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        if length(&text) > 0 then
+                            printLn(asSpan(&text));
+                        end if;
+                        destroyString(text);
+                    when None do
+                        skip;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    function shape(rows: Index, cols: Index): Buffer[Index] is
+        var s: Buffer[Index] := allocateEmpty();
+        insertBack(&!s, rows);
+        insertBack(&!s, cols);
+        return s;
+    end;
+
+    function vector(a: Float64, b: Float64): NdArray[Float64] is
+        var s: Buffer[Index] := allocateEmpty();
+        insertBack(&!s, 2);
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&s), wholeSpan(&v));
+        destroyFree(s);
+        destroyFree(v);
+        return made;
+    end;
+
+    function kindsTextFloat(): Buffer[Nat8] is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 1);
+        return kinds;
+    end;
+
+    -- Whether the file at path is gone or was never there.
+    function missing(path: Span[Nat8, Static]): Bool is
+        case statusOf(path) of
+            when FileMissing do
+                return true;
+            when FileUnreadable do
+                return false;
+            when FileFound(status as s: FileStatus) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function textIs(t: &[Table, R], c: Index, r: Index, want: Span[Nat8, Static]): Bool is
+        case textAt(t, c, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                return equal(v, want);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function stateTables(): Unit is
+        var t: Table := table(2);
+        let x: NdArray[Float64] := vector(1.5, -0.25);
+        let added_text: Bool := addTextColumn(&!t, "name", "ab,c,d", 44);
+        assertFalse(added_text, "three texts for two rows are refused");
+        let added_name: Bool := addTextColumn(&!t, "name", "a\"b|cd", 124);
+        let added_x: Bool := addFloatColumn(&!t, "x", &x);
+        assertTrue(added_name and added_x, "a table of two columns");
+        assertTrue(saveTable("sales", &t), "the table is saved");
+        let kinds: Buffer[Nat8] := kindsTextFloat();
+        case loadTable("sales", wholeSpan(&kinds)) of
+            when Right(right as back: Table) do
+                assertTrue((rowCount(&back) = 2) and (columnCount(&back) = 2), "two rows, two columns back");
+                case floatAt(&back, 1, 1) of
+                    when Some(value as v: Float64) do
+                        assertTrue(v = -0.25, "the number back");
+                    when None do
+                        assertTrue(false, "the number is present");
+                end case;
+                assertTrue(textIs(&back, 0, 0, "a\"b"), "a text with a double quote back");
+                destroyTable(back);
+            when Left(left as e: CellError) do
+                assertTrue(false, "the table is loaded");
+        end case;
+        var one: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!one, 1);
+        insertBack(&!one, 1);
+        case loadTable("sales", wholeSpan(&one)) of
+            when Right(right as back: Table) do
+                destroyTable(back);
+                assertTrue(false, "a text read as a number");
+            when Left(left as e: CellError) do
+                case e of
+                    when NotTable(table as why: TableError) do
+                        assertTrue((why.code = 3) and (why.line = 2) and (why.column = 0), "a text is no Float64, line 2, column 0");
+                    when NoFile do
+                        assertTrue(false, "the file is there");
+                    when NotArray(wire as w: WireError) do
+                        assertTrue(false, "a table is no array");
+                end case;
+        end case;
+        destroyFree(one);
+        case loadTable("nothing", wholeSpan(&kinds)) of
+            when Right(right as back: Table) do
+                destroyTable(back);
+                assertTrue(false, "no state named nothing");
+            when Left(left as e: CellError) do
+                case e of
+                    when NoFile do
+                        assertTrue(true, "no file");
+                    when NotTable(table as why: TableError) do
+                        assertTrue(false, "no file, not no table");
+                    when NotArray(wire as w: WireError) do
+                        assertTrue(false, "no file, not no array");
+                end case;
+        end case;
+        case loadInputTable("input.csv", wholeSpan(&kinds)) of
+            when Right(right as input: Table) do
+                assertTrue(rowCount(&input) = 2, "the input beside the notebook");
+                case floatAt(&input, 1, 1) of
+                    when Some(value as v: Float64) do
+                        assertTrue(false, "an empty field is missing");
+                    when None do
+                        assertTrue(true, "an empty field is missing");
+                end case;
+                destroyTable(input);
+            when Left(left as e: CellError) do
+                assertTrue(false, "the input is read from the current directory");
+        end case;
+        destroyFree(kinds);
+        destroyNdArray(x);
+        destroyTable(t);
+        return nil;
+    end;
+
+    function stateArrays(): Unit is
+        let s: Buffer[Index] := shape(2, 3);
+        var values: Buffer[Float64] := allocateEmpty();
+        var v: Float64 := 0.5;
+        while v < 6.0 do
+            insertBack(&!values, v);
+            v := v + 1.0;
+        end while;
+        let a: NdArray[Float64] := fromSpan(wholeSpan(&s), wholeSpan(&values));
+        assertTrue(saveArray("grid", &a), "the array is saved");
+        let back: Either[CellError, NdArray[Float64]] := loadArray("grid");
+        case back of
+            when Right(right as got: NdArray[Float64]) do
+                assertTrue((rank(&got) = 2) and (dimension(&got, 0) = 2) and (dimension(&got, 1) = 3), "the shape back");
+                assertTrue((flatGet(&got, 0) = 0.5) and (flatGet(&got, 5) = 5.5), "the elements back");
+                destroyNdArray(got);
+            when Left(left as e: CellError) do
+                assertTrue(false, "the array is loaded");
+        end case;
+        let other: Either[CellError, NdArray[Int64]] := loadArray("grid");
+        case other of
+            when Right(right as got: NdArray[Int64]) do
+                destroyNdArray(got);
+                assertTrue(false, "Float64 read as Int64");
+            when Left(left as e: CellError) do
+                case e of
+                    when NotArray(wire as w: WireError) do
+                        case w of
+                            when OtherElement do
+                                assertTrue(true, "another element type is refused");
+                            when TooShort do
+                                assertTrue(false, "OtherElement, not TooShort");
+                            when BadMagic do
+                                assertTrue(false, "OtherElement, not BadMagic");
+                            when BadVersion do
+                                assertTrue(false, "OtherElement, not BadVersion");
+                            when UnknownElement do
+                                assertTrue(false, "OtherElement, not UnknownElement");
+                            when BadRank do
+                                assertTrue(false, "OtherElement, not BadRank");
+                            when BadReserved do
+                                assertTrue(false, "OtherElement, not BadReserved");
+                            when BadDimension do
+                                assertTrue(false, "OtherElement, not BadDimension");
+                            when BadLength do
+                                assertTrue(false, "OtherElement, not BadLength");
+                            when BadElement do
+                                assertTrue(false, "OtherElement, not BadElement");
+                        end case;
+                    when NoFile do
+                        assertTrue(false, "the file is there");
+                    when NotTable(table as why: TableError) do
+                        assertTrue(false, "an array is no table");
+                end case;
+        end case;
+        destroyNdArray(a);
+        destroyFree(s);
+        destroyFree(values);
+        return nil;
+    end;
+
+    function stateOutputs(): Unit is
+        var f: Figure := figure(200, 150);
+        let x: NdArray[Float64] := vector(0.0, 1.0);
+        let y: NdArray[Float64] := vector(1.0, 3.0);
+        addLine(&!f, &x, &y, 2062260);
+        assertTrue(saveSvg("plot", &f), "the svg is saved");
+        assertTrue(savePng("plot", &f), "the PNG is saved");
+        case readState("plot", ".svg") of
+            when Some(value as text: String) do
+                assertTrue(contains(asSpan(&text), "<svg"), "an svg document");
+                destroyString(text);
+            when None do
+                assertTrue(false, "the svg is there");
+        end case;
+        case readState("plot", ".png") of
+            when Some(value as bytes: String) do
+                assertTrue((length(&bytes) > 8) and (nthByte(&bytes, 0) = 137) and (nthByte(&bytes, 1) = 80) and (nthByte(&bytes, 2) = 78) and (nthByte(&bytes, 3) = 71), "the signature of PNG");
+                destroyString(bytes);
+            when None do
+                assertTrue(false, "the PNG is there");
+        end case;
+        assertTrue(saveText("note", "three rows\n"), "the text is saved");
+        case readState("note", ".txt") of
+            when Some(value as text: String) do
+                assertTrue(equal(asSpan(&text), "three rows\n"), "the text as it was");
+                destroyString(text);
+            when None do
+                assertTrue(false, "the text is there");
+        end case;
+        destroyNdArray(x);
+        destroyNdArray(y);
+        destroyFigure(f);
+        return nil;
+    end;
+
+    -- The list of written files names every save in its order, and no part
+    -- file is left in the directory of the states.
+    function stateWritten(): Unit is
+        let dir: String := stateDirectory();
+        assertTrue(contains(asSpan(&dir), "/state"), "the directory MIRCO_NOTEBOOK_STATE names");
+        destroyString(dir);
+        let path: String := statePath("sales", ".csv");
+        assertTrue(contains(asSpan(&path), "/state/sales.csv"), "the path of a state");
+        destroyString(path);
+        case openRead("written.txt") of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                case readAll(&!file) of
+                    when Some(value as text: String) do
+                        assertTrue(equal(asSpan(&text), "sales.csv\ngrid.mirc\nplot.svg\nplot.png\nnote.txt\n"), "every save in its order");
+                        destroyString(text);
+                    when None do
+                        assertTrue(false, "the list is read");
+                end case;
+                let closed: Bool := closeFile(file);
+            when None do
+                assertTrue(false, "the list of written files is there");
+        end case;
+        assertTrue(missing("state/sales.csv.part") and missing("state/grid.mirc.part") and missing("state/plot.png.part"), "no part file left");
+        return nil;
+    end;
+
+    -- Saves and loads of every format, in the child; the parent only says
+    -- whether the child passed.
+    function testStateFiles(): Unit is
+        if asChild() then
+            stateTables();
+            stateArrays();
+            stateOutputs();
+            stateWritten();
+            return nil;
+        end if;
+        if childCanRun() then
+            assertTrue(childPassed("testStateFiles"), "the saves and loads in a directory of their own");
+        end if;
+        return nil;
+    end;
+end module body.

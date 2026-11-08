@@ -1,0 +1,469 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The suite of the interface: one set of assertions, the backend only as
+-- the value openStore takes.  The table of a backend is made in the column
+-- types of that backend, which columnTypeOf names for SQLite and which
+-- DuckDB spells in its own words; every other call is the same.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.Text (equal);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray);
+import Mirco.Schlucki (
+    Table,
+    Rows,
+    table,
+    destroyTable,
+    rowCount,
+    addFloatColumnWith,
+    addIntColumn,
+    addBoolColumn,
+    addTextColumn,
+    floatAt,
+    intAt,
+    textAt,
+    boolAt,
+    kindFloat,
+    kindInt,
+    kindText,
+    kindBool,
+    finishRows
+);
+import Mirco.SchluckiStore (
+    Store,
+    StoreError,
+    backendSqlite,
+    backendDuckDb,
+    backendDefault,
+    openStore,
+    closeStore,
+    backendOf,
+    columnTypeOf,
+    createTable,
+    scan,
+    query,
+    append,
+    statementFailed,
+    wrongColumns,
+    wrongParameters
+);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.SchluckiStore.Suite is
+    function vector3(a: Float64, b: Float64, c: Float64): NdArray[Float64] is
+        var v: Buffer[Float64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        return made;
+    end;
+
+    function ints3(a: Int64, b: Int64, c: Int64): NdArray[Int64] is
+        var v: Buffer[Int64] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        return made;
+    end;
+
+    function bools3(a: Bool, b: Bool, c: Bool): NdArray[Bool] is
+        var v: Buffer[Bool] := allocateEmpty();
+        insertBack(&!v, a);
+        insertBack(&!v, b);
+        insertBack(&!v, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Bool] := fromSpan(wholeSpan(&shape), wholeSpan(&v));
+        destroyFree(v);
+        destroyFree(shape);
+        return made;
+    end;
+
+    -- Three places: the mass of ulm missing, the keys n given.
+    function places(n0: Int64, n1: Int64, n2: Int64): Table is
+        var t: Table := table(3);
+        let masses: NdArray[Float64] := vector3(1.5, 4.0, 0.0);
+        let there: NdArray[Bool] := bools3(true, true, false);
+        let keys: NdArray[Int64] := ints3(n0, n1, n2);
+        let flags: NdArray[Bool] := bools3(true, false, true);
+        let named: Bool := addTextColumn(&!t, "city", "bonn,koeln,ulm", 44);
+        let weighed: Bool := addFloatColumnWith(&!t, "mass", &masses, &there);
+        let counted: Bool := addIntColumn(&!t, "n", &keys);
+        let flagged: Bool := addBoolColumn(&!t, "ok", &flags);
+        assertTrue(named and weighed and counted and flagged, "the four columns of the places");
+        destroyNdArray(masses);
+        destroyNdArray(there);
+        destroyNdArray(keys);
+        destroyNdArray(flags);
+        return t;
+    end;
+
+    -- The kinds of the four columns of places, in their order.
+    function placeKinds(): Buffer[Nat8] is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, kindText());
+        insertBack(&!kinds, kindFloat());
+        insertBack(&!kinds, kindInt());
+        insertBack(&!kinds, kindBool());
+        return kinds;
+    end;
+
+    -- The table places in the column types of the backend.  The SQL of a
+    -- statement is a literal of the programme, so the types stand here as
+    -- columnTypeOf names them, and strictColumnTypes asserts that the two
+    -- agree; the "STRICT" of SQLite refuses a value of another type, and
+    -- DuckDB has no such word.
+    generic [R: Region]
+    function createPlacesTable(store: &![Store, R], backend: Nat8): Unit is
+        let sql: Span[Nat8, Static] := placesTable(backend);
+        case createTable(store, sql) of
+            when Right(right as done: Unit) do
+                skip;
+            when Left(left as e: StoreError) do
+                assertTrue(false, "the table places is made");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function appendPlaces(store: &![Store, R], n0: Int64, n1: Int64, n2: Int64): Unit is
+        let t: Table := places(n0, n1, n2);
+        case append(store, "INSERT INTO places (city, mass, n, ok) VALUES (?, ?, ?, ?)", &t) of
+            when Right(right as n: Nat64) do
+                assertTrue(n = 3, "three rows appended");
+            when Left(left as e: StoreError) do
+                assertTrue(false, "the rows are appended");
+        end case;
+        destroyTable(t);
+        return nil;
+    end;
+
+    function placesTable(backend: Nat8): Span[Nat8, Static] is
+        if backend = backendSqlite() then
+            return "CREATE TABLE places (city TEXT, mass REAL, n INTEGER PRIMARY KEY, ok INTEGER) STRICT";
+        end if;
+        return "CREATE TABLE places (city VARCHAR, mass DOUBLE, n BIGINT PRIMARY KEY, ok BOOLEAN)";
+    end;
+
+    -- The count of rows of places.
+    generic [R: Region]
+    function placeCount(store: &![Store, R]): Int64 is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, kindInt());
+        var found: Int64 := -1;
+        case query(store, "SELECT CAST(count(*) AS BIGINT) FROM places", wholeSpan(&kinds), "count") of
+            when Right(right as back: Table) do
+                case intAt(&back, 0, 0) of
+                    when Some(value as v: Int64) do
+                        found := v;
+                    when None do
+                        skip;
+                end case;
+                destroyTable(back);
+            when Left(left as e: StoreError) do
+                skip;
+        end case;
+        destroyFree(kinds);
+        return found;
+    end;
+
+    function roundTrip(backend: Nat8): Unit is
+        case openStore(backend, ":memory:", true) of
+            when Right(right as opened: Store) do
+                var store: Store := opened;
+                assertTrue(backendOf(&store) = backend, "the backend named");
+                createPlacesTable(&!store, backend);
+                appendPlaces(&!store, 3, 10, 7);
+                var kinds: Buffer[Nat8] := placeKinds();
+                case query(&!store, "SELECT city, mass, n, ok FROM places ORDER BY n", wholeSpan(&kinds), "city,mass,n,ok") of
+                    when Right(right as back: Table) do
+                        assertTrue(rowCount(&back) = 3, "three rows queried");
+                        checkPlaces(&back);
+                        destroyTable(back);
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the query runs");
+                end case;
+                case query(&!store, "SELECT city, mass, n, ok FROM places WHERE n > 100", wholeSpan(&kinds), "city,mass,n,ok") of
+                    when Right(right as back: Table) do
+                        assertTrue(rowCount(&back) = 0, "a query of no row gives a table of no row");
+                        destroyTable(back);
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "a query of no row runs");
+                end case;
+                -- scan is the rows of query before they are named; finishRows names them, so the same
+                -- statement read by scan and named here gives the table query gives.
+                case scan(&!store, "SELECT city, mass, n, ok FROM places ORDER BY n", wholeSpan(&kinds)) of
+                    when Right(right as scanned: Rows) do
+                        let back: Table := finishRows(scanned, "city,mass,n,ok");
+                        assertTrue(rowCount(&back) = 3, "three rows scanned");
+                        checkPlaces(&back);
+                        destroyTable(back);
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the scan runs");
+                end case;
+                destroyFree(kinds);
+                closeStore(store);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "a database in memory opens");
+        end case;
+        return nil;
+    end;
+
+    -- The text of column c, row r of the table, asserted to be expected.
+    generic [R: Region]
+    function assertCellText(back: &[Table, R], c: Index, r: Index, expected: Span[Nat8, Static]): Unit is
+        case textAt(back, c, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                assertTrue(equal(v, expected), "the text of the cell");
+            when None do
+                assertTrue(false, "the text of the cell is there");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function checkPlaces(back: &[Table, R]): Unit is
+        case textAt(back, 0, 0) of
+            when Some(value as v: Span[Nat8, R]) do
+                assertTrue(equal(v, "bonn"), "the first city");
+            when None do
+                assertTrue(false, "the first city is there");
+        end case;
+        case floatAt(back, 1, 0) of
+            when Some(value as v: Float64) do
+                assertTrue(v = 1.5, "the mass of bonn");
+            when None do
+                assertTrue(false, "the mass of bonn is there");
+        end case;
+        case floatAt(back, 1, 1) of
+            when Some(value as v: Float64) do
+                assertTrue(false, "the mass of ulm is missing");
+            when None do
+                assertTrue(true, "the mass of ulm is missing");
+        end case;
+        case intAt(back, 2, 2) of
+            when Some(value as v: Int64) do
+                assertTrue(v = 10, "the n of koeln");
+            when None do
+                assertTrue(false, "the n of koeln is there");
+        end case;
+        case boolAt(back, 3, 1) of
+            when Some(value as v: Bool) do
+                assertTrue(v, "ulm is ok");
+            when None do
+                assertTrue(false, "the flag of ulm is there");
+        end case;
+        case boolAt(back, 3, 2) of
+            when Some(value as v: Bool) do
+                assertFalse(v, "koeln is not ok");
+            when None do
+                assertTrue(false, "the flag of koeln is there");
+        end case;
+        return nil;
+    end;
+
+    -- A key twice: the second row fails, and the first is not kept either.
+    function allOrNothing(backend: Nat8): Unit is
+        case openStore(backend, ":memory:", true) of
+            when Right(right as opened: Store) do
+                var store: Store := opened;
+                createPlacesTable(&!store, backend);
+                let t: Table := places(1, 2, 1);
+                case append(&!store, "INSERT INTO places (city, mass, n, ok) VALUES (?, ?, ?, ?)", &t) of
+                    when Right(right as n: Nat64) do
+                        assertTrue(false, "a key written twice is refused");
+                    when Left(left as e: StoreError) do
+                        assertTrue(e.code = statementFailed(), "the statement failed");
+                end case;
+                assertTrue(placeCount(&!store) = 0, "no row of the failed append is kept");
+                case append(&!store, "INSERT INTO places (city, mass, n) VALUES (?, ?, ?)", &t) of
+                    when Right(right as n: Nat64) do
+                        assertTrue(false, "three question marks for four columns are refused");
+                    when Left(left as e: StoreError) do
+                        assertTrue((e.code = statementFailed()) or (e.code = wrongParameters()), "the count of question marks");
+                end case;
+                assertTrue(placeCount(&!store) = 0, "still no row");
+                destroyTable(t);
+                closeStore(store);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "a database in memory opens");
+        end case;
+        return nil;
+    end;
+
+    -- A row of four NULLs, one column of each kind: every cell comes back as
+    -- None, never as 0, an empty text or false.
+    function nullRoundTrip(backend: Nat8): Unit is
+        case openStore(backend, ":memory:", true) of
+            when Right(right as opened: Store) do
+                var store: Store := opened;
+                let sql: Span[Nat8, Static] := nullsTable(backend);
+                case createTable(&!store, sql) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the table nulls is made");
+                end case;
+                case createTable(&!store, "INSERT INTO nulls (a, b, c, d) VALUES (NULL, NULL, NULL, NULL)") of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the row of nulls is written");
+                end case;
+                var kinds: Buffer[Nat8] := placeKinds();
+                case query(&!store, "SELECT a, b, c, d FROM nulls", wholeSpan(&kinds), "a,b,c,d") of
+                    when Right(right as back: Table) do
+                        assertTrue(rowCount(&back) = 1, "the row of nulls is read");
+                        assertNullCells(&back);
+                        destroyTable(back);
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the row of nulls is queried");
+                end case;
+                destroyFree(kinds);
+                closeStore(store);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "a database in memory opens");
+        end case;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function assertNullCells(back: &[Table, R]): Unit is
+        case textAt(back, 0, 0) of
+            when Some(value as v: Span[Nat8, R]) do
+                assertTrue(false, "the text is missing, not empty");
+            when None do
+                assertTrue(true, "the text is missing, not empty");
+        end case;
+        case floatAt(back, 1, 0) of
+            when Some(value as v: Float64) do
+                assertTrue(false, "the Float64 is missing, not 0");
+            when None do
+                assertTrue(true, "the Float64 is missing, not 0");
+        end case;
+        case intAt(back, 2, 0) of
+            when Some(value as v: Int64) do
+                assertTrue(false, "the Int64 is missing, not 0");
+            when None do
+                assertTrue(true, "the Int64 is missing, not 0");
+        end case;
+        case boolAt(back, 3, 0) of
+            when Some(value as v: Bool) do
+                assertTrue(false, "the Bool is missing, not false");
+            when None do
+                assertTrue(true, "the Bool is missing, not false");
+        end case;
+        return nil;
+    end;
+
+    -- The mapping of the four kinds to the column types of SQLite, and a
+    -- table of them that refuses a value of another type, and a column of
+    -- another kind than the one asked for.
+    function strictColumnTypes(backend: Nat8): Unit is
+        assertTrue(equal(columnTypeOf(kindFloat()), "REAL"), "a Float64 is REAL");
+        assertTrue(equal(columnTypeOf(kindInt()), "INTEGER"), "an Int64 is INTEGER");
+        assertTrue(equal(columnTypeOf(kindText()), "TEXT"), "a text is TEXT");
+        assertTrue(equal(columnTypeOf(kindBool()), "INTEGER"), "a Bool is INTEGER");
+        case openStore(backend, ":memory:", true) of
+            when Right(right as opened: Store) do
+                var store: Store := opened;
+                let sql: Span[Nat8, Static] := typedTable(backend);
+                case createTable(&!store, sql) of
+                    when Right(right as done: Unit) do
+                        skip;
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the table typed is made");
+                end case;
+                case createTable(&!store, "INSERT INTO typed (n) VALUES ('no number')") of
+                    when Right(right as done: Unit) do
+                        assertTrue(false, "a text in a column of Int64 is refused");
+                    when Left(left as e: StoreError) do
+                        assertTrue(e.code = statementFailed(), "a text in a column of Int64 is refused");
+                end case;
+                var kinds: Buffer[Nat8] := allocateEmpty();
+                insertBack(&!kinds, kindText());
+                if backend = backendSqlite() then
+                    -- SQLite reads a column through its own conversion and does not inspect the declared
+                    -- type, so a column of Int64 asked for as text comes back as that text; only DuckDB
+                    -- refuses it, which the branch below asserts where that backend runs.
+                    case query(&!store, "SELECT 7 AS n", wholeSpan(&kinds), "n") of
+                        when Right(right as back: Table) do
+                            assertCellText(&back, 0, 0, "7");
+                            destroyTable(back);
+                        when Left(left as e: StoreError) do
+                            assertTrue(false, "SQLite reads a column as the kind asked");
+                    end case;
+                else
+                    case query(&!store, "SELECT n FROM typed", wholeSpan(&kinds), "n") of
+                        when Right(right as back: Table) do
+                            destroyTable(back);
+                            assertTrue(false, "a column of Int64 is no text");
+                        when Left(left as e: StoreError) do
+                            assertTrue(e.code = wrongColumns(), "a column of Int64 is read as no text");
+                    end case;
+                end if;
+                destroyFree(kinds);
+                closeStore(store);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "a database in memory opens");
+        end case;
+        return nil;
+    end;
+
+    -- A caller that names no backend gets SQLite, and that store reads and
+    -- writes as a store of SQLite does.
+    function defaultIsSqlite(): Unit is
+        assertTrue(backendDefault() = backendSqlite(), "the backend of a caller that names none is SQLite");
+        case openStore(backendDefault(), ":memory:", true) of
+            when Right(right as opened: Store) do
+                var store: Store := opened;
+                assertTrue(backendOf(&store) = backendSqlite(), "a store of no named backend is a store of SQLite");
+                createPlacesTable(&!store, backendSqlite());
+                let t: Table := places(1, 2, 3);
+                case append(&!store, "INSERT INTO places (city, mass, n, ok) VALUES (?, ?, ?, ?)", &t) of
+                    when Right(right as n: Nat64) do
+                        assertTrue(n = 3, "the default store writes");
+                    when Left(left as e: StoreError) do
+                        assertTrue(false, "the default store writes");
+                end case;
+                destroyTable(t);
+                assertTrue(placeCount(&!store) = 3, "the default store reads its rows");
+                closeStore(store);
+            when Left(left as e: StoreError) do
+                assertTrue(false, "a database of the default backend opens");
+        end case;
+        return nil;
+    end;
+
+    -- The table nulls, a column of each kind, in the column types of the
+    -- backend; strictColumnTypes asserts the two against columnTypeOf.
+    function nullsTable(backend: Nat8): Span[Nat8, Static] is
+        if backend = backendSqlite() then
+            return "CREATE TABLE nulls (a TEXT, b REAL, c INTEGER, d INTEGER) STRICT";
+        end if;
+        return "CREATE TABLE nulls (a VARCHAR, b DOUBLE, c BIGINT, d BOOLEAN)";
+    end;
+
+    -- The table typed, one column of Int64, in the column types of the
+    -- backend.
+    function typedTable(backend: Nat8): Span[Nat8, Static] is
+        if backend = backendSqlite() then
+            return "CREATE TABLE typed (n INTEGER) STRICT";
+        end if;
+        return "CREATE TABLE typed (n BIGINT)";
+    end;
+end module body.

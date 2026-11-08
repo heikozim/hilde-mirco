@@ -1,0 +1,80 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The sums are those XXH3_64bits of the library xxHash 0.8.3 gives for the
+-- bytes 7 times i plus 3 modulo 256, for i from 0 below n; the lengths reach
+-- every branch of the hash and both sides of each of its borders.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Mirco.Xxh3 (xxh3);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Xxh3.Test is
+    function bytesOf(n: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            case toNat8(rem((7 * i) + 3, 256)) of
+                when Some(value as b: Nat8) do
+                    insertBack(&!out, b);
+                when None do
+                    abort("Mirco.Xxh3.Test: a byte above 255");
+            end case;
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    function sumIs(n: Index, expected: Nat64): Bool is
+        let data: Buffer[Nat8] := bytesOf(n);
+        let sum: Nat64 := xxh3(wholeSpan(&data));
+        destroyFree(data);
+        return sum = expected;
+    end;
+
+    function testShort(): Unit is
+        assertTrue(sumIs(0, 3244421341483603138), "the empty input");
+        assertTrue(sumIs(1, 1433843135270481901), "one byte");
+        assertTrue(sumIs(2, 2058273368586827884), "two bytes");
+        assertTrue(sumIs(3, 12180141160879835164), "three bytes");
+        assertTrue(sumIs(4, 7895465118229274323), "four bytes");
+        assertTrue(sumIs(7, 10268930274873212462), "seven bytes");
+        assertTrue(sumIs(8, 6941064856527638883), "eight bytes");
+        assertTrue(sumIs(9, 18374517719163151272), "nine bytes");
+        assertTrue(sumIs(15, 11439541028034589121), "15 bytes");
+        assertTrue(sumIs(16, 13314990914799711621), "16 bytes");
+        return nil;
+    end;
+
+    function testMiddle(): Unit is
+        assertTrue(sumIs(17, 8163341949877205007), "17 bytes");
+        assertTrue(sumIs(32, 1873302701886544469), "32 bytes");
+        assertTrue(sumIs(33, 4486878507168070088), "33 bytes");
+        assertTrue(sumIs(64, 2917965298538373825), "64 bytes");
+        assertTrue(sumIs(65, 9408609914592003654), "65 bytes");
+        assertTrue(sumIs(96, 17331232145433315139), "96 bytes");
+        assertTrue(sumIs(97, 2137665177113230204), "97 bytes");
+        assertTrue(sumIs(128, 7440608504995537343), "128 bytes");
+        assertTrue(sumIs(129, 14295761343243267012), "129 bytes");
+        assertTrue(sumIs(200, 8389308914288017243), "200 bytes");
+        assertTrue(sumIs(240, 7229805477010515663), "240 bytes");
+        return nil;
+    end;
+
+    function testLong(): Unit is
+        assertTrue(sumIs(241, 10082113959289486871), "241 bytes");
+        assertTrue(sumIs(255, 13149215926256561209), "255 bytes");
+        assertTrue(sumIs(256, 4339360625268998362), "256 bytes");
+        assertTrue(sumIs(1023, 15161797645365529668), "1023 bytes");
+        assertTrue(sumIs(1024, 11205349619999208113), "1024 bytes");
+        assertTrue(sumIs(1025, 9253807012321506678), "1025 bytes");
+        assertTrue(sumIs(2047, 16388544938733792442), "2047 bytes");
+        assertTrue(sumIs(2048, 12386592778227166929), "2048 bytes");
+        assertTrue(sumIs(2049, 6174105427284153526), "2049 bytes");
+        assertTrue(sumIs(3000, 14452465426031733565), "3000 bytes");
+        return nil;
+    end;
+end module body.

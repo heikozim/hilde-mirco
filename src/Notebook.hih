@@ -1,0 +1,308 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Notebooks of Hilde: a text of cells, each a small programme that hilde run builds and runs.
+
+- A cell begins with a line "--- cell NAME", or "--- cell NAME sperli RANKS HOSTS" for a job of Sperli (Simple Parallel Execution over Remote Links Interface) of "RANKS" ranks on the hosts listed in the file "HOSTS" beside the notebook.
+- "NAME" is 1 to 48 small letters, digits and hyphens, the first a letter, and no two cells share one; "RANKS" is 1 to 4096.
+- The lines up to the next such line or the end are the cell: a module body with a function main, as for hilde run.
+- Lines before the first cell say what the notebook is about and are not run; a zero byte anywhere refuses the text.
+- What a cell writes is recorded in a manifest, a table of Schlucki in CSV: the cell, the file, its kind of output and its bytes.
+- A kind of output follows the ending of a file: text, table, array, svg, png or file.
+
+    case parseNotebook(text) of
+        when Right(right as nb: Notebook) do
+            let cells: Index := cellCount(&nb);
+            destroyNotebook(nb);
+        when Left(left as e: NotebookError) do
+            report(e.code, e.line);
+    end case;
+"""
+import Standard.String (String, length);
+import Mirco.Schlucki (Table, TableError, columnCount, rowCount);
+
+module Mirco.Notebook is
+    """
+    Why parseNotebook refused a text: one of the codes below and the line it was found on, from 1.
+    """
+    record NotebookError: Free is
+        code: Int32;
+        line: Index;
+    end;
+
+    """
+    The text has no line that begins a cell.
+    """
+    function noCell(): Int32
+        ensures result = 1;
+
+    """
+    A line begins a cell but is not "--- cell NAME" or "--- cell NAME sperli RANKS HOSTS".
+    """
+    function badHeader(): Int32
+        ensures result = 2;
+
+    """
+    The name of a cell is not 1 to 48 small letters, digits and hyphens beginning with a letter.
+    """
+    function badName(): Int32
+        ensures result = 3;
+
+    """
+    Two cells have the same name.
+    """
+    function nameTaken(): Int32
+        ensures result = 4;
+
+    """
+    The count of ranks is not a number from 1 to rankLimit.
+    """
+    function badRanks(): Int32
+        ensures result = 5;
+
+    """
+    The file of the hosts is not a plain name of a file beside the notebook.
+    """
+    function badHosts(): Int32
+        ensures result = 6;
+
+    """
+    A cell has no line "module body Name is".
+    """
+    function noModule(): Int32
+        ensures result = 7;
+
+    """
+    The text has more cells than cellLimit.
+    """
+    function tooManyCells(): Int32
+        ensures result = 8;
+
+    """
+    The text holds a zero byte.
+    """
+    function zeroByte(): Int32
+        ensures result = 9;
+
+    """
+    The most cells of a notebook.
+    """
+    function cellLimit(): Index
+        ensures result = 1000;
+
+    """
+    The most ranks of a cell, as many as hilde run starts.
+    """
+    function rankLimit(): Index
+        ensures result = 4096;
+
+    """
+    Whether name can name a cell: 1 to 48 small letters, digits and hyphens, the first a letter.
+    No contract: no precondition, since any bytes can be looked at.
+    """
+    generic [R: Region]
+    function isCellName(name: Span[Nat8, R]): Bool;
+
+    """
+    Whether file is a plain name of a file beside the notebook: 1 to 128 letters, digits, points,
+    underscores and hyphens, the first no point and no hyphen.
+    No contract: no precondition, since any bytes can be looked at.
+    """
+    generic [R: Region]
+    function isHostsName(file: Span[Nat8, R]): Bool;
+
+    """
+    The cells of a notebook, each with its name, its count of ranks, its file of hosts, its module and its
+    text.  Linear: destroyNotebook gives it back.
+    """
+    type Notebook: Linear;
+
+    """
+    The cells of text, or why it is no notebook.
+    No contract: no precondition, since a text that is no notebook gives a NotebookError.
+    """
+    generic [R: Region]
+    function parseNotebook(text: Span[Nat8, R]): Either[NotebookError, Notebook];
+
+    """
+    Gives the notebook back.
+    No contract: a destroy function.
+    """
+    function destroyNotebook(nb: Notebook): Unit;
+
+    """
+    The count of cells; parseNotebook gives no notebook without one.
+    """
+    generic [R: Region]
+    function cellCount(nb: &[Notebook, R]): Index
+        ensures (result >= 1) and (result <= cellLimit());
+
+    """
+    The name of cell i.
+    """
+    generic [R: Region]
+    function cellName(nb: &[Notebook, R], i: Index): Span[Nat8, R]
+        requires i < cellCount(nb)
+        ensures isCellName(result);
+
+    """
+    The count of ranks of cell i, 0 for a cell that runs once on this machine.
+    """
+    generic [R: Region]
+    function cellRanks(nb: &[Notebook, R], i: Index): Index
+        requires i < cellCount(nb)
+        ensures result <= rankLimit();
+
+    """
+    The file of the hosts of cell i, empty for a cell that runs once on this machine.
+    """
+    generic [R: Region]
+    function cellHosts(nb: &[Notebook, R], i: Index): Span[Nat8, R]
+        requires i < cellCount(nb)
+        ensures (spanLength(result) = 0) or isHostsName(result);
+
+    """
+    The name of the module body of cell i, as its line "module body Name is" gives it.
+    """
+    generic [R: Region]
+    function cellModule(nb: &[Notebook, R], i: Index): Span[Nat8, R]
+        requires i < cellCount(nb)
+        ensures spanLength(result) >= 1;
+
+    """
+    The line of the text that begins cell i, from 1.
+    """
+    generic [R: Region]
+    function cellLine(nb: &[Notebook, R], i: Index): Index
+        requires i < cellCount(nb)
+        ensures result >= 1;
+
+    """
+    The position of the cell named name, or None.
+    No contract: no precondition, since a name no cell has gives None.
+    """
+    generic [R: Region, S: Region]
+    function cellIndex(nb: &[Notebook, R], name: Span[Nat8, S]): Option[Index];
+
+    """
+    The source of cell i for hilde run: as many lines "--" as its line, then its text, so that every line of
+    the source has the number it has in the notebook and a message of the compiler points into the notebook;
+    lines of a comment, since the compiler does not count empty lines before the first word.
+    The ensures says at least one byte, not cellLine of them: cellLine reads a buffer, which reaches C, and a
+    condition may not call that.
+    """
+    generic [R: Region]
+    function cellSource(nb: &[Notebook, R], i: Index): String
+        requires i < cellCount(nb)
+        ensures length(&result) >= 1;
+
+    """
+    The kind of output of a file of text, ending .txt.
+    """
+    function outputText(): Nat8
+        ensures result = 1;
+
+    """
+    The kind of output of a table in CSV, ending .csv.
+    """
+    function outputTable(): Nat8
+        ensures result = 2;
+
+    """
+    The kind of output of an array in the wire format of Mirco.Wire, ending .mirc.
+    """
+    function outputArray(): Nat8
+        ensures result = 3;
+
+    """
+    The kind of output of a figure as svg, ending .svg.
+    """
+    function outputSvg(): Nat8
+        ensures result = 4;
+
+    """
+    The kind of output of a figure as PNG, ending .png.
+    """
+    function outputPng(): Nat8
+        ensures result = 5;
+
+    """
+    The kind of output of any other file.
+    """
+    function outputOther(): Nat8
+        ensures result = 6;
+
+    """
+    The kind of output of the file named file, by its ending.
+    """
+    generic [R: Region]
+    function outputKind(file: Span[Nat8, R]): Nat8
+        ensures (result >= 1) and (result <= 6);
+
+    """
+    The word of a kind of output in the manifest: text, table, array, svg, png or file.
+    """
+    function outputWord(kind: Nat8): Span[Nat8, Static]
+        requires (kind >= 1) and (kind <= 6)
+        ensures spanLength(result) >= 3;
+
+    """
+    Whether file can stand in the manifest: "state/" or "out/" and a plain name of a file, as isHostsName
+    takes it; so a manifest names no file outside the directory of the run.
+    No contract: no precondition, since any bytes can be looked at.
+    """
+    generic [R: Region]
+    function isRecordedFile(file: Span[Nat8, R]): Bool;
+
+    """
+    Whether t has the columns of a manifest: cell, file and kind of text, then bytes of Int64.
+    No contract: no precondition, since a table of any columns can be looked at.
+    """
+    generic [R: Region]
+    function isManifest(t: &[Table, R]): Bool;
+
+    """
+    Whether t has the columns of the files a run wrote: cell and file of text, then bytes of Int64.
+    No contract: no precondition, since a table of any columns can be looked at.
+    """
+    generic [R: Region]
+    function isWritten(t: &[Table, R]): Bool;
+
+    """
+    A manifest without rows.
+    """
+    function emptyManifest(): Table
+        ensures (columnCount(&result) = 4) and (rowCount(&result) = 0);
+
+    """
+    The manifest of a CSV text, as writeCsv of Mirco.Schlucki wrote it.
+    No contract: no precondition, since a text that is no manifest gives a TableError.
+    """
+    generic [R: Region]
+    function readManifest(text: Span[Nat8, R]): Either[TableError, Table];
+
+    """
+    The files a run wrote, a CSV text of the columns cell, file and bytes.
+    No contract: no precondition, since a text that is no such table gives a TableError.
+    """
+    generic [R: Region]
+    function readWritten(text: Span[Nat8, R]): Either[TableError, Table];
+
+    """
+    The manifest after a run of the cells named in ran, joined by commas: the rows of old for every other cell
+    in their order, then a row for each file of written whose cell is in ran and whose file isRecordedFile
+    takes, with its kind of output.  A cell that ran and wrote nothing so loses its old rows.
+    The contract states the counts of columns; the kinds isManifest and isWritten look at lie in a buffer,
+    which a condition may not read (it reaches C), so the body stops the programme on a column of another
+    kind, as textAt and intAt of Mirco.Schlucki do; a caller asks isManifest and isWritten first.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function recordCells(old: &[Table, R], ran: Span[Nat8, S], written: &[Table, Q]): Table
+        requires (columnCount(old) = 4) and (columnCount(written) = 3)
+        ensures columnCount(&result) = 4;
+end module.

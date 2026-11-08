@@ -1,0 +1,76 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The arithmetic of the number types of a Mirco array: Float64, Float32, Int64, Int32 and Nat8.
+
+- Integer operations trap on overflow and on a division by zero, as the operators of the language do.
+- A floating point division by zero stops the programme too; any other floating point operation follows binary64 and binary32.
+- less is false when either operand is a NaN.
+
+    let sum: Float64 := plus(1.5, 2.5);
+"""
+module Mirco.Numeric is
+    """
+    A number type of a Mirco array.
+    """
+    typeclass Numeric(T: Free) is
+        """
+        a + b.
+        No contract: a method takes no requires or ensures in the language; an integer overflow stops the programme, as the operator does.
+        """
+        method plus(a: T, b: T): T;
+
+        """
+        a - b.
+        No contract: a method takes no requires or ensures in the language; an integer overflow stops the programme, as the operator does.
+        """
+        method minus(a: T, b: T): T;
+
+        """
+        a * b.
+        No contract: a method takes no requires or ensures in the language; an integer overflow stops the programme, as the operator does.
+        """
+        method times(a: T, b: T): T;
+
+        """
+        a / b; for an integer type rounded towards zero.
+        No contract: a method takes no requires or ensures in the language (a requires on it is the parse error H0005); a division by zero or an integer overflow stops the programme, as the operator does; the zero test over arrays at Mirco.Compute.divide is refused with H3098.
+        """
+        method dividedBy(a: T, b: T): T;
+
+        """
+        Whether a is below b; false when either is a NaN.
+        No contract: a method takes no requires or ensures in the language; it has no precondition; a NaN gives false.
+        """
+        method less(a: T, b: T): Bool;
+
+        """
+        Whether a is a NaN; always false for an integer type.
+        No contract: a method takes no requires or ensures in the language; it has no precondition.
+        """
+        method isNaN(a: T): Bool;
+
+        """
+        The one of the type.
+        No contract: a method takes no requires or ensures in the language; it has no argument and so no precondition.
+        """
+        method oneOf(): T;
+
+        """
+        The count as a value of the type, for a mean.
+        No contract: a method takes no requires or ensures in the language; a count above the range of an integer type stops the programme.
+        """
+        method fromCount(count: Index): T;
+    end;
+
+    instance Numeric(Float64);
+    instance Numeric(Float32);
+    instance Numeric(Int64);
+    instance Numeric(Int32);
+    instance Numeric(Nat8);
+end module.

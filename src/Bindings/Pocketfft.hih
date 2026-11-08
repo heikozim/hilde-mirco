@@ -1,0 +1,32 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the transforms of pocketfft in the library mircoblis that the package mirco-blis builds.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.Pocketfft is the safe module built on it, and the one a programme imports.
+- Each function transforms in place and returns 0, or -1 when n is 0, the span too short or memory short.
+
+    let done: Int32 := complexTransform(values, n, true, 1.0);
+"""
+module Mirco.Bindings.Pocketfft is
+    """
+    The transform of n complex numbers stored as pairs of real and imaginary part, forward when forward
+    holds, each result multiplied by scale, mirco_cfft.
+    No contract: no precondition, since the body returns -1 when n is 0, when values holds fewer than 2 n numbers or when memory is short, and transforms nothing.
+    """
+    generic [R: Region]
+    function complexTransform(values: Span![Float64, R], n: Index, forward: Bool, scale: Float64): Int32;
+
+    """
+    The forward transform of n real numbers into the half complex order of fftpack, mirco_rfft_forward.
+    No contract: no precondition, since the body returns -1 when n is 0, when values holds fewer than n numbers or when memory is short, and transforms nothing.
+    """
+    generic [R: Region]
+    function realTransform(values: Span![Float64, R], n: Index, scale: Float64): Int32;
+end module.

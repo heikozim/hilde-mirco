@@ -1,0 +1,61 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A script for tools/mirco-run: the mean and the deviation of a few
+-- numbers, and the slope and intercept of the line through them.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, flatGet);
+import Mirco.Stats (standardDeviation);
+import Mirco.Linalg (lstsq);
+import Mirco.Text (formatFloat64);
+
+module body Example.Summary is
+    function show(label: Span[Nat8, Static], x: Float64): Unit is
+        let text: String := formatFloat64(x);
+        print(label);
+        printLn(asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    function main(): ExitCode is
+        var a: Buffer[Float64] := allocateEmpty();
+        var y: Buffer[Float64] := allocateEmpty();
+        var x: Float64 := 0.0;
+        while x < 4.0 do
+            insertBack(&!a, 1.0);
+            insertBack(&!a, x);
+            insertBack(&!y, 1.0 + (2.0 * x));
+            x := x + 1.0;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 4);
+        insertBack(&!shape, 2);
+        let m: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&a));
+        var vshape: Buffer[Index] := allocateEmpty();
+        insertBack(&!vshape, 4);
+        let v: NdArray[Float64] := fromSpan(wholeSpan(&vshape), wholeSpan(&y));
+        show("deviation ", standardDeviation(&v, 0));
+        case lstsq(&m, &v) of
+            when Some(value as c: NdArray[Float64]) do
+                show("intercept ", flatGet(&c, 0));
+                show("slope ", flatGet(&c, 1));
+                destroyNdArray(c);
+            when None do
+                printLn("no fit");
+        end case;
+        destroyNdArray(m);
+        destroyNdArray(v);
+        destroyFree(a);
+        destroyFree(y);
+        destroyFree(shape);
+        destroyFree(vshape);
+        return ExitSuccess();
+    end;
+end module body.

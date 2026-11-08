@@ -1,0 +1,41 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reads a Float64 from decimal text and writes the shortest decimal text that reads back as the same number.
+
+- A number is read only when the whole text is one: a sign, digits with a point, an exponent, or nan, inf.
+- Blanks and tabs around the number are allowed; anything else gives None.
+- Written text reads back as the same number, its bits included, and nan, inf and -inf stand for those values.
+
+    let text: String := formatFloat64(0.1);
+"""
+import Standard.String (String, length);
+
+module Mirco.Text is
+    """
+    True when text, without the blanks and tabs around it, is a decimal number or nan, inf or infinity, in
+    any case, each with a sign or without; never for an empty text.
+    """
+    generic [R: Region]
+    function isNumber(text: Span[Nat8, R]): Bool
+        ensures (not result) or (spanLength(text) > 0);
+
+    """
+    The number text holds, rounded to the nearest Float64; None when the text is no number.
+    No contract: no precondition, since bytes that are no number give None.
+    """
+    generic [R: Region]
+    function parseFloat64(text: Span[Nat8, R]): Option[Float64];
+
+    """
+    The shortest text with up to 17 significant digits that parseFloat64 reads back as value; at most 24
+    bytes, as many as -2.2250738585072014e-308 takes: a sign, 17 digits, a point and an exponent of five.
+    """
+    function formatFloat64(value: Float64): String
+        ensures (length(&result) > 0) and (length(&result) <= 24);
+end module.

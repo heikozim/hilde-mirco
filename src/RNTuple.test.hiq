@@ -1,0 +1,1245 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, destroyEmpty, removeLast, lengthMut, nth, getSpan, length as bufferLength);
+import Standard.String (String, fromSpan, fromByteBuffer, asSpan, destroyString);
+import Standard.Text (equal, contains);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    openRead,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, destroyNdArray, count, flatGet);
+import Mirco.Root (RootFault, RootError, RootHeader, RootKey, readHeader, readKeys, className, keyName);
+import Mirco.RNTuple (
+    Ntuple,
+    readNtuple,
+    destroyNtuple,
+    ntupleEntries,
+    fieldCount,
+    fieldName,
+    fieldTypeName,
+    fieldInt64,
+    fieldFloat64,
+    fieldFloat32,
+    fieldStrings,
+    fieldOffsets,
+    fieldHandles,
+    fieldPath,
+    fieldTags,
+    clusterCount,
+    clusterEntries,
+    narrowClusters,
+    rankFirst,
+    rankCount
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.RNTuple.Test is
+    constant limit: Index := 16777216;
+
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function load(path: Span[Nat8, Static]): String is
+        case openRead(path) of
+            when Some(value as opened: FileDescriptor) do
+                var file: FileDescriptor := opened;
+                let read: Option[String] := readAll(&!file);
+                let closed: Bool := closeFile(file);
+                case read of
+                    when Some(value as text: String) do
+                        return text;
+                    when None do
+                        return fromSpan("");
+                end case;
+            when None do
+                return fromSpan("");
+        end case;
+    end;
+
+    -- The checks of check on the RNTuple named name of the file at path.
+    function holds(path: Span[Nat8, Static], name: Span[Nat8, Static], check: Int32): Bool is
+        let file: String := load(path);
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readKeys(asSpan(&file), header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        var k: Index := 0;
+                        while k < bufferLength(&keys) do
+                            let key: RootKey := nth(&keys, k);
+                            if equal(className(asSpan(&file), key), "ROOT::RNTuple") and equal(keyName(asSpan(&file), key), name) then
+                                case readNtuple(asSpan(&file), key, limit) of
+                                    when Right(right as t: Ntuple) do
+                                        ok := checked(asSpan(&file), &t, check);
+                                        destroyNtuple(t);
+                                    when Left(left as e: RootError) do
+                                        ok := false;
+                                end case;
+                            end if;
+                            k := k + 1;
+                        end while;
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    generic [R: Region]
+    function nameIs(t: &[Ntuple, R], i: Index, name: Span[Nat8, Static], kind: Span[Nat8, Static]): Bool is
+        let n: String := fieldName(t, i);
+        let k: String := fieldTypeName(t, i);
+        let same: Bool := equal(asSpan(&n), name) and equal(asSpan(&k), kind);
+        destroyString(n);
+        destroyString(k);
+        return same;
+    end;
+
+    generic [R: Region, S: Region]
+    function intAt(bytes: Span[Nat8, R], t: &[Ntuple, S], i: Index, at: Index, wanted: Int64): Bool is
+        case fieldInt64(bytes, t, i, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                let same: Bool := (at < count(&v)) and (flatGet(&v, at) = wanted);
+                destroyNdArray(v);
+                return same;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function textAt(bytes: Span[Nat8, R], t: &[Ntuple, S], i: Index, at: Index, wanted: Span[Nat8, Static]): Bool is
+        case fieldStrings(bytes, t, i, limit) of
+            when Right(right as v: Buffer[String]) do
+                var same: Bool := false;
+                if at < bufferLength(&v) then
+                    same := equalAt(&v, at, wanted);
+                end if;
+                dropStrings(v);
+                return same;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    generic [R: Region]
+    function equalAt(v: &[Buffer[String], R], at: Index, wanted: Span[Nat8, Static]): Bool is
+        let piece: Span[String, R] := getSpan(v, at, at);
+        return equal(asSpan(&(piece[0])), wanted);
+    end;
+
+    function dropStrings(v: Buffer[String]): Unit is
+        var rest: Buffer[String] := v;
+        while lengthMut(&!rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- Reads the field at fieldHandles, past the last number of a field, with
+    -- fieldInt64 for 20, fieldFloat64 for 21, fieldFloat32 for 22,
+    -- fieldStrings for 23, fieldOffsets for 24 and fieldTags for 26; for 25
+    -- the last number with fieldInt64, fieldOffsets and fieldTags. True when
+    -- the calls came back.
+    generic [R: Region, S: Region]
+    function pastField(bytes: Span[Nat8, R], t: &[Ntuple, S], check: Int32): Bool is
+        var i: Index := fieldHandles(t);
+        if check = 25 then
+            i := i - 1;
+        end if;
+        if (check = 20) or (check = 25) then
+            case fieldInt64(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if check = 21 then
+            case fieldFloat64(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Float64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if check = 22 then
+            case fieldFloat32(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Float32]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if check = 23 then
+            case fieldStrings(bytes, t, i, limit) of
+                when Right(right as v: Buffer[String]) do
+                    dropStrings(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if (check = 24) or (check = 25) then
+            case fieldOffsets(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        if (check = 26) or (check = 25) then
+            case fieldTags(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+        end if;
+        return true;
+    end;
+
+    generic [R: Region, S: Region]
+    function checked(bytes: Span[Nat8, R], t: &[Ntuple, S], check: Int32): Bool is
+        if check >= 20 then
+            return pastField(bytes, t, check);
+        end if;
+        if check = 1 then
+            var ok: Bool := (ntupleEntries(t) = 10) and (fieldCount(t) = 2);
+            ok := ok and (nameIs(t, 0, "one_integers", "std::int32_t") and nameIs(t, 1, "two_floats", "float"));
+            ok := ok and (intAt(bytes, t, 0, 0, 9) and (intAt(bytes, t, 0, 1, 8) and intAt(bytes, t, 0, 2, 7)));
+            case fieldFloat32(bytes, t, 1, limit) of
+                when Right(right as v: NdArray[Float32]) do
+                    case toFloat64(flatGet(&v, 0)) of
+                        when Some(value as x: Float64) do
+                            ok := ok and (x = 9.899999618530273);
+                        when None do
+                            ok := false;
+                    end case;
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    ok := false;
+            end case;
+            case fieldFloat64(bytes, t, 1, limit) of
+                when Right(right as v: NdArray[Float64]) do
+                    destroyNdArray(v);
+                    ok := false;
+                when Left(left as e: RootError) do
+                    skip;
+            end case;
+            return ok;
+        end if;
+        if check = 4 then
+            return stepsHold(bytes, t, 0) and stepsHold(bytes, t, 1);
+        end if;
+        if check = 5 then
+            return muonsHold(bytes, t);
+        end if;
+        if check = 10 then
+            return structsHold(bytes, t);
+        end if;
+        if check = 12 then
+            return sizesHold(bytes, t);
+        end if;
+        if check = 13 then
+            return limitsHold(bytes, t);
+        end if;
+        if check = 11 then
+            return containersHold(bytes, t);
+        end if;
+        if check = 6 then
+            return ((ntupleEntries(t) = 200) and (fieldCount(t) = 1)) and pairsHold(bytes, t, 0, 200, 6);
+        end if;
+        if check = 7 then
+            let counted: Bool := (ntupleEntries(t) = 1000) and (fieldCount(t) = 2);
+            return (counted and onesHold(bytes, t)) and pairsHold(bytes, t, 1, 1000, 7);
+        end if;
+        if check = 2 then
+            var ok: Bool := (ntupleEntries(t) = 3354) and (fieldCount(t) = 11);
+            ok := ok and (nameIs(t, 0, "Category", "std::int32_t") and nameIs(t, 1, "Flag", "std::uint32_t"));
+            ok := ok and (intAt(bytes, t, 0, 0, 202) and (intAt(bytes, t, 1, 0, 15) and intAt(bytes, t, 2, 0, 58)));
+            ok := ok and (intAt(bytes, t, 3, 0, 28) and (intAt(bytes, t, 7, 0, 40) and intAt(bytes, t, 8, 0, 11975)));
+            ok := ok and (textAt(bytes, t, 9, 0, "PS") and textAt(bytes, t, 10, 0, "DE"));
+            return ok;
+        end if;
+        var ok: Bool := (ntupleEntries(t) = 22) and (fieldCount(t) = 2);
+        ok := ok and (textAt(bytes, t, 0, 0, "Jakob") and textAt(bytes, t, 1, 0, "Blomer"));
+        return ok;
+    end;
+
+    -- The two vector fields of 100 entries: entry i holds i mod 10 items, 450
+    -- in all, and the items are as many as the last offset.
+    generic [R: Region, S: Region]
+    function stepsHold(bytes: Span[Nat8, R], t: &[Ntuple, S], i: Index): Bool is
+        var ok: Bool := false;
+        case fieldOffsets(bytes, t, i, limit) of
+            when Right(right as o: NdArray[Int64]) do
+                ok := (count(&o) = 101) and ((flatGet(&o, 0) = 0) and (flatGet(&o, 100) = 450));
+                var e: Index := 0;
+                while ok and (e < 100) do
+                    case toInt64(rem(e, 10)) of
+                        when Some(value as step: Int64) do
+                            ok := (flatGet(&o, e + 1) - flatGet(&o, e)) = step;
+                        when None do
+                            ok := false;
+                    end case;
+                    e := e + 1;
+                end while;
+                destroyNdArray(o);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        if i = 0 then
+            case fieldInt64(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Int64]) do
+                    ok := ok and (count(&v) = 450);
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    ok := false;
+            end case;
+        else
+            case fieldFloat32(bytes, t, i, limit) of
+                when Right(right as v: NdArray[Float32]) do
+                    ok := ok and (count(&v) = 450);
+                    destroyNdArray(v);
+                when Left(left as e: RootError) do
+                    ok := false;
+            end case;
+        end if;
+        return ok;
+    end;
+
+    -- The muons of 1000 events of the experiment at the collider: the projected fields read through
+    -- their alias columns, nMuon the counts, every charge 1 or -1, every
+    -- transverse momentum above 0, and the offsets of Muon_pt stepping by
+    -- nMuon.
+    generic [R: Region, S: Region]
+    function muonsHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        var ok: Bool := fieldCount(t) = 7;
+        ok := ok and (nameIs(t, 1, "Muon_pt", "ROOT::VecOps::RVec<float>") and nameIs(t, 6, "nMuon", "ROOT::RNTupleCardinality<std::uint32_t>"));
+        if not ok then
+            return false;
+        end if;
+        case fieldInt64(bytes, t, 6, limit) of
+            when Right(right as counts: NdArray[Int64]) do
+                ok := count(&counts) = 1000;
+                case fieldOffsets(bytes, t, 1, limit) of
+                    when Right(right as o: NdArray[Int64]) do
+                        ok := ok and ((count(&o) = 1001) and (flatGet(&o, 1000) = 2372));
+                        var e: Index := 0;
+                        while ok and (e < 1000) do
+                            ok := (flatGet(&o, e + 1) - flatGet(&o, e)) = flatGet(&counts, e);
+                            e := e + 1;
+                        end while;
+                        destroyNdArray(o);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+                destroyNdArray(counts);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        case fieldInt64(bytes, t, 5, limit) of
+            when Right(right as charges: NdArray[Int64]) do
+                ok := ok and (count(&charges) = 2372);
+                var k: Index := 0;
+                while ok and (k < count(&charges)) do
+                    ok := (flatGet(&charges, k) = 1) or (flatGet(&charges, k) = -1);
+                    k := k + 1;
+                end while;
+                destroyNdArray(charges);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        case fieldFloat32(bytes, t, 1, limit) of
+            when Right(right as pt: NdArray[Float32]) do
+                ok := ok and (count(&pt) = 2372);
+                var k: Index := 0;
+                while ok and (k < count(&pt)) do
+                    case toFloat64(flatGet(&pt, k)) of
+                        when Some(value as x: Float64) do
+                            ok := x > 0.0;
+                        when None do
+                            ok := false;
+                    end case;
+                    k := k + 1;
+                end while;
+                destroyNdArray(pt);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    -- The item of entry k the generator of the file wrote first or second: in
+    -- the file of check 6 entry 100 j + i holds i and i + j, in the file of
+    -- check 7 entry k holds k and k + 1.
+    function wantedItem(k: Index, file: Int32, second: Bool): Index is
+        if file = 6 then
+            if second then
+                return rem(k, 100) + (k / 100);
+            end if;
+            return rem(k, 100);
+        end if;
+        if second then
+            return k + 1;
+        end if;
+        return k;
+    end;
+
+    generic [R: Region]
+    function itemIs(v: &[NdArray[Int64], R], at: Index, wanted: Index): Bool is
+        case toInt64(wanted) of
+            when Some(value as w: Int64) do
+                return flatGet(v, at) = w;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- A vector field of two items in each entry, over several clusters: the
+    -- offsets step by 2 from 0 across the cluster boundaries, and the items
+    -- are those the generator wrote.
+    generic [R: Region, S: Region]
+    function pairsHold(bytes: Span[Nat8, R], t: &[Ntuple, S], field: Index, entries: Index, file: Int32): Bool is
+        var ok: Bool := false;
+        case fieldOffsets(bytes, t, field, limit) of
+            when Right(right as o: NdArray[Int64]) do
+                ok := count(&o) = (entries + 1);
+                var e: Index := 0;
+                while ok and (e <= entries) do
+                    ok := itemIs(&o, e, 2 * e);
+                    e := e + 1;
+                end while;
+                destroyNdArray(o);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        case fieldInt64(bytes, t, field, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                ok := ok and (count(&v) = (2 * entries));
+                var k: Index := 0;
+                while ok and (k < entries) do
+                    ok := itemIs(&v, 2 * k, wantedItem(k, file, false)) and itemIs(&v, (2 * k) + 1, wantedItem(k, file, true));
+                    k := k + 1;
+                end while;
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    -- The field one of the file of check 7 holds k in entry k.
+    generic [R: Region, S: Region]
+    function onesHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        case fieldInt64(bytes, t, 0, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                var ok: Bool := count(&v) = 1000;
+                var k: Index := 0;
+                while ok and (k < 1000) do
+                    ok := itemIs(&v, k, k);
+                    k := k + 1;
+                end while;
+                destroyNdArray(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The number of the field at path, or fieldHandles when there is none.
+    generic [R: Region]
+    function handleOf(t: &[Ntuple, R], path: Span[Nat8, Static]): Index is
+        case fieldPath(t, path) of
+            when Some(value as h: Index) do
+                return h;
+            when None do
+                return fieldHandles(t);
+        end case;
+    end;
+
+    generic [R: Region]
+    function pathMissing(t: &[Ntuple, R], path: Span[Nat8, Static]): Bool is
+        return handleOf(t, path) = fieldHandles(t);
+    end;
+
+    function numberName(k: Index): Span[Nat8, Static] is
+        if k = 0 then
+            return "one";
+        end if;
+        if k = 1 then
+            return "two";
+        end if;
+        if k = 2 then
+            return "three";
+        end if;
+        if k = 3 then
+            return "four";
+        end if;
+        return "five";
+    end;
+
+    -- The integers of the field at path are first, first + 1 and so on, one
+    -- for each of the entries.
+    generic [R: Region, S: Region]
+    function intsFrom(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], entries: Index, first: Index): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldInt64(bytes, t, h, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                var ok: Bool := count(&v) = entries;
+                var k: Index := 0;
+                while ok and (k < entries) do
+                    ok := itemIs(&v, k, k + first);
+                    k := k + 1;
+                end while;
+                destroyNdArray(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The integers of the field at path run 1, 1, 2, 1, 2, 3 and so on: entry
+    -- k of five holds 1 to k + 1.
+    generic [R: Region, S: Region]
+    function growingHolds(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static]): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldInt64(bytes, t, h, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                var ok: Bool := count(&v) = 15;
+                var at: Index := 0;
+                var k: Index := 0;
+                while ok and (k < 5) do
+                    var j: Index := 0;
+                    while ok and (j <= k) do
+                        ok := itemIs(&v, at, j + 1);
+                        at := at + 1;
+                        j := j + 1;
+                    end while;
+                    k := k + 1;
+                end while;
+                destroyNdArray(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The offsets of the field at path over its entries: kind 1 steps by e +
+    -- 1 for entry e, kind 2 by 1 and kind 3 by 2.
+    generic [R: Region, S: Region]
+    function offsetsStep(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], entries: Index, kind: Int32): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldOffsets(bytes, t, h, limit) of
+            when Right(right as o: NdArray[Int64]) do
+                var ok: Bool := (count(&o) = (entries + 1)) and itemIs(&o, 0, 0);
+                var at: Index := 0;
+                var e: Index := 0;
+                while ok and (e < entries) do
+                    var step: Index := 1;
+                    if kind = 1 then
+                        step := e + 1;
+                    end if;
+                    if kind = 3 then
+                        step := 2;
+                    end if;
+                    at := at + step;
+                    ok := itemIs(&o, e + 1, at);
+                    e := e + 1;
+                end while;
+                destroyNdArray(o);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The floats of the field at path: entry k of five holds k + 1, times
+    -- over.
+    generic [R: Region, S: Region]
+    function floatsRepeat(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], times: Index): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldFloat32(bytes, t, h, limit) of
+            when Right(right as v: NdArray[Float32]) do
+                var ok: Bool := count(&v) = (5 * times);
+                var wanted: Float64 := 1.0;
+                var at: Index := 0;
+                var k: Index := 0;
+                while ok and (k < 5) do
+                    var j: Index := 0;
+                    while ok and (j < times) do
+                        case toFloat64(flatGet(&v, at)) of
+                            when Some(value as x: Float64) do
+                                ok := x = wanted;
+                            when None do
+                                ok := false;
+                        end case;
+                        at := at + 1;
+                        j := j + 1;
+                    end while;
+                    wanted := wanted + 1.0;
+                    k := k + 1;
+                end while;
+                destroyNdArray(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The strings of the field at path: for kind 1 one, two, three, four and
+    -- five; for kind 2 entry k holds one to the name of k + 1.
+    generic [R: Region, S: Region]
+    function namesHold(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], kind: Int32): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldStrings(bytes, t, h, limit) of
+            when Right(right as v: Buffer[String]) do
+                var ok: Bool := false;
+                if kind = 1 then
+                    ok := bufferLength(&v) = 5;
+                    var k: Index := 0;
+                    while ok and (k < 5) do
+                        ok := equalAt(&v, k, numberName(k));
+                        k := k + 1;
+                    end while;
+                else
+                    ok := bufferLength(&v) = 15;
+                    var at: Index := 0;
+                    var k: Index := 0;
+                    while ok and (k < 5) do
+                        var j: Index := 0;
+                        while ok and (j <= k) do
+                            ok := equalAt(&v, at, numberName(j));
+                            at := at + 1;
+                            j := j + 1;
+                        end while;
+                        k := k + 1;
+                    end while;
+                end if;
+                dropStrings(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The records of test_nested_structs: entry k of ten holds k, k + 1 and
+    -- k + 2 three records deep and the vector k, k + 1 in the deepest; the
+    -- record itself has no values of its own, and a wrong path has no field.
+    generic [R: Region, S: Region]
+    function structsHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        var ok: Bool := (ntupleEntries(t) = 10) and (fieldCount(t) = 1);
+        ok := ok and ((handleOf(t, "my_struct") = fieldCount(t)) and (fieldHandles(t) = 9));
+        ok := ok and intsFrom(bytes, t, "my_struct.i", 10, 0);
+        ok := ok and intsFrom(bytes, t, "my_struct.sub_struct.i", 10, 1);
+        ok := ok and intsFrom(bytes, t, "my_struct.sub_struct.sub_sub_struct.i", 10, 2);
+        let v: Index := handleOf(t, "my_struct.sub_struct.sub_sub_struct.v");
+        ok := ok and ((v < fieldHandles(t)) and pairsHold(bytes, t, v, 10, 7));
+        case fieldInt64(bytes, t, 0, limit) of
+            when Right(right as whole: NdArray[Int64]) do
+                destroyNdArray(whole);
+                ok := false;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        ok := ok and (pathMissing(t, "my_struct.nothing") and pathMissing(t, ""));
+        ok := ok and (pathMissing(t, "my_struct..i") and pathMissing(t, "i"));
+        return ok;
+    end;
+
+    -- The containers of test_stl_containers, five entries: a string, vectors
+    -- that grow by one item with each entry, of integers, of vectors and of
+    -- strings, an array of three floats, a pair, a record of four floats and
+    -- an array of three such records.
+    generic [R: Region, S: Region]
+    function containersHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        var ok: Bool := ntupleEntries(t) = 5;
+        ok := ok and namesHold(bytes, t, "string", 1);
+        ok := ok and (offsetsStep(bytes, t, "vector_int32", 5, 1) and growingHolds(bytes, t, "vector_int32"));
+        ok := ok and floatsRepeat(bytes, t, "array_float", 3);
+        ok := ok and offsetsStep(bytes, t, "vector_vector_int32", 5, 1);
+        ok := ok and (offsetsStep(bytes, t, "vector_vector_int32._0", 15, 2) and growingHolds(bytes, t, "vector_vector_int32"));
+        ok := ok and (offsetsStep(bytes, t, "vector_string", 5, 1) and namesHold(bytes, t, "vector_string", 2));
+        ok := ok and (offsetsStep(bytes, t, "vector_vector_string._0", 15, 2) and namesHold(bytes, t, "vector_vector_string", 2));
+        ok := ok and (intsFrom(bytes, t, "pair_int32_string._0", 5, 1) and namesHold(bytes, t, "pair_int32_string._1", 1));
+        ok := ok and (floatsRepeat(bytes, t, "lorentz_vector.pt", 1) and floatsRepeat(bytes, t, "lorentz_vector.mass", 1));
+        ok := ok and floatsRepeat(bytes, t, "array_lv._0.eta", 3);
+        ok := ok and variantsHold(bytes, t);
+        return ok;
+    end;
+
+    -- The tag of the value at n among those of the variant: for kind 1 the
+    -- top variant of 1, two, three, 4 and 5; for kind 2 the variant in the
+    -- vector, whose entry k holds one and then 2 to k + 1.
+    function wantedTag(kind: Int32, n: Index): Index is
+        if kind = 1 then
+            if (n = 1) or (n = 2) then
+                return 1;
+            end if;
+            return 0;
+        end if;
+        if (n = 0) or ((n = 1) or ((n = 3) or ((n = 6) or (n = 10)))) then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region, S: Region]
+    function tagsAre(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], wanted: Index, kind: Int32): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldTags(bytes, t, h, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                var ok: Bool := count(&v) = wanted;
+                var n: Index := 0;
+                while ok and (n < wanted) do
+                    ok := itemIs(&v, n, wantedTag(kind, n));
+                    n := n + 1;
+                end while;
+                destroyNdArray(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The integers of the alternative at path: for kind 1 those of the top
+    -- variant, 1, 4 and 5; for kind 2 those of the variant in the vector, 2
+    -- to k + 1 for each entry k from 1 to 4.
+    generic [R: Region, S: Region]
+    function alternativeInts(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], kind: Int32): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldInt64(bytes, t, h, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                var ok: Bool := false;
+                if kind = 1 then
+                    ok := (count(&v) = 3) and (itemIs(&v, 0, 1) and (itemIs(&v, 1, 4) and itemIs(&v, 2, 5)));
+                else
+                    ok := count(&v) = 10;
+                    var at: Index := 0;
+                    var k: Index := 1;
+                    while ok and (k < 5) do
+                        var w: Index := 2;
+                        while ok and (w <= (k + 1)) do
+                            ok := itemIs(&v, at, w);
+                            at := at + 1;
+                            w := w + 1;
+                        end while;
+                        k := k + 1;
+                    end while;
+                end if;
+                destroyNdArray(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The strings of the alternative at path: wanted of them, the name of
+    -- first + n at n, or one at every place when first is 5.
+    generic [R: Region, S: Region]
+    function alternativeNames(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], wanted: Index, first: Index): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldStrings(bytes, t, h, limit) of
+            when Right(right as v: Buffer[String]) do
+                var ok: Bool := bufferLength(&v) = wanted;
+                var n: Index := 0;
+                while ok and (n < wanted) do
+                    if first = 5 then
+                        ok := equalAt(&v, n, "one");
+                    else
+                        ok := equalAt(&v, n, numberName(first + n));
+                    end if;
+                    n := n + 1;
+                end while;
+                dropStrings(v);
+                return ok;
+            when Left(left as e: RootError) do
+                return false;
+        end case;
+    end;
+
+    -- The two variants of test_stl_containers: their tags, the values of each
+    -- alternative, and the refusal of tags for a field that is no variant.
+    generic [R: Region, S: Region]
+    function variantsHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        var ok: Bool := tagsAre(bytes, t, "variant_int32_string", 5, 1);
+        ok := ok and (alternativeInts(bytes, t, "variant_int32_string._0", 1) and alternativeNames(bytes, t, "variant_int32_string._1", 2, 1));
+        ok := ok and tagsAre(bytes, t, "vector_variant_int64_string._0", 15, 2);
+        ok := ok and (alternativeInts(bytes, t, "vector_variant_int64_string._0._0", 2) and alternativeNames(bytes, t, "vector_variant_int64_string._0._1", 5, 5));
+        let plain: Index := handleOf(t, "vector_int32");
+        if plain >= fieldHandles(t) then
+            return false;
+        end if;
+        case fieldTags(bytes, t, plain, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                return false;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        return ok;
+    end;
+
+    -- A limit of 4 below the 5 values of the variant and the 15 items of
+    -- the vector gives a RootError for both, not a stop; the limit of the
+    -- other tests reads them.
+    generic [R: Region, S: Region]
+    function limitsHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        let small: Index := 4;
+        let variant: Index := handleOf(t, "variant_int32_string");
+        let vector: Index := handleOf(t, "vector_int32");
+        if (variant >= fieldHandles(t)) or (vector >= fieldHandles(t)) then
+            return false;
+        end if;
+        var ok: Bool := true;
+        case fieldTags(bytes, t, variant, small) of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                ok := false;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        case fieldInt64(bytes, t, vector, small) of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                ok := false;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        case fieldTags(bytes, t, variant, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    function testRecordsAndContainers(): Unit is
+        assertTrue(holds("testdata/uproot/test_nested_structs_rntuple_v1-0-0-0.root", "ntuple", 10), "records three deep with a vector in the deepest");
+        assertTrue(holds("testdata/uproot/test_stl_containers_rntuple_v1-0-0-0.root", "ntuple", 11), "strings, vectors of vectors and of strings, arrays, a pair and records");
+        assertTrue(holds("testdata/uproot/test_stl_containers_rntuple_v1-0-0-0.root", "ntuple", 13), "pages above the limit give a RootError");
+        return nil;
+    end;
+
+    -- The checks of check on the RNTuple of the file of several cluster
+    -- groups, cut down to count clusters from first on; for check 3 cut
+    -- down a second time to the clusters 2 and 3 of the first cut.
+    function narrowHolds(first: Index, count: Index, check: Int32): Bool is
+        let file: String := load("testdata/uproot/test_multiple_cluster_groups_rntuple_v1-0-0-0.root");
+        var ok: Bool := false;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readKeys(asSpan(&file), header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        var k: Index := 0;
+                        while k < bufferLength(&keys) do
+                            let key: RootKey := nth(&keys, k);
+                            if equal(className(asSpan(&file), key), "ROOT::RNTuple") then
+                                case readNtuple(asSpan(&file), key, limit) of
+                                    when Right(right as t: Ntuple) do
+                                        var cut: Ntuple := narrowClusters(t, first, count);
+                                        if check = 3 then
+                                            cut := narrowClusters(cut, 2, 2);
+                                        end if;
+                                        ok := narrowChecked(asSpan(&file), &cut, check);
+                                        destroyNtuple(cut);
+                                    when Left(left as e: RootError) do
+                                        ok := false;
+                                end case;
+                            end if;
+                            k := k + 1;
+                        end while;
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        ok := false;
+                end case;
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        destroyString(file);
+        return ok;
+    end;
+
+    -- The items of the vector field at path: entry k of the entries holds
+    -- base + k and base + k + 1, the offsets stepping by 2.
+    generic [R: Region, S: Region]
+    function pairsFrom(bytes: Span[Nat8, R], t: &[Ntuple, S], path: Span[Nat8, Static], entries: Index, base: Index): Bool is
+        let h: Index := handleOf(t, path);
+        if h >= fieldHandles(t) then
+            return false;
+        end if;
+        var ok: Bool := offsetsStep(bytes, t, path, entries, 3);
+        case fieldInt64(bytes, t, h, limit) of
+            when Right(right as v: NdArray[Int64]) do
+                ok := ok and (count(&v) = (2 * entries));
+                var k: Index := 0;
+                while ok and (k < entries) do
+                    ok := itemIs(&v, 2 * k, base + k) and itemIs(&v, (2 * k) + 1, (base + k) + 1);
+                    k := k + 1;
+                end while;
+                destroyNdArray(v);
+            when Left(left as e: RootError) do
+                ok := false;
+        end case;
+        return ok;
+    end;
+
+    -- Check 1 the clusters 4 and 5, on both sides of the second cluster
+    -- group, entries 400 to 499; check 2 the share of rank 1 of 3, the
+    -- clusters 4 to 7, entries 400 to 699; check 3 the clusters 2 to 7 cut
+    -- again to their clusters 2 and 3, entries 400 to 499 once more; check 4
+    -- a range past the end, cut to the clusters 10 and 11, entries 800 to 999.
+    generic [R: Region, S: Region]
+    function narrowChecked(bytes: Span[Nat8, R], t: &[Ntuple, S], check: Int32): Bool is
+        var clusters: Index := 2;
+        var entries: Index := 100;
+        var base: Index := 400;
+        if check = 2 then
+            clusters := 4;
+            entries := 300;
+        end if;
+        if check = 4 then
+            entries := 200;
+            base := 800;
+        end if;
+        var ok: Bool := (clusterCount(t) = clusters) and (ntupleEntries(t) = entries);
+        ok := ok and intsFrom(bytes, t, "one", entries, base);
+        ok := ok and pairsFrom(bytes, t, "int_vector", entries, base);
+        return ok;
+    end;
+
+    -- The counts of entries of the twelve clusters of the file of several
+    -- cluster groups, cut at every 100 entries and at 450 and 750.
+    generic [R: Region, S: Region]
+    function sizesHold(bytes: Span[Nat8, R], t: &[Ntuple, S]): Bool is
+        var ok: Bool := clusterCount(t) = 12;
+        var c: Index := 0;
+        while ok and (c < 12) do
+            var wanted: Index := 100;
+            if (c = 4) or ((c = 5) or ((c = 8) or (c = 9))) then
+                wanted := 50;
+            end if;
+            ok := clusterEntries(t, c) = wanted;
+            c := c + 1;
+        end while;
+        return ok;
+    end;
+
+    -- The shares of rankFirst and rankCount follow each other without a gap
+    -- and add up to all the clusters.
+    function sharesHold(clusters: Index, ranks: Index): Bool is
+        var next: Index := 0;
+        var r: Index := 0;
+        while r < ranks do
+            if rankFirst(clusters, r, ranks) /= next then
+                return false;
+            end if;
+            next := next + rankCount(clusters, r, ranks);
+            r := r + 1;
+        end while;
+        return next = clusters;
+    end;
+
+    function testClusterRanges(): Unit is
+        assertTrue(holds("testdata/uproot/test_multiple_cluster_groups_rntuple_v1-0-0-0.root", "ntuple", 12), "twelve clusters of 100 or 50 entries");
+        assertTrue(narrowHolds(4, 2, 1), "the clusters 4 and 5 alone");
+        assertTrue(narrowHolds(rankFirst(12, 1, 3), rankCount(12, 1, 3), 2), "the share of rank 1 of 3");
+        assertTrue(narrowHolds(2, 6, 3), "a cut RNTuple cut again");
+        assertTrue(narrowHolds(10, 5, 4), "a range past the end cut at the last cluster");
+        assertTrue((rankFirst(10, 3, 4) = 8) and (rankCount(10, 3, 4) = 2), "10 clusters for 4 ranks: rank 3 takes 8 and 9");
+        assertTrue(sharesHold(12, 3) and (sharesHold(10, 4) and (sharesHold(3, 5) and sharesHold(0, 2))), "the shares cover all clusters once");
+        return nil;
+    end;
+
+    function testClusters(): Unit is
+        assertTrue(holds("testdata/uproot/test_index_multicluster_rntuple_v1-0-0-0.root", "ntuple", 6), "200 entries of two items over several clusters");
+        assertTrue(holds("testdata/uproot/test_multiple_cluster_groups_rntuple_v1-0-0-0.root", "ntuple", 7), "1000 entries over several cluster groups");
+        return nil;
+    end;
+
+    function testCollections(): Unit is
+        assertTrue(holds("testdata/uproot/test_1jag_int_float_rntuple_v1-0-0-0.root", "ntuple", 4), "two vector fields, i mod 10 items each");
+        assertTrue(holds("testdata/uproot/Run2012BC_DoubleMuParked_Muons_1000evts_rntuple_v1-0-0-0.root", "Events", 5), "2372 muons of 1000 events, every charge 1 or -1");
+        return nil;
+    end;
+
+    function testIntFloat(): Unit is
+        assertTrue(holds("testdata/uproot/test_int_float_rntuple_v1-0-0-0.root", "ntuple", 1), "9, 8, 7 and 9.9 as uproot reads them");
+        return nil;
+    end;
+
+    function testStaff(): Unit is
+        assertTrue(holds("testdata/uproot/ntpl001_staff_rntuple_v1-0-0-0.root", "Staff", 2), "the first row of the staff, packed by Zstandard");
+        return nil;
+    end;
+
+    function testStrings(): Unit is
+        assertTrue(holds("testdata/uproot/rntviewer-testfile-uncomp-single-rntuple-v1-0-0-0.root", "Contributors", 3), "strings without compression");
+        return nil;
+    end;
+
+    -- The first place of needle in hay, or the length of hay.
+    generic [R: Region]
+    function findIn(hay: Span[Nat8, R], needle: Span[Nat8, Static]): Index is
+        var at: Index := 0;
+        while (at + spanLength(needle)) <= spanLength(hay) do
+            let same: Bool := equal(spanPart(hay, at, spanLength(needle)), needle);
+            if same then
+                return at;
+            end if;
+            at := at + 1;
+        end while;
+        return spanLength(hay);
+    end;
+
+    -- The bytes of hay with the lowest bit of the byte at at turned.
+    generic [R: Region]
+    function copyTurned(hay: Span[Nat8, R], at: Index): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        var i: Index := 0;
+        while i < spanLength(hay) do
+            var b: Nat8 := hay[i];
+            if i = at then
+                b := bitwiseXor(b, 1);
+            end if;
+            insertBack(&!out, b);
+            i := i + 1;
+        end while;
+        return out;
+    end;
+
+    -- 10 for a refusal for a checksum, 0 when the ntuple and the strings of
+    -- its first field are read, 1 for every other outcome.
+    function codeOf(e: RootError): Int32 is
+        let fault: RootFault := e.fault;
+        case fault of
+            when BadChecksum do
+                return 10;
+            when NotRoot do
+                return 1;
+            when Truncated do
+                return 1;
+            when BadOffset do
+                return 1;
+            when BadString do
+                return 1;
+            when BadCompression do
+                return 1;
+            when UnknownCompression do
+                return 1;
+            when TooLarge do
+                return 1;
+            when BadObject do
+                return 1;
+            when UnknownVersion do
+                return 1;
+        end case;
+    end;
+
+    generic [R: Region]
+    function readOutcome(bytes: Span[Nat8, R], key: RootKey): Int32 is
+        case readNtuple(bytes, key, limit) of
+            when Right(right as t: Ntuple) do
+                var outcome: Int32 := 0;
+                case fieldStrings(bytes, &t, 0, limit) of
+                    when Right(right as v: Buffer[String]) do
+                        dropStrings(v);
+                    when Left(left as e: RootError) do
+                        outcome := codeOf(e);
+                end case;
+                destroyNtuple(t);
+                return outcome;
+            when Left(left as e: RootError) do
+                return codeOf(e);
+        end case;
+    end;
+
+    -- The outcome of reading the RNTuple Contributors from the file of
+    -- strings with the first needle in it turned, or untouched when needle
+    -- is empty.
+    function outcomeTurned(needle: Span[Nat8, Static]): Int32 is
+        let original: String := load("testdata/uproot/rntviewer-testfile-uncomp-single-rntuple-v1-0-0-0.root");
+        var at: Index := 0;
+        if spanLength(needle) > 0 then
+            at := findIn(asSpan(&original), needle) + 1;
+        else
+            at := spanLength(asSpan(&original));
+        end if;
+        let copy: Buffer[Nat8] := copyTurned(asSpan(&original), at);
+        destroyString(original);
+        let file: String := fromByteBuffer(copy);
+        var outcome: Int32 := 1;
+        case readHeader(asSpan(&file)) of
+            when Right(right as header: RootHeader) do
+                case readKeys(asSpan(&file), header) of
+                    when Right(right as keys: Buffer[RootKey]) do
+                        var k: Index := 0;
+                        while k < bufferLength(&keys) do
+                            let key: RootKey := nth(&keys, k);
+                            if equal(className(asSpan(&file), key), "ROOT::RNTuple") and equal(keyName(asSpan(&file), key), "Contributors") then
+                                outcome := readOutcome(asSpan(&file), key);
+                            end if;
+                            k := k + 1;
+                        end while;
+                        destroyFree(keys);
+                    when Left(left as e: RootError) do
+                        skip;
+                end case;
+            when Left(left as e: RootError) do
+                skip;
+        end case;
+        destroyString(file);
+        return outcome;
+    end;
+
+    function testChecksums(): Unit is
+        assertTrue(outcomeTurned("") = 0, "the untouched copy is read");
+        assertTrue(outcomeTurned("Jakob") = 10, "a turned byte in a page of strings is refused for its checksum");
+        assertTrue(outcomeTurned("std::string") = 10, "a turned byte in the header is refused for its checksum");
+        return nil;
+    end;
+
+    -- An index at fieldHandles is refused by the requires of each reader of
+    -- a field, before the body looks at the field; the last number is taken.
+    function testAFieldPastTheLastIsRefused(): Unit is
+        let path: Span[Nat8, Static] := "testdata/uproot/test_int_float_rntuple_v1-0-0-0.root";
+        if asChild("int64") then
+            let ran: Bool := holds(path, "ntuple", 20);
+            return nil;
+        end if;
+        if asChild("float64") then
+            let ran: Bool := holds(path, "ntuple", 21);
+            return nil;
+        end if;
+        if asChild("float32") then
+            let ran: Bool := holds(path, "ntuple", 22);
+            return nil;
+        end if;
+        if asChild("strings") then
+            let ran: Bool := holds(path, "ntuple", 23);
+            return nil;
+        end if;
+        if asChild("offsets") then
+            let ran: Bool := holds(path, "ntuple", 24);
+            return nil;
+        end if;
+        if asChild("tags") then
+            let ran: Bool := holds(path, "ntuple", 26);
+            return nil;
+        end if;
+        if asChild("inside") then
+            let ran: Bool := holds(path, "ntuple", 25);
+            return nil;
+        end if;
+        assertTrue(holds(path, "ntuple", 25), "the RNTuple of two fields is read and its last number taken");
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testAFieldPastTheLastIsRefused", "int64", "contract violated: the requires"), "fieldInt64 at fieldHandles is refused");
+        assertTrue(refusedInChild("testAFieldPastTheLastIsRefused", "float64", "contract violated: the requires"), "fieldFloat64 at fieldHandles is refused");
+        assertTrue(refusedInChild("testAFieldPastTheLastIsRefused", "float32", "contract violated: the requires"), "fieldFloat32 at fieldHandles is refused");
+        assertTrue(refusedInChild("testAFieldPastTheLastIsRefused", "strings", "contract violated: the requires"), "fieldStrings at fieldHandles is refused");
+        assertTrue(refusedInChild("testAFieldPastTheLastIsRefused", "offsets", "contract violated: the requires"), "fieldOffsets at fieldHandles is refused");
+        assertTrue(refusedInChild("testAFieldPastTheLastIsRefused", "tags", "contract violated: the requires"), "fieldTags at fieldHandles is refused");
+        assertTrue(not refusedInChild("testAFieldPastTheLastIsRefused", "inside", "contract violated"), "the last number breaks no contract");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,450 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Standard.Png (PngError, Image, decodePng, imageWidth, imagePixels, destroyImage);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray);
+import Mirco.Yompi (
+    Figure,
+    figure,
+    destroyFigure,
+    seriesCount,
+    setTitle,
+    setXLabel,
+    setYLabel,
+    addLine,
+    addScatter,
+    addHistogram,
+    setHeatmap,
+    renderSvg,
+    renderPng
+);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Yompi.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- True when needle occurs in hay.
+    generic [R: Region]
+    function contains(hay: Span[Nat8, R], needle: Span[Nat8, Static]): Bool is
+        if spanLength(needle) > spanLength(hay) then
+            return false;
+        end if;
+        var at: Index := 0;
+        while at <= (spanLength(hay) - spanLength(needle)) do
+            if equal(spanPart(hay, at, spanLength(needle)), needle) then
+                return true;
+            end if;
+            at := at + 1;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function byteAt(image: &[Image, R], at: Index): Nat8 is
+        let pixels: Span[Nat8, R] := imagePixels(image);
+        return pixels[at];
+    end;
+
+    function vector(a: Float64, b: Float64, c: Float64): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, a);
+        insertBack(&!values, b);
+        insertBack(&!values, c);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- A line from 0 to 4 in x and from 0 to 0.5 in y, in the blue 1f77b4.
+    function lineFigure(): Figure is
+        var f: Figure := figure(640, 480);
+        let x: NdArray[Float64] := vector(0.0, 2.0, 4.0);
+        let y: NdArray[Float64] := vector(0.0, 0.5, 0.25);
+        addLine(&!f, &x, &y, 2062260);
+        setTitle(&!f, "a & b");
+        setXLabel(&!f, "time");
+        setYLabel(&!f, "level");
+        destroyNdArray(x);
+        destroyNdArray(y);
+        return f;
+    end;
+
+    function testSvgOfALine(): Unit is
+        let f: Figure := lineFigure();
+        assertTrue(seriesCount(&f) = 1, "one series");
+        let svg: String := renderSvg(&f);
+        assertTrue(contains(asSpan(&svg), "<svg xmlns='http://www.w3.org/2000/svg' width='640' height='480'"), "the root element");
+        assertTrue(contains(asSpan(&svg), "<polyline fill='none' stroke-width='1.5' stroke='#1f77b4'"), "the line in its colour");
+        assertTrue(contains(asSpan(&svg), ">a &amp; b</text>"), "the title, escaped");
+        assertTrue(contains(asSpan(&svg), ">4</text>") and contains(asSpan(&svg), ">0.3</text>"), "ticks of x by 1 and of y by 0.1");
+        assertTrue(not contains(asSpan(&svg), "0.30000000000000004"), "no tick with the error of the float");
+        assertTrue(contains(asSpan(&svg), "rotate(-90)") and contains(asSpan(&svg), ">level</text>"), "the label of y");
+        let again: String := renderSvg(&f);
+        assertTrue(equal(asSpan(&svg), asSpan(&again)), "the same figure gives the same bytes");
+        destroyString(again);
+        destroyString(svg);
+        destroyFigure(f);
+        return nil;
+    end;
+
+    function testHistogramAndHeatmap(): Unit is
+        var f: Figure := figure(300, 200);
+        let values: NdArray[Float64] := vector(1.0, 2.0, 2.5);
+        addHistogram(&!f, &values, 3, 16744206);
+        assertTrue(seriesCount(&f) = 1, "the histogram is one series");
+        let svg: String := renderSvg(&f);
+        assertTrue(contains(asSpan(&svg), "fill='#ff7f0e'"), "bars in their colour");
+        destroyString(svg);
+        destroyFigure(f);
+        var h: Figure := figure(300, 200);
+        var cells: Buffer[Float64] := allocateEmpty();
+        insertBack(&!cells, 0.0);
+        insertBack(&!cells, 1.0);
+        insertBack(&!cells, 2.0);
+        insertBack(&!cells, 3.0);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 2);
+        let m: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&cells));
+        setHeatmap(&!h, &m);
+        assertTrue(seriesCount(&h) = 1, "the heatmap counts as one");
+        let hs: String := renderSvg(&h);
+        assertTrue(contains(asSpan(&hs), "fill='#440154'") and contains(asSpan(&hs), "fill='#fde725'"), "dark blue and yellow at the ends");
+        destroyString(hs);
+        destroyFigure(h);
+        destroyNdArray(m);
+        destroyNdArray(values);
+        destroyFree(cells);
+        destroyFree(shape);
+        return nil;
+    end;
+
+    -- One point in the middle of a figure of 200 by 150: the plot spans
+    -- 70 to 180 and 40 to 95, so the point is drawn around 125, 68.
+    function testPng(): Unit is
+        var f: Figure := figure(200, 150);
+        let x: NdArray[Float64] := vector(1.0, 1.0, 1.0);
+        let y: NdArray[Float64] := vector(5.0, 5.0, 5.0);
+        addScatter(&!f, &x, &y, 14423100);
+        let png: String := renderPng(&f);
+        assertTrue(contains(asSpan(&png), "PNG"), "the signature of PNG");
+        case decodePng(asSpan(&png), 100000) of
+            when Right(right as image: Image) do
+                assertTrue(imageWidth(&image) = 200, "200 wide");
+                let at: Index := 3 * ((68 * 200) + 125);
+                assertTrue((byteAt(&image, at) = 220) and (byteAt(&image, at + 1) = 20) and (byteAt(&image, at + 2) = 60), "the point in crimson");
+                assertTrue((byteAt(&image, 0) = 255) and (byteAt(&image, 1) = 255) and (byteAt(&image, 2) = 255), "white at the corner");
+                let axis: Index := 3 * ((95 * 200) + 120);
+                assertTrue((byteAt(&image, axis) = 0) and (byteAt(&image, axis + 1) = 0), "the axis of x in black");
+                destroyImage(image);
+            when Left(left as e: PngError) do
+                assertTrue(false, "the image is read back");
+        end case;
+        let again: String := renderPng(&f);
+        assertTrue(equal(asSpan(&png), asSpan(&again)), "the same image gives the same bytes");
+        destroyString(again);
+        destroyString(png);
+        destroyFigure(f);
+        destroyNdArray(x);
+        destroyNdArray(y);
+        return nil;
+    end;
+    -- The black pixels of the rows top to bottom of the image.
+    generic [R: Region]
+    function blackIn(image: &[Image, R], width: Index, top: Index, bottom: Index): Index is
+        var n: Index := 0;
+        var y: Index := top;
+        while y <= bottom do
+            var x: Index := 0;
+            while x < width do
+                if byteAt(image, 3 * ((y * width) + x)) = 0 then
+                    n := n + 1;
+                end if;
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return n;
+    end;
+
+    -- The title, drawn in the pixel font two pixels to the pixel, blackens
+    -- the rows 8 to 21; without it they stay white.  The numbers of the
+    -- ticks blacken the rows below the axis of x.
+    function testPngText(): Unit is
+        var f: Figure := figure(200, 150);
+        let x: NdArray[Float64] := vector(1.0, 2.0, 3.0);
+        let y: NdArray[Float64] := vector(5.0, 6.0, 7.0);
+        addLine(&!f, &x, &y, 0);
+        let plain: String := renderPng(&f);
+        setTitle(&!f, "Mirco");
+        setYLabel(&!f, "y");
+        let titled: String := renderPng(&f);
+        case decodePng(asSpan(&plain), 100000) of
+            when Right(right as image: Image) do
+                assertTrue(blackIn(&image, 200, 8, 21) = 0, "no title, no black above the plot");
+                assertTrue(blackIn(&image, 200, 104, 112) > 0, "the numbers of the ticks of x");
+                destroyImage(image);
+            when Left(left as e: PngError) do
+                assertTrue(false, "the plain image is read back");
+        end case;
+        case decodePng(asSpan(&titled), 100000) of
+            when Right(right as image: Image) do
+                assertTrue(blackIn(&image, 200, 8, 21) > 40, "the title in black");
+                destroyImage(image);
+            when Left(left as e: PngError) do
+                assertTrue(false, "the titled image is read back");
+        end case;
+        destroyString(plain);
+        destroyString(titled);
+        destroyFigure(f);
+        destroyNdArray(x);
+        destroyNdArray(y);
+        return nil;
+    end;
+
+    -- A vector of n values 0, 1, 2 and so on.
+    function ramp(n: Index): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        var v: Float64 := 0.0;
+        var i: Index := 0;
+        while i < n do
+            insertBack(&!values, v);
+            v := v + 1.0;
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- A matrix of 2 by 3 values.
+    function grid(): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.0);
+        insertBack(&!values, 2.0);
+        insertBack(&!values, 3.0);
+        insertBack(&!values, 4.0);
+        insertBack(&!values, 5.0);
+        insertBack(&!values, 6.0);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 3);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    function figureOf(width: Index, height: Index): Unit is
+        let f: Figure := figure(width, height);
+        destroyFigure(f);
+        return nil;
+    end;
+
+    -- A line, or a scatter when line is false, of 3 values in x and n in y.
+    function pointsOf(line: Bool, n: Index, color: Nat32): Unit is
+        var f: Figure := figure(640, 480);
+        let x: NdArray[Float64] := ramp(3);
+        let y: NdArray[Float64] := ramp(n);
+        if line then
+            addLine(&!f, &x, &y, color);
+        else
+            addScatter(&!f, &x, &y, color);
+        end if;
+        assertTrue(seriesCount(&f) = 1, "one series added");
+        destroyNdArray(x);
+        destroyNdArray(y);
+        destroyFigure(f);
+        return nil;
+    end;
+
+    function histogramOf(bins: Index, color: Nat32): Unit is
+        var f: Figure := figure(640, 480);
+        let values: NdArray[Float64] := ramp(5);
+        addHistogram(&!f, &values, bins, color);
+        assertTrue(seriesCount(&f) = 1, "one histogram added");
+        destroyNdArray(values);
+        destroyFigure(f);
+        return nil;
+    end;
+
+    -- A heatmap of the 2 by 3 grid, or of a vector when matrix is false.
+    function heatmapOf(matrix: Bool): Unit is
+        var f: Figure := figure(640, 480);
+        if matrix then
+            let m: NdArray[Float64] := grid();
+            setHeatmap(&!f, &m);
+            destroyNdArray(m);
+        else
+            let v: NdArray[Float64] := ramp(3);
+            setHeatmap(&!f, &v);
+            destroyNdArray(v);
+        end if;
+        assertTrue(seriesCount(&f) = 1, "a heatmap counts as one series");
+        destroyFigure(f);
+        return nil;
+    end;
+
+    -- A figure of 99 or 10001 pixels either way, a line and a scatter of 3
+    -- values in x and 2 in y or in the colour 16777216, a histogram of 0 or
+    -- 10001 bins or in the colour 16777216 and a heatmap of a vector are
+    -- refused by the requires.  The fitting calls at the bounds are taken.
+    function testRefusals(): Unit is
+        if asChild("figureNarrow") then
+            figureOf(99, 480);
+            return nil;
+        end if;
+        if asChild("figureWide") then
+            figureOf(10001, 480);
+            return nil;
+        end if;
+        if asChild("figureLow") then
+            figureOf(640, 99);
+            return nil;
+        end if;
+        if asChild("figureHigh") then
+            figureOf(640, 10001);
+            return nil;
+        end if;
+        if asChild("lineOtherCount") then
+            pointsOf(true, 2, 0);
+            return nil;
+        end if;
+        if asChild("lineColor") then
+            pointsOf(true, 3, 16777216);
+            return nil;
+        end if;
+        if asChild("scatterOtherCount") then
+            pointsOf(false, 2, 0);
+            return nil;
+        end if;
+        if asChild("scatterColor") then
+            pointsOf(false, 3, 16777216);
+            return nil;
+        end if;
+        if asChild("histogramNoBins") then
+            histogramOf(0, 0);
+            return nil;
+        end if;
+        if asChild("histogramTooManyBins") then
+            histogramOf(10001, 0);
+            return nil;
+        end if;
+        if asChild("histogramColor") then
+            histogramOf(4, 16777216);
+            return nil;
+        end if;
+        if asChild("heatmapVector") then
+            heatmapOf(false);
+            return nil;
+        end if;
+        if asChild("fits") then
+            figureOf(100, 100);
+            figureOf(10000, 10000);
+            pointsOf(true, 3, 16777215);
+            pointsOf(false, 3, 16777215);
+            histogramOf(1, 16777215);
+            histogramOf(10000, 0);
+            heatmapOf(true);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRefusals", "figureNarrow", "contract violated: the requires"), "a figure 99 pixels wide is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "figureWide", "contract violated: the requires"), "a figure 10001 pixels wide is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "figureLow", "contract violated: the requires"), "a figure 99 pixels high is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "figureHigh", "contract violated: the requires"), "a figure 10001 pixels high is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "lineOtherCount", "contract violated: the requires"), "a line of 3 x and 2 y is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "lineColor", "contract violated: the requires"), "a line in the colour 16777216 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "scatterOtherCount", "contract violated: the requires"), "a scatter of 3 x and 2 y is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "scatterColor", "contract violated: the requires"), "a scatter in the colour 16777216 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramNoBins", "contract violated: the requires"), "a histogram of 0 bins is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramTooManyBins", "contract violated: the requires"), "a histogram of 10001 bins is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "histogramColor", "contract violated: the requires"), "a histogram in the colour 16777216 is refused by the requires");
+        assertTrue(refusedInChild("testRefusals", "heatmapVector", "contract violated: the requires"), "a heatmap of a vector is refused by the requires");
+        assertTrue(not refusedInChild("testRefusals", "fits", "contract violated"), "fitting calls break no contract");
+        assertTrue(not refusedInChild("testRefusals", "fits", "Mirco"), "fitting calls are taken");
+        return nil;
+    end;
+end module body.

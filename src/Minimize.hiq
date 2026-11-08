@@ -1,0 +1,423 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, nth, storeNth, nthMut, getSpan, wholeSpan, length as bufferLength);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, count, flatGet, fromSpan, destroyNdArray);
+import Mirco.Math (absolute, squareRoot);
+
+module body Mirco.Minimize is
+    -- The coefficients of reflection, expansion, contraction and shrinking,
+    -- and the steps of the first simplex, as scipy takes them.
+    constant reflect: Float64 := 1.0;
+    constant expand: Float64 := 2.0;
+    constant contract: Float64 := 0.5;
+    constant shrink: Float64 := 0.5;
+    constant non_zero_step: Float64 := 0.05;
+    constant zero_step: Float64 := 0.00025;
+
+    -- The value of objective at the n numbers of points from at.
+    generic [T: Free(Objective), R: Region]
+    function valueOf(objective: T, points: &[Buffer[Float64], R], at: Index, n: Index): Float64 is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let x: NdArray[Float64] := fromSpan(wholeSpan(&shape), getSpan(points, at, (at + n) - 1));
+        destroyFree(shape);
+        let v: Float64 := valueAt(objective, &x);
+        destroyNdArray(x);
+        return v;
+    end;
+
+    generic [R: Region]
+    function vectorOf(points: &[Buffer[Float64], R], at: Index, n: Index): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let x: NdArray[Float64] := fromSpan(wholeSpan(&shape), getSpan(points, at, (at + n) - 1));
+        destroyFree(shape);
+        return x;
+    end;
+
+    -- Sorts the vertices of the simplex by their values, the smallest
+    -- first; equal values keep their order, as a stable sort does.
+    generic [R: Region, S: Region]
+    function sortSimplex(simplex: &![Buffer[Float64], R], values: &![Buffer[Float64], S], n: Index): Unit is
+        var i: Index := 1;
+        while i <= n do
+            var j: Index := i;
+            var moving: Bool := true;
+            while moving and (j > 0) do
+                let here: Float64 := nthMut(&~values, j);
+                let before: Float64 := nthMut(&~values, j - 1);
+                if here < before then
+                    storeNth(&~values, j, before);
+                    storeNth(&~values, j - 1, here);
+                    var k: Index := 0;
+                    while k < n do
+                        let p: Float64 := nthMut(&~simplex, (j * n) + k);
+                        let q: Float64 := nthMut(&~simplex, ((j - 1) * n) + k);
+                        storeNth(&~simplex, (j * n) + k, q);
+                        storeNth(&~simplex, ((j - 1) * n) + k, p);
+                        k := k + 1;
+                    end while;
+                    j := j - 1;
+                else
+                    moving := false;
+                end if;
+            end while;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [T: Free(Objective), R: Region]
+    function nelderMead(objective: T, start: &[NdArray[Float64], R], tolerance: Float64): NdArray[Float64] is
+        let n: Index := count(start);
+        var simplex: Buffer[Float64] := allocateEmpty();
+        var vertex: Index := 0;
+        while vertex <= n do
+            var k: Index := 0;
+            while k < n do
+                var v: Float64 := flatGet(start, k);
+                if (vertex > 0) and (k = (vertex - 1)) then
+                    if v /= 0.0 then
+                        v := (1.0 + non_zero_step) * v;
+                    else
+                        v := zero_step;
+                    end if;
+                end if;
+                insertBack(&!simplex, v);
+                k := k + 1;
+            end while;
+            vertex := vertex + 1;
+        end while;
+        var values: Buffer[Float64] := allocateEmpty();
+        vertex := 0;
+        while vertex <= n do
+            insertBack(&!values, valueOf(objective, &simplex, vertex * n, n));
+            vertex := vertex + 1;
+        end while;
+        sortSimplex(&!simplex, &!values, n);
+        let most: Index := 200 * n;
+        var calls: Index := n + 1;
+        var steps: Index := 1;
+        var trial: Buffer[Float64] := initialize(n, 0.0);
+        var other: Buffer[Float64] := initialize(n, 0.0);
+        var centre: Buffer[Float64] := initialize(n, 0.0);
+        while (calls < most) and (steps < most) do
+            if converged(&simplex, &values, n, tolerance) then
+                steps := most;
+            else
+                -- The centre of all vertices but the worst.
+                var k: Index := 0;
+                while k < n do
+                    var s: Float64 := 0.0;
+                    vertex := 0;
+                    while vertex < n do
+                        s := s + nth(&simplex, (vertex * n) + k);
+                        vertex := vertex + 1;
+                    end while;
+                    storeNth(&!centre, k, s / wide(n));
+                    k := k + 1;
+                end while;
+                let worst: Index := n * n;
+                combine(&centre, &simplex, worst, 1.0 + reflect, reflect, n, &!trial);
+                let fr: Float64 := valueOf(objective, &trial, 0, n);
+                calls := calls + 1;
+                var replaced: Bool := false;
+                var shrinking: Bool := false;
+                if fr < nth(&values, 0) then
+                    combine(&centre, &simplex, worst, 1.0 + (reflect * expand), reflect * expand, n, &!other);
+                    let fe: Float64 := valueOf(objective, &other, 0, n);
+                    calls := calls + 1;
+                    if fe < fr then
+                        place(&!simplex, &!values, n, &other, fe);
+                    else
+                        place(&!simplex, &!values, n, &trial, fr);
+                    end if;
+                    replaced := true;
+                end if;
+                if (not replaced) and (fr < nth(&values, n - 1)) then
+                    place(&!simplex, &!values, n, &trial, fr);
+                    replaced := true;
+                end if;
+                if (not replaced) and (fr < nth(&values, n)) then
+                    combine(&centre, &simplex, worst, 1.0 + (contract * reflect), contract * reflect, n, &!other);
+                    let fc: Float64 := valueOf(objective, &other, 0, n);
+                    calls := calls + 1;
+                    if fc <= fr then
+                        place(&!simplex, &!values, n, &other, fc);
+                    else
+                        shrinking := true;
+                    end if;
+                    replaced := true;
+                end if;
+                if not replaced then
+                    combine(&centre, &simplex, worst, 1.0 - contract, -contract, n, &!other);
+                    let fcc: Float64 := valueOf(objective, &other, 0, n);
+                    calls := calls + 1;
+                    if fcc < nth(&values, n) then
+                        place(&!simplex, &!values, n, &other, fcc);
+                    else
+                        shrinking := true;
+                    end if;
+                end if;
+                if shrinking then
+                    vertex := 1;
+                    while vertex <= n do
+                        var j: Index := 0;
+                        while j < n do
+                            let best: Float64 := nth(&simplex, j);
+                            let old: Float64 := nth(&simplex, (vertex * n) + j);
+                            storeNth(&!simplex, (vertex * n) + j, best + (shrink * (old - best)));
+                            j := j + 1;
+                        end while;
+                        storeNth(&!values, vertex, valueOf(objective, &simplex, vertex * n, n));
+                        calls := calls + 1;
+                        vertex := vertex + 1;
+                    end while;
+                end if;
+                sortSimplex(&!simplex, &!values, n);
+                steps := steps + 1;
+            end if;
+        end while;
+        let found: NdArray[Float64] := vectorOf(&simplex, 0, n);
+        destroyFree(simplex);
+        destroyFree(values);
+        destroyFree(trial);
+        destroyFree(other);
+        destroyFree(centre);
+        return found;
+    end;
+
+    function wide(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as f: Float64) do
+                return f;
+            when None do
+                return 1.0;
+        end case;
+    end;
+
+    -- out = a centre - b the worst vertex: the points of reflection,
+    -- expansion and contraction.
+    generic [R: Region, S: Region, Q: Region]
+    function combine(centre: &[Buffer[Float64], R], simplex: &[Buffer[Float64], S], worst: Index, a: Float64, b: Float64, n: Index, out: &![Buffer[Float64], Q]): Unit is
+        var k: Index := 0;
+        while k < n do
+            storeNth(&~out, k, (a * nth(centre, k)) - (b * nth(simplex, worst + k)));
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The worst vertex replaced by point with its value.
+    generic [R: Region, S: Region, Q: Region]
+    function place(simplex: &![Buffer[Float64], R], values: &![Buffer[Float64], S], n: Index, point: &[Buffer[Float64], Q], value: Float64): Unit is
+        var k: Index := 0;
+        while k < n do
+            storeNth(&~simplex, (n * n) + k, nth(point, k));
+            k := k + 1;
+        end while;
+        storeNth(&~values, n, value);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function converged(simplex: &[Buffer[Float64], R], values: &[Buffer[Float64], S], n: Index, tolerance: Float64): Bool is
+        var vertex: Index := 1;
+        while vertex <= n do
+            if absolute(nth(values, vertex) - nth(values, 0)) > tolerance then
+                return false;
+            end if;
+            var k: Index := 0;
+            while k < n do
+                if absolute(nth(simplex, (vertex * n) + k) - nth(simplex, k)) > tolerance then
+                    return false;
+                end if;
+                k := k + 1;
+            end while;
+            vertex := vertex + 1;
+        end while;
+        return true;
+    end;
+
+    -- The gradient at x by central differences with the step cbrt of the
+    -- machine epsilon times one more than the size of the coordinate.
+    generic [T: Free(Objective), R: Region, S: Region]
+    function gradient(objective: T, x: &[Buffer[Float64], R], n: Index, out: &![Buffer[Float64], S]): Unit is
+        var probe: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!probe, nth(x, k));
+            k := k + 1;
+        end while;
+        k := 0;
+        while k < n do
+            let base: Float64 := nth(x, k);
+            let h: Float64 := 0.000006055454452393343 * (1.0 + absolute(base));
+            storeNth(&!probe, k, base + h);
+            let up: Float64 := valueOf(objective, &probe, 0, n);
+            storeNth(&!probe, k, base - h);
+            let down: Float64 := valueOf(objective, &probe, 0, n);
+            storeNth(&!probe, k, base);
+            storeNth(&~out, k, (up - down) / (2.0 * h));
+            k := k + 1;
+        end while;
+        destroyFree(probe);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function largest(v: &[Buffer[Float64], R]): Float64 is
+        var m: Float64 := 0.0;
+        var k: Index := 0;
+        while k < bufferLength(v) do
+            if absolute(nth(v, k)) > m then
+                m := absolute(nth(v, k));
+            end if;
+            k := k + 1;
+        end while;
+        return m;
+    end;
+
+    generic [T: Free(Objective), R: Region]
+    function bfgs(objective: T, start: &[NdArray[Float64], R], tolerance: Float64): NdArray[Float64] is
+        let n: Index := count(start);
+        var x: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!x, flatGet(start, k));
+            k := k + 1;
+        end while;
+        -- The inverse of the Hessian, row-major, starting as the identity.
+        var h: Buffer[Float64] := initialize(n * n, 0.0);
+        k := 0;
+        while k < n do
+            storeNth(&!h, (k * n) + k, 1.0);
+            k := k + 1;
+        end while;
+        var g: Buffer[Float64] := initialize(n, 0.0);
+        var g_new: Buffer[Float64] := initialize(n, 0.0);
+        var p: Buffer[Float64] := initialize(n, 0.0);
+        var x_new: Buffer[Float64] := initialize(n, 0.0);
+        var s: Buffer[Float64] := initialize(n, 0.0);
+        var y: Buffer[Float64] := initialize(n, 0.0);
+        var hy: Buffer[Float64] := initialize(n, 0.0);
+        gradient(objective, &x, n, &!g);
+        var fx: Float64 := valueOf(objective, &x, 0, n);
+        var step: Index := 0;
+        while (step < (200 * n)) and (largest(&g) > tolerance) do
+            var i: Index := 0;
+            var slope: Float64 := 0.0;
+            while i < n do
+                var d: Float64 := 0.0;
+                var j: Index := 0;
+                while j < n do
+                    d := d - (nth(&h, (i * n) + j) * nth(&g, j));
+                    j := j + 1;
+                end while;
+                storeNth(&!p, i, d);
+                slope := slope + (d * nth(&g, i));
+                i := i + 1;
+            end while;
+            if slope >= 0.0 then
+                -- Not a direction of descent: start again from the gradient.
+                i := 0;
+                while i < (n * n) do
+                    if rem(i, n + 1) = 0 then
+                        storeNth(&!h, i, 1.0);
+                    else
+                        storeNth(&!h, i, 0.0);
+                    end if;
+                    i := i + 1;
+                end while;
+                i := 0;
+                slope := 0.0;
+                while i < n do
+                    storeNth(&!p, i, -nth(&g, i));
+                    slope := slope - (nth(&g, i) * nth(&g, i));
+                    i := i + 1;
+                end while;
+            end if;
+            var alpha: Float64 := 1.0;
+            var f_new: Float64 := fx;
+            var searching: Bool := true;
+            while searching do
+                i := 0;
+                while i < n do
+                    storeNth(&!x_new, i, nth(&x, i) + (alpha * nth(&p, i)));
+                    i := i + 1;
+                end while;
+                f_new := valueOf(objective, &x_new, 0, n);
+                if (f_new <= (fx + ((0.0001 * alpha) * slope))) or (alpha < 0.000000000001) then
+                    searching := false;
+                else
+                    alpha := alpha * 0.5;
+                end if;
+            end while;
+            gradient(objective, &x_new, n, &!g_new);
+            var ys: Float64 := 0.0;
+            i := 0;
+            while i < n do
+                storeNth(&!s, i, nth(&x_new, i) - nth(&x, i));
+                storeNth(&!y, i, nth(&g_new, i) - nth(&g, i));
+                ys := ys + (nth(&y, i) * nth(&s, i));
+                i := i + 1;
+            end while;
+            if ys > 0.000000000001 then
+                -- H = (I - rho s y') H (I - rho y s') + rho s s', written out
+                -- with hy = H y and yhy = y' H y.
+                let rho: Float64 := 1.0 / ys;
+                var yhy: Float64 := 0.0;
+                i := 0;
+                while i < n do
+                    var d: Float64 := 0.0;
+                    var j: Index := 0;
+                    while j < n do
+                        d := d + (nth(&h, (i * n) + j) * nth(&y, j));
+                        j := j + 1;
+                    end while;
+                    storeNth(&!hy, i, d);
+                    yhy := yhy + (nth(&y, i) * d);
+                    i := i + 1;
+                end while;
+                i := 0;
+                while i < n do
+                    var j: Index := 0;
+                    while j < n do
+                        let si: Float64 := nth(&s, i);
+                        let sj: Float64 := nth(&s, j);
+                        let change: Float64 := ((((1.0 + (rho * yhy)) * rho) * (si * sj)) - (rho * ((nth(&hy, i) * sj) + (si * nth(&hy, j)))));
+                        let before: Float64 := nth(&h, (i * n) + j);
+                        storeNth(&!h, (i * n) + j, before + change);
+                        j := j + 1;
+                    end while;
+                    i := i + 1;
+                end while;
+            end if;
+            i := 0;
+            while i < n do
+                storeNth(&!x, i, nth(&x_new, i));
+                storeNth(&!g, i, nth(&g_new, i));
+                i := i + 1;
+            end while;
+            fx := f_new;
+            step := step + 1;
+        end while;
+        let found: NdArray[Float64] := vectorOf(&x, 0, n);
+        destroyFree(x);
+        destroyFree(h);
+        destroyFree(g);
+        destroyFree(g_new);
+        destroyFree(p);
+        destroyFree(x_new);
+        destroyFree(s);
+        destroyFree(y);
+        destroyFree(hy);
+        return found;
+    end;
+end module body.

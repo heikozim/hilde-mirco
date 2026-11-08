@@ -1,0 +1,204 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+module body Mirco.Numeric is
+    instance Numeric(Float64) is
+        method plus(a: Float64, b: Float64): Float64 is
+            return a + b;
+        end;
+
+        method minus(a: Float64, b: Float64): Float64 is
+            return a - b;
+        end;
+
+        method times(a: Float64, b: Float64): Float64 is
+            return a * b;
+        end;
+
+        method dividedBy(a: Float64, b: Float64): Float64 is
+            return a / b;
+        end;
+
+        method less(a: Float64, b: Float64): Bool is
+            return a < b;
+        end;
+
+        method isNaN(a: Float64): Bool is
+            return a /= a;
+        end;
+
+        method oneOf(): Float64 is
+            return 1.0;
+        end;
+
+        method fromCount(count: Index): Float64 is
+            case toFloat64(count) of
+                when Some(value as wide: Float64) do
+                    return wide;
+                when None do
+                    abort("Mirco.Numeric: a count that is no Float64");
+            end case;
+        end;
+    end;
+
+    instance Numeric(Float32) is
+        method plus(a: Float32, b: Float32): Float32 is
+            return a + b;
+        end;
+
+        method minus(a: Float32, b: Float32): Float32 is
+            return a - b;
+        end;
+
+        method times(a: Float32, b: Float32): Float32 is
+            return a * b;
+        end;
+
+        method dividedBy(a: Float32, b: Float32): Float32 is
+            return a / b;
+        end;
+
+        method less(a: Float32, b: Float32): Bool is
+            return a < b;
+        end;
+
+        method isNaN(a: Float32): Bool is
+            return a /= a;
+        end;
+
+        method oneOf(): Float32 is
+            return 1.0;
+        end;
+
+        method fromCount(count: Index): Float32 is
+            case toFloat32(count) of
+                when Some(value as wide: Float32) do
+                    return wide;
+                when None do
+                    abort("Mirco.Numeric: a count that is no Float32");
+            end case;
+        end;
+    end;
+
+    instance Numeric(Int64) is
+        method plus(a: Int64, b: Int64): Int64 is
+            return a + b;
+        end;
+
+        method minus(a: Int64, b: Int64): Int64 is
+            return a - b;
+        end;
+
+        method times(a: Int64, b: Int64): Int64 is
+            return a * b;
+        end;
+
+        method dividedBy(a: Int64, b: Int64): Int64 is
+            return a / b;
+        end;
+
+        method less(a: Int64, b: Int64): Bool is
+            return a < b;
+        end;
+
+        method isNaN(a: Int64): Bool is
+            return false;
+        end;
+
+        method oneOf(): Int64 is
+            return 1;
+        end;
+
+        method fromCount(count: Index): Int64 is
+            case toInt64(count) of
+                when Some(value as wide: Int64) do
+                    return wide;
+                when None do
+                    abort("Mirco.Numeric: a count above the range of Int64");
+            end case;
+        end;
+    end;
+
+    instance Numeric(Int32) is
+        method plus(a: Int32, b: Int32): Int32 is
+            return a + b;
+        end;
+
+        method minus(a: Int32, b: Int32): Int32 is
+            return a - b;
+        end;
+
+        method times(a: Int32, b: Int32): Int32 is
+            return a * b;
+        end;
+
+        method dividedBy(a: Int32, b: Int32): Int32 is
+            return a / b;
+        end;
+
+        method less(a: Int32, b: Int32): Bool is
+            return a < b;
+        end;
+
+        method isNaN(a: Int32): Bool is
+            return false;
+        end;
+
+        method oneOf(): Int32 is
+            return 1;
+        end;
+
+        method fromCount(count: Index): Int32 is
+            case toInt32(count) of
+                when Some(value as wide: Int32) do
+                    return wide;
+                when None do
+                    abort("Mirco.Numeric: a count above the range of Int32");
+            end case;
+        end;
+    end;
+
+    instance Numeric(Nat8) is
+        method plus(a: Nat8, b: Nat8): Nat8 is
+            return a + b;
+        end;
+
+        method minus(a: Nat8, b: Nat8): Nat8 is
+            return a - b;
+        end;
+
+        method times(a: Nat8, b: Nat8): Nat8 is
+            return a * b;
+        end;
+
+        method dividedBy(a: Nat8, b: Nat8): Nat8 is
+            return a / b;
+        end;
+
+        method less(a: Nat8, b: Nat8): Bool is
+            return a < b;
+        end;
+
+        method isNaN(a: Nat8): Bool is
+            return false;
+        end;
+
+        method oneOf(): Nat8 is
+            return 1;
+        end;
+
+        method fromCount(count: Index): Nat8 is
+            case toNat8(count) of
+                when Some(value as wide: Nat8) do
+                    return wide;
+                when None do
+                    abort("Mirco.Numeric: a count above the range of Nat8");
+            end case;
+        end;
+    end;
+end module body.

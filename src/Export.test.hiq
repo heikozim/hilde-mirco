@@ -1,0 +1,240 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, nth, wholeSpan, getSpanMut);
+import Standard.Bits (float64Bits, float64FromBits);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Export (dotBytes, meanBytes, deviationBytes, matmulBytes);
+import Mirco.Math (absolute);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Export.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) < 0.000000000001;
+    end;
+
+    function byteOf(v: Nat64): Nat8 is
+        case toNat8(v) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The eight bytes of value, lowest first, after those of out.
+    generic [R: Region]
+    function appendFloat(out: &![Buffer[Nat8], R], value: Float64): Unit is
+        var bits: Nat64 := float64Bits(value);
+        var k: Index := 0;
+        while k < 8 do
+            insertBack(&~out, byteOf(rem(bits, 256)));
+            bits := bits / 256;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    function bytes2(a: Float64, b: Float64): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        appendFloat(&!out, a);
+        appendFloat(&!out, b);
+        return out;
+    end;
+
+    function bytes4(a: Float64, b: Float64, c: Float64, d: Float64): Buffer[Nat8] is
+        var out: Buffer[Nat8] := allocateEmpty();
+        appendFloat(&!out, a);
+        appendFloat(&!out, b);
+        appendFloat(&!out, c);
+        appendFloat(&!out, d);
+        return out;
+    end;
+
+    -- The Float64 of the eight bytes of buf from at, little endian.
+    generic [R: Region]
+    function floatAt(buf: &[Buffer[Nat8], R], at: Index): Float64 is
+        var bits: Nat64 := 0;
+        var i: Index := 8;
+        while i > 0 do
+            i := i - 1;
+            case toNat64(nth(buf, at + i)) of
+                when Some(value as w: Nat64) do
+                    bits := (bits * 256) + w;
+                when None do
+                    skip;
+            end case;
+        end while;
+        return float64FromBits(bits);
+    end;
+
+    function testVectors(): Unit is
+        let a: Buffer[Nat8] := bytes2(3.0, 4.0);
+        let b: Buffer[Nat8] := bytes2(5.0, 6.0);
+        let v: Buffer[Nat8] := bytes4(1.0, 3.0, 5.0, 7.0);
+        assertTrue(dotBytes(wholeSpan(&a), wholeSpan(&b)) = 39.0, "3 * 5 + 4 * 6");
+        let other: Float64 := dotBytes(wholeSpan(&a), wholeSpan(&v));
+        assertTrue(other /= other, "vectors of 2 and 4 elements give a NaN");
+        assertTrue(meanBytes(wholeSpan(&v)) = 4.0, "the mean of 1, 3, 5, 7");
+        assertTrue(near(deviationBytes(wholeSpan(&v), 0), 2.23606797749979), "the deviation of 1, 3, 5, 7");
+        let too_few: Float64 := deviationBytes(wholeSpan(&a), 2);
+        assertTrue(too_few /= too_few, "a ddof of 2 over 2 elements gives a NaN");
+        destroyFree(a);
+        destroyFree(b);
+        destroyFree(v);
+        return nil;
+    end;
+
+    -- 1 2 / 3 4 times 5 / 6 is 17 / 39; the ensures of matmulBytes is
+    -- checked on each call, on true as on false.
+    function testMatmul(): Unit is
+        let a: Buffer[Nat8] := bytes4(1.0, 2.0, 3.0, 4.0);
+        let b: Buffer[Nat8] := bytes2(5.0, 6.0);
+        var out: Buffer[Nat8] := initialize(16, 0);
+        let done: Bool := matmulBytes(wholeSpan(&a), wholeSpan(&b), 2, 2, 1, getSpanMut(&!out, 0, 15));
+        assertTrue(done, "a 2 by 2 matrix times a 2 by 1 matrix");
+        assertTrue(floatAt(&out, 0) = 17.0, "row 0 of the product");
+        assertTrue(floatAt(&out, 8) = 39.0, "row 1 of the product");
+        let no_rows: Bool := matmulBytes(wholeSpan(&a), wholeSpan(&b), 0, 2, 1, getSpanMut(&!out, 0, 15));
+        assertTrue(not no_rows, "0 rows give false");
+        let wrong_inner: Bool := matmulBytes(wholeSpan(&a), wholeSpan(&b), 2, 1, 1, getSpanMut(&!out, 0, 15));
+        assertTrue(not wrong_inner, "a of 4 elements is no 2 by 1 matrix");
+        assertTrue(floatAt(&out, 0) = 17.0, "nothing written on false");
+        destroyFree(a);
+        destroyFree(b);
+        destroyFree(out);
+        return nil;
+    end;
+
+    -- The product of 1 2 / 3 4 and 5 / 6 into an out of outBytes bytes,
+    -- the result dropped.
+    function matmulInto(out_bytes: Index): Unit is
+        let a: Buffer[Nat8] := bytes4(1.0, 2.0, 3.0, 4.0);
+        let b: Buffer[Nat8] := bytes2(5.0, 6.0);
+        var out: Buffer[Nat8] := initialize(out_bytes, 0);
+        let done: Bool := matmulBytes(wholeSpan(&a), wholeSpan(&b), 2, 2, 1, getSpanMut(&!out, 0, out_bytes - 1));
+        destroyFree(a);
+        destroyFree(b);
+        destroyFree(out);
+        return nil;
+    end;
+
+    -- The length of out is a precondition of matmulBytes that no requires
+    -- can state, since a condition reads no writable span: an out of 15
+    -- bytes for a product of 16 stops the programme at the check of the
+    -- index, before a byte beyond it is written; the No contract of
+    -- matmulBytes names H3097.
+    -- An out of 16 bytes is taken.
+    function testShortOut(): Unit is
+        if asChild("shortOut") then
+            matmulInto(15);
+            return nil;
+        end if;
+        if asChild("fits") then
+            matmulInto(16);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testShortOut", "shortOut", "index out of bounds"), "an out of 15 bytes for a product of 16 stops the programme at the check of the index");
+        assertTrue(not refusedInChild("testShortOut", "shortOut", "contract violated"), "the stop of a short out is the check of the index, no contract");
+        assertTrue(not refusedInChild("testShortOut", "fits", "Mirco"), "an out of 16 bytes is taken");
+        return nil;
+    end;
+
+    -- Rows of 2 to the 62 make 8 times rows times inner overflow an Index:
+    -- the programme stops with an Overflow rather than giving false, the
+    -- gap the docstring of matmulBytes names; rows of 3 give false.
+    function testHugeRows(): Unit is
+        if asChild("huge") or asChild("three") then
+            let a: Buffer[Nat8] := bytes4(1.0, 2.0, 3.0, 4.0);
+            var out: Buffer[Nat8] := initialize(16, 0);
+            var rows: Index := 3;
+            if asChild("huge") then
+                rows := 4611686018427387904;
+            end if;
+            let done: Bool := matmulBytes(wholeSpan(&a), wholeSpan(&a), rows, 1, 1, getSpanMut(&!out, 0, 15));
+            destroyFree(a);
+            destroyFree(out);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testHugeRows", "huge", "Overflow"), "rows of 2 to the 62 stop the programme with an Overflow");
+        assertTrue(not refusedInChild("testHugeRows", "three", "Mirco"), "rows of 3 for a of 4 elements give false");
+        return nil;
+    end;
+end module body.

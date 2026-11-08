@@ -1,0 +1,60 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- strtod wants text that ends in a zero byte, so the text is copied into
+-- memory of its length and one byte more.  snprintf writes into 40 bytes:
+-- %.17g of a binary64 number takes at most 24 and the zero byte.
+pragma Unsafe_Module;
+pragma Foreign_Header(Name => "stdlib.h");
+pragma Foreign_Header(Name => "stdio.h");
+pragma Foreign_Header(Name => "string.h");
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocateBuffer,
+    deallocate
+);
+import Standard.String (String, fromSpan);
+
+module body Mirco.Bindings.Number is
+    constant format_room: Index := 40;
+
+    function room(size: Index): Pointer[Nat8] is
+        let address: Address[Nat8] := allocateBuffer(size);
+        case nullCheck(address) of
+            when Some(value as bytes: Pointer[Nat8]) do
+                return bytes;
+            when None do
+                abort("Mirco.Bindings.Number: no memory for a number");
+        end case;
+    end;
+
+    generic [R: Region]
+    function parseChecked(text: Span[Nat8, R]): Float64 is
+        let bytes: Pointer[Nat8] := room(spanLength(text) + 1);
+        let copied: Unit := @embed(Unit, "(memcpy((void*) $1, (const void*) $2.data, $2.size), ((uint8_t*) $1)[$2.size] = 0, (hilde_unit_t) 0)", bytes, text);
+        let value: Float64 := @embed(Float64, "strtod((const char*) $1, NULL)", bytes);
+        deallocate(bytes);
+        return value;
+    end;
+
+    function formatWith(value: Float64, precision: Int32): String is
+        let bytes: Pointer[Nat8] := room(format_room);
+        let written: Index := @embed(Index, "(size_t) snprintf((char*) $1, (size_t) $2, (const char[]) { 37, 46, 42, 103, 0 }, (int) $3, $4)", bytes, format_room, precision, value);
+        var used: Index := written;
+        if used >= format_room then
+            used := format_room - 1;
+        end if;
+        let text: Span[Nat8, Static] := @embed(Span[Nat8, Static], "hilde_make_span((void*) $1, $2)", bytes, used);
+        let made: String := fromSpan(text);
+        deallocate(bytes);
+        return made;
+    end;
+end module body.

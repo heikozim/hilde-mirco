@@ -1,0 +1,119 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Font (glyphRow);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Font.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- The glyph of A from top to bottom: 01110, 10001, 10001, 11111 and
+    -- three rows of 10001; a byte outside 32 to 126 draws as a space.
+    function testGlyphOfA(): Unit is
+        assertTrue(glyphRow(65, 0) = 14, "row 0 of A");
+        assertTrue(glyphRow(65, 1) = 17, "row 1 of A");
+        assertTrue(glyphRow(65, 3) = 31, "row 3 of A, its bar");
+        assertTrue(glyphRow(65, 6) = 17, "row 6 of A, the last");
+        assertTrue(glyphRow(32, 3) = 0, "a space has no pixel");
+        assertTrue(glyphRow(200, 3) = 0, "a byte above 126 draws as a space");
+        return nil;
+    end;
+
+    -- glyphRow of row, the row dropped.
+    function rowOf(row: Index): Unit is
+        let bits: Nat8 := glyphRow(65, row);
+        return nil;
+    end;
+
+    -- A row of 7 is refused by the requires of glyphRow; 0 and 6 are taken.
+    function testRowRefusal(): Unit is
+        if asChild("rowSeven") then
+            rowOf(7);
+            return nil;
+        end if;
+        if asChild("fits") then
+            rowOf(0);
+            rowOf(6);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testRowRefusal", "rowSeven", "contract violated: the requires"), "glyphRow of row 7 is refused by the requires");
+        assertTrue(not refusedInChild("testRowRefusal", "fits", "contract violated"), "rows 0 and 6 break no contract");
+        assertTrue(not refusedInChild("testRowRefusal", "fits", "Mirco"), "rows 0 and 6 are taken");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,413 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Schlucki, tables of named columns of Float64, Int64, text or Bool, each value present or missing.
+
+Schlucki stands for Structured Columnar Handling: Load, Unify, Clean, Knit, Inspect.
+
+- A missing value is None when it is read, never a number standing in for one.
+- Rows are matched by their position only; no index aligns two tables behind the caller's back.
+- Every operation gives a new table and leaves its arguments as they were, so nothing is a view of another.
+- A value is never converted to another kind: a column read as another kind or a join of keys of two kinds is refused.
+- A table is read from CSV with a kind named for each column, written as CSV that reads back, and read from or written into SQLite by a query.
+
+    var t: Table := table(3);
+    let added: Bool := addFloatColumn(&!t, "mass", &masses);
+    let heavy: Table := filter(&t, &mask);
+"""
+import Standard.Buffer (Buffer);
+import Standard.String (String);
+import Standard.Sqlite (Connection, Writing, SqlError, Values);
+import Mirco.Array (NdArray, count);
+
+module Mirco.Schlucki is
+    """
+    A table: a count of rows and named columns of one kind each.
+    """
+    type Table: Linear;
+
+    """
+    The kind of a column of Float64.
+    """
+    function kindFloat(): Nat8
+        ensures result = 1;
+
+    """
+    The kind of a column of Int64.
+    """
+    function kindInt(): Nat8
+        ensures result = 2;
+
+    """
+    The kind of a column of text.
+    """
+    function kindText(): Nat8
+        ensures result = 3;
+
+    """
+    The kind of a column of Bool.
+    """
+    function kindBool(): Nat8
+        ensures result = 4;
+
+    """
+    A new table of rows rows and no column.
+    """
+    function table(rows: Index): Table
+        requires rows <= 1000000000
+        ensures (rowCount(&result) = rows) and (columnCount(&result) = 0);
+
+    """
+    Gives the table back.
+    No contract: a destroy function.
+    """
+    function destroyTable(t: Table): Unit;
+
+    """
+    The count of rows.
+    No contract: no precondition, since the count of rows of any table is a number.
+    """
+    generic [R: Region]
+    function rowCount(t: &[Table, R]): Index;
+
+    """
+    The count of columns.
+    No contract: no precondition, since the count of columns of any table is a number.
+    """
+    generic [R: Region]
+    function columnCount(t: &[Table, R]): Index;
+
+    """
+    The position of the column named name, or None.
+    No contract: no precondition, since a name the table does not have gives None.
+    """
+    generic [R: Region, S: Region]
+    function columnIndex(t: &[Table, R], name: Span[Nat8, S]): Option[Index];
+
+    """
+    The kind of column c: kindFloat, kindInt, kindText or kindBool.
+    """
+    generic [R: Region]
+    function columnKind(t: &[Table, R], c: Index): Nat8
+        requires c < columnCount(t)
+        ensures (result >= 1) and (result <= 4);
+
+    """
+    The name of column c.
+    """
+    generic [R: Region]
+    function columnName(t: &[Table, R], c: Index): Span[Nat8, R]
+        requires c < columnCount(t);
+
+    """
+    Adds a column of the values, every one present; false, and nothing added, when their count is not the
+    count of rows or the name is taken.
+    No requires, since a count of values other than the count of rows, or a taken name, gives false and adds nothing.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function addFloatColumn(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Float64], Q]): Bool
+        ensures (rowCount(&t) = old(rowCount(&t))) and ((result and (columnCount(&t) = (old(columnCount(&t)) + 1))) or ((not result) and (columnCount(&t) = old(columnCount(&t)))));
+
+    """
+    addFloatColumn where there says for each row whether its value is there.
+    No requires, since a count of values or of marks other than the count of rows, or a taken name, gives false and adds nothing.
+    """
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function addFloatColumnWith(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Float64], Q], there: &[NdArray[Bool], P]): Bool
+        ensures (rowCount(&t) = old(rowCount(&t))) and ((result and (columnCount(&t) = (old(columnCount(&t)) + 1))) or ((not result) and (columnCount(&t) = old(columnCount(&t)))));
+
+    """
+    Adds a column of Int64, every value present; false as addFloatColumn.
+    No requires, since a count of values other than the count of rows, or a taken name, gives false and adds nothing.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function addIntColumn(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Int64], Q]): Bool
+        ensures (rowCount(&t) = old(rowCount(&t))) and ((result and (columnCount(&t) = (old(columnCount(&t)) + 1))) or ((not result) and (columnCount(&t) = old(columnCount(&t)))));
+
+    """
+    Adds a column of Bool, every value present; false as addFloatColumn.
+    No requires, since a count of values other than the count of rows, or a taken name, gives false and adds nothing.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function addBoolColumn(t: &![Table, R], name: Span[Nat8, S], values: &[NdArray[Bool], Q]): Bool
+        ensures (rowCount(&t) = old(rowCount(&t))) and ((result and (columnCount(&t) = (old(columnCount(&t)) + 1))) or ((not result) and (columnCount(&t) = old(columnCount(&t)))));
+
+    """
+    Adds a column of text, the values joined by the byte separator, every value present; false as
+    addFloatColumn.
+    No requires, since a count of values other than the count of rows, or a taken name, gives false and adds nothing.
+    """
+    generic [R: Region, S: Region, Q: Region]
+    function addTextColumn(t: &![Table, R], name: Span[Nat8, S], joined: Span[Nat8, Q], separator: Nat8): Bool
+        ensures (rowCount(&t) = old(rowCount(&t))) and ((result and (columnCount(&t) = (old(columnCount(&t)) + 1))) or ((not result) and (columnCount(&t) = old(columnCount(&t)))));
+
+    """
+    The Float64 in column c, row r, or None when it is missing; a column of another kind stops the programme.
+    """
+    generic [R: Region]
+    function floatAt(t: &[Table, R], c: Index, r: Index): Option[Float64]
+        requires (c < columnCount(t)) and (r < rowCount(t));
+
+    """
+    The Int64 in column c, row r, or None; a column of another kind stops the programme.
+    """
+    generic [R: Region]
+    function intAt(t: &[Table, R], c: Index, r: Index): Option[Int64]
+        requires (c < columnCount(t)) and (r < rowCount(t));
+
+    """
+    The text in column c, row r, or None; a column of another kind stops the programme.
+    """
+    generic [R: Region]
+    function textAt(t: &[Table, R], c: Index, r: Index): Option[Span[Nat8, R]]
+        requires (c < columnCount(t)) and (r < rowCount(t));
+
+    """
+    The Bool in column c, row r, or None; a column of another kind stops the programme.
+    """
+    generic [R: Region]
+    function boolAt(t: &[Table, R], c: Index, r: Index): Option[Bool]
+        requires (c < columnCount(t)) and (r < rowCount(t));
+
+    """
+    Column c of Float64 as a vector; a missing value is a NaN there, and present tells which.
+    """
+    generic [R: Region]
+    function floatColumn(t: &[Table, R], c: Index): NdArray[Float64]
+        requires (c < columnCount(t)) and (rowCount(t) >= 1)
+        ensures count(&result) = rowCount(t);
+
+    """
+    For each row of column c whether its value is present.
+    """
+    generic [R: Region]
+    function present(t: &[Table, R], c: Index): NdArray[Bool]
+        requires (c < columnCount(t)) and (rowCount(t) >= 1)
+        ensures count(&result) = rowCount(t);
+
+    """
+    Whether every position of cols names a column of the table.
+    No contract: no precondition; any positions can be compared with the count of columns.
+    """
+    generic [R: Region, S: Region]
+    function columnsExist(t: &[Table, R], cols: Span[Index, S]): Bool;
+
+    """
+    A new table of the columns at the positions cols, in that order.
+    """
+    generic [R: Region, S: Region]
+    function select(t: &[Table, R], cols: Span[Index, S]): Table
+        requires columnsExist(t, cols)
+        ensures (rowCount(&result) = rowCount(t)) and (columnCount(&result) = spanLength(cols));
+
+    """
+    A new table of the rows whose element of keep is true, in their order.
+    """
+    generic [R: Region, S: Region]
+    function filter(t: &[Table, R], keep: &[NdArray[Bool], S]): Table
+        requires count(keep) = rowCount(t)
+        ensures (columnCount(&result) = columnCount(t)) and (rowCount(&result) <= rowCount(t));
+
+    """
+    For each row whether the Float64 of column c lies from low to high; false for a missing value.
+    """
+    generic [R: Region]
+    function whereBetween(t: &[Table, R], c: Index, low: Float64, high: Float64): NdArray[Bool]
+        requires (c < columnCount(t)) and (rowCount(t) >= 1)
+        ensures count(&result) = rowCount(t);
+
+    """
+    For each row whether the text of column c is text; false for a missing value.
+    """
+    generic [R: Region, S: Region]
+    function whereText(t: &[Table, R], c: Index, text: Span[Nat8, S]): NdArray[Bool]
+        requires (c < columnCount(t)) and (rowCount(t) >= 1)
+        ensures count(&result) = rowCount(t);
+
+    """
+    A new table of the rows ordered by column c, ascending or descending; equal values keep their order,
+    missing values come last.
+    """
+    generic [R: Region]
+    function sortBy(t: &[Table, R], c: Index, ascending: Bool): Table
+        requires c < columnCount(t)
+        ensures (rowCount(&result) = rowCount(t)) and (columnCount(&result) = columnCount(t));
+
+    """
+    The code of an aggregate: 1 sum, 2 mean, 3 count, 4 the smallest, 5 the largest.
+    """
+    function aggregateSum(): Nat8
+        ensures result = 1;
+
+    """
+    The code of the mean.
+    """
+    function aggregateMean(): Nat8
+        ensures result = 2;
+
+    """
+    The code of the count of present values.
+    """
+    function aggregateCount(): Nat8
+        ensures result = 3;
+
+    """
+    The code of the smallest present value.
+    """
+    function aggregateMinimum(): Nat8
+        ensures result = 4;
+
+    """
+    The code of the largest present value.
+    """
+    function aggregateMaximum(): Nat8
+        ensures result = 5;
+
+    """
+    A new table of one row for each value of the key column, in the order they first appear, and the column
+    aggregate of the present Float64 or Int64 values of column value in its rows; rows with a missing key
+    are left out.  A column value of another kind stops the programme.
+    """
+    generic [R: Region]
+    function groupBy(t: &[Table, R], key: Index, value: Index, aggregate: Nat8): Table
+        requires (key < columnCount(t)) and (value < columnCount(t)) and (aggregate >= 1) and (aggregate <= 5)
+        ensures (columnCount(&result) = 2) and (rowCount(&result) <= rowCount(t));
+
+    """
+    The inner join on equal keys: a row for each pair of rows whose keys are equal, the columns of left, then
+    those of right but its key, a name taken suffixed with _right; None when the keys are of two kinds.
+    """
+    generic [R: Region, S: Region]
+    function join(left: &[Table, R], right: &[Table, S], left_key: Index, right_key: Index): Option[Table]
+        requires (left_key < columnCount(left)) and (right_key < columnCount(right));
+
+    """
+    Why readCsv refused a text: 1 no CSV, 2 another count of columns than of kinds, 3 a field not of its
+    kind, 4 an unknown kind; with the line and the column.
+    """
+    record TableError: Free is
+        code: Int32;
+        line: Index;
+        column: Index;
+    end;
+
+    """
+    A table read from CSV with the comma: the first row names the columns, kinds names the kind of each; an
+    empty field is missing, a field not of its kind is refused with its line and column, counted from 1 and 0.
+    No contract: no precondition, since a text that is no CSV, kinds that do not fit it or a field not of its kind give a TableError.
+    """
+    generic [R: Region, S: Region]
+    function readCsv(text: Span[Nat8, R], kinds: Span[Nat8, S]): Either[TableError, Table];
+
+    """
+    The table as CSV with the comma, in the form readCsv reads back with the kinds of its columns: a first row
+    of the names, then a row for each row; a missing value is an empty field, a Float64 the shortest text
+    that reads back as the same number, an Int64 in decimal, a Bool true or false, a text as it is.  A
+    present empty text is an empty field too and so is read back as missing.  None when Standard.Csv
+    refuses, as for a name or a text that is not UTF-8.
+    """
+    generic [R: Region]
+    function writeCsv(t: &[Table, R]): Option[String]
+        requires columnCount(t) >= 1;
+
+    """
+    The rows a query gives, a column for each kind of kinds, named by names, joined by commas; a null is
+    missing. The query is SQL of one's own, run unchecked; sql is a literal, so no input of the programme reaches it.
+    A code in kinds that is no kind is refused by the requires; a statement or a connection that fails gives a SqlError.
+    A column asked for as kindBool is read as the integer SQLite holds a Bool as, 0 or 1, as insertRows writes it;
+    any other value is no Bool SQLite can give and gives a SqlError, never a column of another kind.
+    """
+    generic [M: Free, R: Region, S: Region, Q: Region]
+    function fromQuery(db: &![Connection[M], R], sql: Span[Nat8, Static], kinds: Span[Nat8, S], names: Span[Nat8, Q]): Either[SqlError, Table]
+        requires kindsKnown(kinds);
+
+    """
+    Runs the statement sql once for each row, its parameters the values of the row in the order of the
+    columns, a missing one null; the count of rows changed comes back.
+    No contract: no precondition, since a statement or a connection that fails gives a SqlError; sql is a literal, so no input of the programme reaches it.
+    """
+    generic [R: Region, S: Region]
+    function insertRows(db: &![Connection[Writing], R], sql: Span[Nat8, Static], t: &[Table, S]): Either[SqlError, Nat64];
+
+    """
+    Values gathered row by row for a new table, each of the kind of its column in turn; Mirco.SchluckiStore
+    reads the rows of a query of SQLite or DuckDB through it.
+    """
+    type Rows: Linear;
+
+    """
+    Whether every element of kinds is kindFloat, kindInt, kindText or kindBool.
+    No contract: no precondition; any span of codes can be scanned.
+    """
+    generic [R: Region]
+    function kindsKnown(kinds: Span[Nat8, R]): Bool;
+
+    """
+    Rows for columns of the kinds, none gathered yet.
+    """
+    generic [R: Region]
+    function rowsFor(kinds: Span[Nat8, R]): Rows
+        requires (spanLength(kinds) >= 1) and (spanLength(kinds) <= 100000) and kindsKnown(kinds)
+        ensures gatheredRows(&result) = 0;
+
+    """
+    The count of whole rows gathered.
+    No contract: no precondition, since rows of any kinds have a count.
+    """
+    generic [R: Region]
+    function gatheredRows(rows: &[Rows, R]): Index;
+
+    """
+    The kind of the column the next value goes to.
+    """
+    generic [R: Region]
+    function nextKind(rows: &[Rows, R]): Nat8
+        ensures (result >= 1) and (result <= 4);
+
+    """
+    Puts a Float64, None for a missing one, into the next column; a column of another kind stops the
+    programme.
+    No requires: the kind of the next column lies in a buffer, which only C reads, so a condition cannot read it; the body stops the programme on another kind.
+    """
+    generic [R: Region]
+    function putFloat(rows: &![Rows, R], value: Option[Float64]): Unit
+        ensures (gatheredRows(&rows) = old(gatheredRows(&rows))) or (gatheredRows(&rows) = (old(gatheredRows(&rows)) + 1));
+
+    """
+    Puts an Int64 or None into the next column; a column of another kind stops the programme.
+    No requires: the kind of the next column lies in a buffer, which only C reads, so a condition cannot read it; the body stops the programme on another kind.
+    """
+    generic [R: Region]
+    function putInt(rows: &![Rows, R], value: Option[Int64]): Unit
+        ensures (gatheredRows(&rows) = old(gatheredRows(&rows))) or (gatheredRows(&rows) = (old(gatheredRows(&rows)) + 1));
+
+    """
+    Puts a text, copied, or None into the next column; a column of another kind stops the programme.
+    No requires: the kind of the next column lies in a buffer, which only C reads, so a condition cannot read it; the body stops the programme on another kind.
+    """
+    generic [R: Region, S: Region]
+    function putText(rows: &![Rows, R], value: Option[Span[Nat8, S]]): Unit
+        ensures (gatheredRows(&rows) = old(gatheredRows(&rows))) or (gatheredRows(&rows) = (old(gatheredRows(&rows)) + 1));
+
+    """
+    Puts a Bool or None into the next column; a column of another kind stops the programme.
+    No requires: the kind of the next column lies in a buffer, which only C reads, so a condition cannot read it; the body stops the programme on another kind.
+    """
+    generic [R: Region]
+    function putBool(rows: &![Rows, R], value: Option[Bool]): Unit
+        ensures (gatheredRows(&rows) = old(gatheredRows(&rows))) or (gatheredRows(&rows) = (old(gatheredRows(&rows)) + 1));
+
+    """
+    The table of the whole rows gathered, the columns named by names joined by commas; values put after the
+    last whole row are left out, and the rows are given back.
+    No requires, since rows of any count make a table; a name missing in names is empty.
+    """
+    generic [R: Region]
+    function finishRows(rows: Rows, names: Span[Nat8, R]): Table
+        ensures rowCount(&result) = old(gatheredRows(&rows));
+end module.

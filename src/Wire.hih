@@ -1,0 +1,75 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The binary wire format of an owning Mirco array: a header, then the elements in row-major order, all little endian.
+
+- Header: the bytes M, I, R, C; version 1; the element code; the rank; a zero byte; then each dimension as eight bytes.
+- The elements follow the header without a gap, each as many bytes as its type is wide.
+- A decoder reads the header and checks the version, the code against the element type asked for, the rank, every dimension and the exact length before it takes any element.
+- A Bool element other than 0 or 1 is refused.
+
+    let bytes: Buffer[Nat8] := encode(&grid);
+"""
+import Standard.Buffer (Buffer, length);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, count);
+
+module Mirco.Wire is
+    """
+    Why a decoder refused its bytes.
+    """
+    union WireError: Free is
+        case TooShort;
+        case BadMagic;
+        case BadVersion;
+        case UnknownElement;
+        case OtherElement;
+        case BadRank;
+        case BadReserved;
+        case BadDimension;
+        case BadLength;
+        case BadElement;
+    end;
+
+    """
+    The version this module writes and reads.
+    """
+    function wireVersion(): Nat8
+        ensures result = 1;
+
+    """
+    The length of the header of an array of rank: eight bytes, then eight for every dimension.
+    """
+    function headerLength(rank: Index): Index
+        requires rank <= 32
+        ensures result = (8 + (8 * rank));
+
+    """
+    The count of bytes encode writes for array: the header, then each element as wide as its type, 1 to 8
+    bytes; the width itself is a method of T, which a condition does not call.
+    """
+    generic [T: Free(Element), R: Region]
+    function encodedLength(array: &[NdArray[T], R]): Index
+        ensures result >= (headerLength(rank(array)) + count(array))
+        ensures result <= (headerLength(rank(array)) + (8 * count(array)));
+
+    """
+    The bytes of array in the wire format, encodedLength(array) of them.
+    """
+    generic [T: Free(Element), R: Region]
+    function encode(array: &[NdArray[T], R]): Buffer[Nat8]
+        ensures length(&result) >= (headerLength(rank(array)) + count(array))
+        ensures length(&result) <= (headerLength(rank(array)) + (8 * count(array)));
+
+    """
+    The array the bytes hold, or why they were refused; T is the element type asked for.
+    No contract: no precondition, since bytes that are no array, or of another element type than T, give a WireError, never a stop.
+    """
+    generic [T: Free(Element), R: Region]
+    function decode(bytes: Span[Nat8, R]): Either[WireError, NdArray[T]];
+end module.

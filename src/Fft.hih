@@ -1,0 +1,103 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Computes the discrete Fourier transform of a complex signal of any length and its inverse.
+
+- Time n log n for every length: a power of two directly, any other length by the chirp z method of Bluestein.
+- The forward transform is not scaled and the inverse divides by n, as NumPy's default norm does.
+- A signal holds its real and its imaginary parts as two arrays of the same length, at least one.
+
+    let spectrum: Signal := fft(&samples);
+"""
+import Mirco.Array (NdArray, rank, count);
+
+module Mirco.Fft is
+    """
+    A complex signal: n real parts and n imaginary parts.
+    """
+    type Signal: Linear;
+
+    """
+    The signal of the real parts real and the imaginary parts imaginary, two vectors of the same count.
+    """
+    generic [R: Region, S: Region]
+    function signal(real: &[NdArray[Float64], R], imaginary: &[NdArray[Float64], S]): Signal
+        requires (count(real) = count(imaginary)) and (count(real) > 0)
+        ensures signalLength(&result) = count(real);
+
+    """
+    The signal of the real parts real, every imaginary part zero.
+    """
+    generic [R: Region]
+    function realSignal(real: &[NdArray[Float64], R]): Signal
+        requires count(real) > 0
+        ensures signalLength(&result) = count(real);
+
+    """
+    Gives the signal back.
+    No contract: a destroy function.
+    """
+    function destroySignal(s: Signal): Unit;
+
+    """
+    The count of complex values of the signal.
+    """
+    generic [R: Region]
+    function signalLength(s: &[Signal, R]): Index
+        ensures result > 0;
+
+    """
+    The real part of the value at k.
+    """
+    generic [R: Region]
+    function realAt(s: &[Signal, R], k: Index): Float64
+        requires k < signalLength(s);
+
+    """
+    The imaginary part of the value at k.
+    """
+    generic [R: Region]
+    function imaginaryAt(s: &[Signal, R], k: Index): Float64
+        requires k < signalLength(s);
+
+    """
+    The absolute values of the signal as a new vector.
+    """
+    generic [R: Region]
+    function magnitude(s: &[Signal, R]): NdArray[Float64]
+        ensures (rank(&result) = 1) and (count(&result) = signalLength(s));
+
+    """
+    The discrete Fourier transform of s, X at k the sum of x at j times e to the -2 pi i j k / n.
+    """
+    generic [R: Region]
+    function fft(s: &[Signal, R]): Signal
+        ensures signalLength(&result) = signalLength(s);
+
+    """
+    The inverse transform: the sum with e to the +2 pi i j k / n, divided by n.
+    """
+    generic [R: Region]
+    function inverseFft(s: &[Signal, R]): Signal
+        ensures signalLength(&result) = signalLength(s);
+
+    """
+    The first n / 2 + 1 values of the transform of a real vector; the others are their conjugates.
+    """
+    generic [R: Region]
+    function realFft(real: &[NdArray[Float64], R]): Signal
+        requires count(real) > 0
+        ensures signalLength(&result) = ((count(real) / 2) + 1);
+
+    """
+    The frequency of each value of a transform of n samples taken spacing apart, as NumPy's fftfreq gives them.
+    """
+    function fftFrequencies(n: Index, spacing: Float64): NdArray[Float64]
+        requires (n > 0) and (n <= 1000000000) and (spacing > 0.0)
+        ensures (rank(&result) = 1) and (count(&result) = n);
+end module.

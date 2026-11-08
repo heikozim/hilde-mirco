@@ -1,0 +1,888 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Element (Element);
+import Mirco.Numeric (Numeric);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, rank, dimension, count, flatGet);
+import Mirco.Compute (
+    add,
+    subtract,
+    multiply,
+    divide,
+    addScalar,
+    multiplyScalar,
+    sum,
+    product,
+    minimum,
+    maximum,
+    mean,
+    sumAxis,
+    productAxis,
+    minimumAxis,
+    maximumAxis,
+    meanAxis,
+    reductionSum,
+    reductionMinimum,
+    reductionMaximum,
+    reductionProduct,
+    combineValues,
+    combine,
+    meanOfSums,
+    dot,
+    transpose,
+    matvec,
+    matmul,
+    gemv,
+    gemm
+);
+import Standard.Bits (float64FromBits);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Compute.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, words, words);
+    end;
+
+    -- Whether the child for word stopped with the message of a violated
+    -- requires of name, as " of Mirco.Compute.gemv (": the message names the
+    -- function whose requires failed, so a requires of a function the body
+    -- calls does not count.
+    function refusedByRequiresOf(test: Span[Nat8, Static], word: Span[Nat8, Static], name: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, "contract violated: the requires", name);
+    end;
+
+    -- Whether the child for word stopped with an exit other than 0 and both
+    -- words and also on its standard error.
+    function refusedInChildWith(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static], also: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words) and contains(asSpan(&text), also);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- An Int64 array of shape rows by cols, holding first, first + 1, ...
+    function counting(rows: Index, cols: Index, first: Int64): NdArray[Int64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        var values: Buffer[Int64] := allocateEmpty();
+        var v: Int64 := first;
+        var at: Index := 0;
+        while at < (rows * cols) do
+            insertBack(&!values, v);
+            v := v + 1;
+            at := at + 1;
+        end while;
+        let made: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    function vector(a: Float64, b: Float64, c: Float64): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 3);
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, a);
+        insertBack(&!values, b);
+        insertBack(&!values, c);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    function testElementwiseSameShape(): Unit is
+        let a: NdArray[Int64] := counting(2, 3, 1);
+        let b: NdArray[Int64] := counting(2, 3, 10);
+        case add(&a, &b) of
+            when Some(value as c: NdArray[Int64]) do
+                assertTrue(flatGet(&c, 0) = 11, "1 + 10");
+                assertTrue(flatGet(&c, 5) = 21, "6 + 15");
+                destroyNdArray(c);
+            when None do
+                assertTrue(false, "the same shape broadcasts");
+        end case;
+        case subtract(&b, &a) of
+            when Some(value as c: NdArray[Int64]) do
+                assertTrue(flatGet(&c, 4) = 9, "14 - 5");
+                destroyNdArray(c);
+            when None do
+                assertTrue(false, "the same shape broadcasts");
+        end case;
+        case multiply(&a, &b) of
+            when Some(value as c: NdArray[Int64]) do
+                assertTrue(flatGet(&c, 2) = 36, "3 * 12");
+                destroyNdArray(c);
+            when None do
+                assertTrue(false, "the same shape broadcasts");
+        end case;
+        case divide(&b, &a) of
+            when Some(value as c: NdArray[Int64]) do
+                assertTrue(flatGet(&c, 1) = 5, "11 / 2 rounds towards zero");
+                destroyNdArray(c);
+            when None do
+                assertTrue(false, "the same shape broadcasts");
+        end case;
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- A 2 by 3 matrix plus a row of three: the row is added to every row.
+    function testElementwiseBroadcast(): Unit is
+        let m: NdArray[Int64] := counting(2, 3, 0);
+        let row: NdArray[Int64] := counting(1, 3, 100);
+        case add(&m, &row) of
+            when Some(value as c: NdArray[Int64]) do
+                assertTrue(rank(&c) = 2, "rank 2");
+                assertTrue(dimension(&c, 0) = 2, "two rows");
+                assertTrue(flatGet(&c, 3) = 103, "row 1, column 0: 3 + 100");
+                assertTrue(flatGet(&c, 5) = 107, "row 1, column 2: 5 + 102");
+                destroyNdArray(c);
+            when None do
+                assertTrue(false, "2x3 and 1x3 broadcast");
+        end case;
+        let wrong: NdArray[Int64] := counting(1, 2, 0);
+        case add(&m, &wrong) of
+            when Some(value as c: NdArray[Int64]) do
+                destroyNdArray(c);
+                assertTrue(false, "2x3 and 1x2 do not broadcast");
+            when None do
+                assertTrue(true, "2x3 and 1x2 do not broadcast");
+        end case;
+        destroyNdArray(wrong);
+        destroyNdArray(m);
+        destroyNdArray(row);
+        return nil;
+    end;
+
+    function testScalarsAndReductions(): Unit is
+        let a: NdArray[Int64] := counting(2, 3, 1);
+        let plus_ten: NdArray[Int64] := addScalar(&a, 10);
+        let doubled: NdArray[Int64] := multiplyScalar(&a, 2);
+        assertTrue(flatGet(&plus_ten, 0) = 11, "1 + 10");
+        assertTrue(flatGet(&doubled, 5) = 12, "6 * 2");
+        assertTrue(sum(&a) = 21, "1 + ... + 6");
+        assertTrue(product(&a) = 720, "6 factorial");
+        assertTrue(minimum(&a) = 1, "the smallest is 1");
+        assertTrue(maximum(&a) = 6, "the largest is 6");
+        assertTrue(mean(&a) = 3, "21 / 6 rounds towards zero");
+        destroyNdArray(plus_ten);
+        destroyNdArray(doubled);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- A NaN is passed over by the smallest and the largest.
+    function testNaNPassedOver(): Unit is
+        let nan: Float64 := float64FromBits(9221120237041090560);
+        let v: NdArray[Float64] := vector(nan, 2.0, -1.0);
+        assertTrue(minimum(&v) = -1.0, "the smallest number past a NaN");
+        assertTrue(maximum(&v) = 2.0, "the largest number past a NaN");
+        assertTrue(mean(&v) /= mean(&v), "a mean over a NaN is a NaN");
+        destroyNdArray(v);
+        return nil;
+    end;
+
+    function testSumAxis(): Unit is
+        let a: NdArray[Int64] := counting(2, 3, 1);
+        let columns: NdArray[Int64] := sumAxis(&a, 0);
+        assertTrue(count(&columns) = 3, "three column sums");
+        assertTrue(flatGet(&columns, 0) = 5, "1 + 4");
+        assertTrue(flatGet(&columns, 2) = 9, "3 + 6");
+        let rows: NdArray[Int64] := sumAxis(&a, 1);
+        assertTrue(count(&rows) = 2, "two row sums");
+        assertTrue(flatGet(&rows, 1) = 15, "4 + 5 + 6");
+        destroyNdArray(columns);
+        destroyNdArray(rows);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    function testDotAndTranspose(): Unit is
+        let x: NdArray[Float64] := vector(1.0, 2.0, 3.0);
+        let y: NdArray[Float64] := vector(4.0, 5.0, 6.0);
+        assertTrue(dot(&x, &y) = 32.0, "4 + 10 + 18");
+        let a: NdArray[Int64] := counting(2, 3, 1);
+        let t: NdArray[Int64] := transpose(&a);
+        assertTrue(dimension(&t, 0) = 3, "three rows after the transpose");
+        assertTrue(flatGet(&t, 1) = 4, "row 0, column 1 is a's row 1, column 0");
+        destroyNdArray(t);
+        destroyNdArray(a);
+        destroyNdArray(x);
+        destroyNdArray(y);
+        return nil;
+    end;
+
+    -- [[1, 2, 3], [4, 5, 6]] times [[7, 8], [9, 10], [11, 12]] is
+    -- [[58, 64], [139, 154]], and times the vector [1, 1, 1] it is [6, 15].
+    function testProducts(): Unit is
+        let a: NdArray[Int64] := counting(2, 3, 1);
+        let b: NdArray[Int64] := counting(3, 2, 7);
+        let c: NdArray[Int64] := matmul(&a, &b);
+        assertTrue(flatGet(&c, 0) = 58, "c[0][0]");
+        assertTrue(flatGet(&c, 1) = 64, "c[0][1]");
+        assertTrue(flatGet(&c, 2) = 139, "c[1][0]");
+        assertTrue(flatGet(&c, 3) = 154, "c[1][1]");
+        let ones: NdArray[Int64] := counting(3, 1, 1);
+        let column: NdArray[Int64] := matmul(&a, &ones);
+        assertTrue(flatGet(&column, 0) = 14, "1 + 4 + 9: the ones are 1, 2, 3");
+        destroyNdArray(column);
+        destroyNdArray(ones);
+        destroyNdArray(c);
+        destroyNdArray(a);
+        destroyNdArray(b);
+        return nil;
+    end;
+
+    -- The matrix of shape rows by cols holding 1, 2, ... in row-major order.
+    function rising(rows: Index, cols: Index): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        var values: Buffer[Float64] := allocateEmpty();
+        var v: Float64 := 1.0;
+        var at: Index := 0;
+        while at < (rows * cols) do
+            insertBack(&!values, v);
+            v := v + 1.0;
+            at := at + 1;
+        end while;
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- The vector of length n, every element 1.
+    function filledWithOne(n: Index): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        var values: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!values, 1.0);
+            at := at + 1;
+        end while;
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    -- y := m times x for m of shape rows by cols, x of length xs, y of
+    -- length ys.
+    function gemvOf(rows: Index, cols: Index, xs: Index, ys: Index): Unit is
+        let m: NdArray[Float64] := rising(rows, cols);
+        let x: NdArray[Float64] := filledWithOne(xs);
+        var y: NdArray[Float64] := filledWithOne(ys);
+        gemv(1.0, &m, &x, 0.0, &!y);
+        destroyNdArray(y);
+        destroyNdArray(x);
+        destroyNdArray(m);
+        return nil;
+    end;
+
+    -- gemv is called with a y of another length than the rows of m, each
+    -- call in a child of its own.  For m of 2 by 3 and x of 3, a y of 3 and
+    -- a y of 1 are refused by the requires, which reads the rows of m.  An
+    -- x of 2 and a y of 3 for m of 2 by 3 hold 6 = 2 times 3 elements, and
+    -- the requires refuses them too, since it reads the columns and the rows
+    -- and not only the count.  The y of 2 for m of 2 by 3 and x of 3 is taken.
+    function testGemvRefusesAYOfAnotherLength(): Unit is
+        if asChild("yOfThree") then
+            gemvOf(2, 3, 3, 3);
+            return nil;
+        end if;
+        if asChild("yOfOne") then
+            gemvOf(2, 3, 3, 1);
+            return nil;
+        end if;
+        if asChild("xAndYExchanged") then
+            gemvOf(2, 3, 2, 3);
+            return nil;
+        end if;
+        if asChild("fits") then
+            gemvOf(2, 3, 3, 2);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testGemvRefusesAYOfAnotherLength", "yOfThree", " of Mirco.Compute.gemv ("), "a y of 3 for 2 rows is refused by the requires");
+        assertTrue(refusedByRequiresOf("testGemvRefusesAYOfAnotherLength", "yOfOne", " of Mirco.Compute.gemv ("), "a y of 1 for 2 rows is refused by the requires");
+        assertTrue(refusedByRequiresOf("testGemvRefusesAYOfAnotherLength", "xAndYExchanged", " of Mirco.Compute.gemv ("), "an x of 2 and a y of 3 for 2 by 3 are refused by the requires");
+        assertTrue(not refusedInChild("testGemvRefusesAYOfAnotherLength", "xAndYExchanged", "Mirco.Compute: the"), "an x of 2 and a y of 3 for 2 by 3 do not reach the body");
+        assertTrue(not refusedInChild("testGemvRefusesAYOfAnotherLength", "fits", "Mirco.Compute"), "a y of 2 for 2 rows is taken");
+        assertTrue(not refusedInChild("testGemvRefusesAYOfAnotherLength", "fits", "contract violated"), "a y of 2 for 2 rows breaks no contract");
+        return nil;
+    end;
+
+    -- c := a times b for a of rows by inner, b of rows of b by cols, c of
+    -- cRows by cCols, every element of c 1.
+    function gemmOf(rows: Index, inner: Index, b_rows: Index, cols: Index, c_rows: Index, c_cols: Index): Unit is
+        let a: NdArray[Float64] := rising(rows, inner);
+        let b: NdArray[Float64] := rising(b_rows, cols);
+        var c: NdArray[Float64] := rising(c_rows, c_cols);
+        gemm(1.0, &a, &b, 0.0, &!c);
+        destroyNdArray(c);
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- matvec of m of rows by cols and x of length xs.
+    function matvecOf(rows: Index, cols: Index, xs: Index): Unit is
+        let m: NdArray[Float64] := rising(rows, cols);
+        let x: NdArray[Float64] := filledWithOne(xs);
+        let made: NdArray[Float64] := matvec(&m, &x);
+        destroyNdArray(made);
+        destroyNdArray(x);
+        destroyNdArray(m);
+        return nil;
+    end;
+
+    -- matmul of a of rows by inner and b of bRows by cols.
+    function matmulOfShapes(rows: Index, inner: Index, b_rows: Index, cols: Index): Unit is
+        let a: NdArray[Float64] := rising(rows, inner);
+        let b: NdArray[Float64] := rising(b_rows, cols);
+        let made: NdArray[Float64] := matmul(&a, &b);
+        destroyNdArray(made);
+        destroyNdArray(b);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- matvec, matmul and gemm with a dimension that does not fit, each call
+    -- in a child of its own, must stop with the message of a violated
+    -- requires and not reach the body; the fitting calls are taken.
+    function testProductsRefuseDimensionsThatDoNotFit(): Unit is
+        if asChild("matvecXOfTwo") then
+            matvecOf(2, 3, 2);
+            return nil;
+        end if;
+        if asChild("matmulInnerApart") then
+            matmulOfShapes(2, 3, 2, 3);
+            return nil;
+        end if;
+        if asChild("gemmCOfOtherRows") then
+            gemmOf(2, 3, 3, 2, 3, 2);
+            return nil;
+        end if;
+        if asChild("gemmCOfOtherColumns") then
+            gemmOf(2, 3, 3, 2, 2, 3);
+            return nil;
+        end if;
+        if asChild("gemmInnerApart") then
+            gemmOf(2, 3, 2, 2, 2, 2);
+            return nil;
+        end if;
+        if asChild("fits") then
+            matvecOf(2, 3, 3);
+            matmulOfShapes(2, 3, 3, 4);
+            gemmOf(2, 3, 3, 4, 2, 4);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testProductsRefuseDimensionsThatDoNotFit", "matvecXOfTwo", " of Mirco.Compute.matvec ("), "matvec of 2 by 3 and an x of 2 is refused by the requires");
+        assertTrue(not refusedInChild("testProductsRefuseDimensionsThatDoNotFit", "matvecXOfTwo", "Mirco.Compute: the"), "matvec of 2 by 3 and an x of 2 does not reach the body");
+        assertTrue(refusedByRequiresOf("testProductsRefuseDimensionsThatDoNotFit", "matmulInnerApart", " of Mirco.Compute.matmul ("), "matmul of 2 by 3 and 2 by 3 is refused by the requires");
+        assertTrue(not refusedInChild("testProductsRefuseDimensionsThatDoNotFit", "matmulInnerApart", "Mirco.Compute: the"), "matmul of 2 by 3 and 2 by 3 does not reach the body");
+        assertTrue(refusedByRequiresOf("testProductsRefuseDimensionsThatDoNotFit", "gemmCOfOtherRows", " of Mirco.Compute.gemm ("), "gemm into a c of 3 by 2 for a product of 2 by 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testProductsRefuseDimensionsThatDoNotFit", "gemmCOfOtherColumns", " of Mirco.Compute.gemm ("), "gemm into a c of 2 by 3 for a product of 2 by 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testProductsRefuseDimensionsThatDoNotFit", "gemmInnerApart", " of Mirco.Compute.gemm ("), "gemm of 2 by 3 and 2 by 2 is refused by the requires");
+        assertTrue(not refusedInChild("testProductsRefuseDimensionsThatDoNotFit", "fits", "Mirco.Compute"), "fitting products are taken");
+        assertTrue(not refusedInChild("testProductsRefuseDimensionsThatDoNotFit", "fits", "contract violated"), "fitting products break no contract");
+        return nil;
+    end;
+
+    -- dot of two vectors of another length, sumAxis along an axis past the
+    -- rank and transpose of a vector, each call in a child of its own, must
+    -- stop with the message of a violated requires; the fitting calls are
+    -- taken.
+    function testDotSumAxisTransposeRefuseWhatDoesNotFit(): Unit is
+        if asChild("dotOfThreeAndTwo") then
+            let x: NdArray[Float64] := filledWithOne(3);
+            let y: NdArray[Float64] := filledWithOne(2);
+            let d: Float64 := dot(&x, &y);
+            destroyNdArray(y);
+            destroyNdArray(x);
+            return nil;
+        end if;
+        if asChild("dotOfAMatrix") then
+            let m: NdArray[Float64] := rising(1, 3);
+            let x: NdArray[Float64] := filledWithOne(3);
+            let d: Float64 := dot(&m, &x);
+            destroyNdArray(x);
+            destroyNdArray(m);
+            return nil;
+        end if;
+        if asChild("sumAxisPastTheRank") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let s: NdArray[Int64] := sumAxis(&a, 2);
+            destroyNdArray(s);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        if asChild("transposeOfAVector") then
+            let x: NdArray[Float64] := filledWithOne(3);
+            let t: NdArray[Float64] := transpose(&x);
+            destroyNdArray(t);
+            destroyNdArray(x);
+            return nil;
+        end if;
+        if asChild("fits") then
+            let x: NdArray[Float64] := filledWithOne(3);
+            let y: NdArray[Float64] := filledWithOne(3);
+            let d: Float64 := dot(&x, &y);
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let s: NdArray[Int64] := sumAxis(&a, 1);
+            let t: NdArray[Int64] := transpose(&a);
+            destroyNdArray(t);
+            destroyNdArray(s);
+            destroyNdArray(a);
+            destroyNdArray(y);
+            destroyNdArray(x);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testDotSumAxisTransposeRefuseWhatDoesNotFit", "dotOfThreeAndTwo", " of Mirco.Compute.dot ("), "dot of a vector of 3 and one of 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testDotSumAxisTransposeRefuseWhatDoesNotFit", "dotOfAMatrix", " of Mirco.Compute.dot ("), "dot of a 1 by 3 matrix and a vector of 3 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testDotSumAxisTransposeRefuseWhatDoesNotFit", "sumAxisPastTheRank", " of Mirco.Compute.sumAxis ("), "sumAxis along axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testDotSumAxisTransposeRefuseWhatDoesNotFit", "transposeOfAVector", " of Mirco.Compute.transpose ("), "transpose of a vector is refused by the requires");
+        assertTrue(not refusedInChild("testDotSumAxisTransposeRefuseWhatDoesNotFit", "fits", "Mirco"), "dot of 3 and 3, sumAxis along axis 1 and transpose of 2 by 3 are taken");
+        assertTrue(not refusedInChild("testDotSumAxisTransposeRefuseWhatDoesNotFit", "fits", "contract violated"), "dot of 3 and 3, sumAxis along axis 1 and transpose of 2 by 3 break no contract");
+        return nil;
+    end;
+
+    function testMatvecGemvGemm(): Unit is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 3);
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.0);
+        insertBack(&!values, 2.0);
+        insertBack(&!values, 3.0);
+        insertBack(&!values, 4.0);
+        insertBack(&!values, 5.0);
+        insertBack(&!values, 6.0);
+        let m: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        let x: NdArray[Float64] := vector(1.0, 1.0, 1.0);
+        let mx: NdArray[Float64] := matvec(&m, &x);
+        assertTrue(flatGet(&mx, 0) = 6.0, "1 + 2 + 3");
+        assertTrue(flatGet(&mx, 1) = 15.0, "4 + 5 + 6");
+        var y: NdArray[Float64] := multiplyScalar(&mx, 1.0);
+        gemv(2.0, &m, &x, 0.5, &!y);
+        assertTrue(flatGet(&y, 0) = 15.0, "2 * 6 + 0.5 * 6");
+        assertTrue(flatGet(&y, 1) = 37.5, "2 * 15 + 0.5 * 15");
+        let mt: NdArray[Float64] := transposeOf(&m);
+        var c: NdArray[Float64] := matmulOf(&m, &mt);
+        gemm(1.0, &m, &mt, 1.0, &!c);
+        assertTrue(flatGet(&c, 0) = 28.0, "2 * (1 + 4 + 9)");
+        assertTrue(flatGet(&c, 3) = 154.0, "2 * (16 + 25 + 36)");
+        destroyNdArray(c);
+        destroyNdArray(mt);
+        destroyNdArray(y);
+        destroyNdArray(mx);
+        destroyNdArray(x);
+        destroyNdArray(m);
+        destroyFree(shape);
+        destroyFree(values);
+        return nil;
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region]
+    function transposeOf(a: &[NdArray[T], R]): NdArray[T] is
+        return transpose(a);
+    end;
+
+    generic [T: Free(Element, Numeric), R: Region, S: Region]
+    function matmulOf(a: &[NdArray[T], R], b: &[NdArray[T], S]): NdArray[T] is
+        return matmul(a, b);
+    end;
+
+    -- The values as an array of shape rows by cols, in row-major order.
+    generic [T: Free(Element), R: Region]
+    function shaped(rows: Index, cols: Index, values: &[Buffer[T], R]): NdArray[T] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        let made: NdArray[T] := fromSpan(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    -- Whether the three elements of a are x, y and z exactly.
+    generic [T: Free(Element, Numeric), R: Region]
+    function threeAre(a: &[NdArray[T], R], x: T, y: T, z: T): Bool is
+        if (rank(a) /= 1) or (count(a) /= 3) then
+            return false;
+        end if;
+        return (flatGet(a, 0) = x) and (flatGet(a, 1) = y) and (flatGet(a, 2) = z);
+    end;
+
+    -- Whether the two elements of a are x and y exactly.
+    generic [T: Free(Element, Numeric), R: Region]
+    function twoAre(a: &[NdArray[T], R], x: T, y: T): Bool is
+        if (rank(a) /= 1) or (count(a) /= 2) then
+            return false;
+        end if;
+        return (flatGet(a, 0) = x) and (flatGet(a, 1) = y);
+    end;
+
+    -- The tolerance of the floating point vectors, relative to the value
+    -- worked out by hand: 1e-12 for Float64, whose step at 1 is 2.2e-16,
+    -- and 1e-6 for Float32, whose step at 1 is 1.2e-7; each vector takes
+    -- fewer than ten roundings, so the tolerances hold with room to spare.
+    function near64(x: Float64, expected: Float64): Bool is
+        var diff: Float64 := x - expected;
+        if diff < 0.0 then
+            diff := 0.0 - diff;
+        end if;
+        var size: Float64 := expected;
+        if size < 0.0 then
+            size := 0.0 - size;
+        end if;
+        return diff <= (1.0e-12 * size);
+    end;
+
+    function near32(x: Float32, expected: Float32): Bool is
+        var diff: Float32 := x - expected;
+        if diff < 0.0 then
+            diff := 0.0 - diff;
+        end if;
+        var size: Float32 := expected;
+        if size < 0.0 then
+            size := 0.0 - size;
+        end if;
+        return diff <= (1.0e-6 * size);
+    end;
+
+    -- The reductions along each axis of 1 2 3 over 4 5 6, worked out by hand.
+    function testAxisReductions(): Unit is
+        let a: NdArray[Int64] := counting(2, 3, 1);
+        let p0: NdArray[Int64] := productAxis(&a, 0);
+        let p1: NdArray[Int64] := productAxis(&a, 1);
+        let lo0: NdArray[Int64] := minimumAxis(&a, 0);
+        let lo1: NdArray[Int64] := minimumAxis(&a, 1);
+        let hi0: NdArray[Int64] := maximumAxis(&a, 0);
+        let hi1: NdArray[Int64] := maximumAxis(&a, 1);
+        let m0: NdArray[Int64] := meanAxis(&a, 0);
+        let m1: NdArray[Int64] := meanAxis(&a, 1);
+        assertTrue(threeAre(&p0, 4, 10, 18), "the column products 1 * 4, 2 * 5, 3 * 6");
+        assertTrue(twoAre(&p1, 6, 120), "the row products 1 * 2 * 3 and 4 * 5 * 6");
+        assertTrue(threeAre(&lo0, 1, 2, 3), "the smallest of each column");
+        assertTrue(twoAre(&lo1, 1, 4), "the smallest of each row");
+        assertTrue(threeAre(&hi0, 4, 5, 6), "the largest of each column");
+        assertTrue(twoAre(&hi1, 3, 6), "the largest of each row");
+        assertTrue(threeAre(&m0, 2, 3, 4), "the column means 5 / 2, 7 / 2, 9 / 2 rounded towards zero");
+        assertTrue(twoAre(&m1, 2, 5), "the row means 6 / 3 and 15 / 3");
+        let v: NdArray[Int64] := counting(1, 4, 1);
+        let flat: NdArray[Int64] := sumAxis(&v, 0);
+        let row: NdArray[Int64] := productAxis(&flat, 0);
+        assertTrue((rank(&row) = 1) and (count(&row) = 1) and (flatGet(&row, 0) = 24), "a vector reduces to the shape 1, 1 * 2 * 3 * 4");
+        destroyNdArray(row);
+        destroyNdArray(flat);
+        destroyNdArray(v);
+        destroyNdArray(m1);
+        destroyNdArray(m0);
+        destroyNdArray(hi1);
+        destroyNdArray(hi0);
+        destroyNdArray(lo1);
+        destroyNdArray(lo0);
+        destroyNdArray(p1);
+        destroyNdArray(p0);
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- Along an axis, as over the whole array, a NaN is passed over by the
+    -- smallest and the largest unless every element is one.
+    function testAxisNaNPassedOver(): Unit is
+        let nan: Float64 := float64FromBits(9221120237041090560);
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, nan);
+        insertBack(&!values, nan);
+        insertBack(&!values, 2.0);
+        insertBack(&!values, nan);
+        let a: NdArray[Float64] := shaped(2, 2, &values);
+        let lo: NdArray[Float64] := minimumAxis(&a, 0);
+        let hi: NdArray[Float64] := maximumAxis(&a, 1);
+        assertTrue(flatGet(&lo, 0) = 2.0, "the column of a NaN and 2 gives 2");
+        assertTrue(flatGet(&lo, 1) /= flatGet(&lo, 1), "a column of NaN alone gives a NaN");
+        assertTrue(flatGet(&hi, 1) = 2.0, "the row of 2 and a NaN gives 2");
+        assertTrue(combineValues(nan, 1.0, reductionMinimum()) = 1.0, "combine passes a NaN over in its first");
+        assertTrue(combineValues(1.0, nan, reductionMaximum()) = 1.0, "combine passes a NaN over in its second");
+        destroyNdArray(hi);
+        destroyNdArray(lo);
+        destroyNdArray(a);
+        destroyFree(values);
+        return nil;
+    end;
+
+    -- The rows 1 2 3 and 4 5 6 reduced apart and joined by combine give what
+    -- the reduction of the whole gives, for every reduction and the mean.
+    function testCombineJoinsPartialResults(): Unit is
+        let whole: NdArray[Int64] := counting(2, 3, 1);
+        let top: NdArray[Int64] := counting(1, 3, 1);
+        let bottom: NdArray[Int64] := counting(1, 3, 4);
+        let top_sum: NdArray[Int64] := sumAxis(&top, 0);
+        let bottom_sum: NdArray[Int64] := sumAxis(&bottom, 0);
+        let top_product: NdArray[Int64] := productAxis(&top, 0);
+        let bottom_product: NdArray[Int64] := productAxis(&bottom, 0);
+        let top_low: NdArray[Int64] := minimumAxis(&top, 0);
+        let bottom_low: NdArray[Int64] := minimumAxis(&bottom, 0);
+        let top_high: NdArray[Int64] := maximumAxis(&top, 0);
+        let bottom_high: NdArray[Int64] := maximumAxis(&bottom, 0);
+        case combine(&top_sum, &bottom_sum, reductionSum()) of
+            when Some(value as joined: NdArray[Int64]) do
+                assertTrue(threeAre(&joined, 5, 7, 9), "the joined sums are the column sums");
+                let means: NdArray[Int64] := meanOfSums(&joined, 2);
+                let direct: NdArray[Int64] := meanAxis(&whole, 0);
+                assertTrue(threeAre(&means, flatGet(&direct, 0), flatGet(&direct, 1), flatGet(&direct, 2)), "the mean of the joined sums is the column mean");
+                destroyNdArray(direct);
+                destroyNdArray(means);
+                destroyNdArray(joined);
+            when None do
+                assertTrue(false, "two sums of shape 3 joined");
+        end case;
+        case combine(&top_product, &bottom_product, reductionProduct()) of
+            when Some(value as joined: NdArray[Int64]) do
+                assertTrue(threeAre(&joined, 4, 10, 18), "the joined products are the column products");
+                destroyNdArray(joined);
+            when None do
+                assertTrue(false, "two products of shape 3 joined");
+        end case;
+        case combine(&top_low, &bottom_low, reductionMinimum()) of
+            when Some(value as joined: NdArray[Int64]) do
+                assertTrue(threeAre(&joined, 1, 2, 3), "the joined smallest are those of the columns");
+                destroyNdArray(joined);
+            when None do
+                assertTrue(false, "two minima of shape 3 joined");
+        end case;
+        case combine(&top_high, &bottom_high, reductionMaximum()) of
+            when Some(value as joined: NdArray[Int64]) do
+                assertTrue(threeAre(&joined, 4, 5, 6), "the joined largest are those of the columns");
+                destroyNdArray(joined);
+            when None do
+                assertTrue(false, "two maxima of shape 3 joined");
+        end case;
+        assertTrue(combineValues(sum(&top), sum(&bottom), reductionSum()) = sum(&whole), "6 + 15 is the sum 21 of the whole");
+        assertTrue(combineValues(product(&top), product(&bottom), reductionProduct()) = product(&whole), "6 * 120 is the product 720 of the whole");
+        assertTrue(combineValues(minimum(&bottom), minimum(&top), reductionMinimum()) = minimum(&whole), "the smaller of 4 and 1");
+        assertTrue(combineValues(maximum(&top), maximum(&bottom), reductionMaximum()) = maximum(&whole), "the larger of 3 and 6");
+        case combine(&whole, &top_sum, reductionSum()) of
+            when Some(value as joined: NdArray[Int64]) do
+                destroyNdArray(joined);
+                assertTrue(false, "2 by 3 and 3 are not joined");
+            when None do
+                assertTrue(true, "2 by 3 and 3 are not joined, nothing is broadcast");
+        end case;
+        destroyNdArray(bottom_high);
+        destroyNdArray(top_high);
+        destroyNdArray(bottom_low);
+        destroyNdArray(top_low);
+        destroyNdArray(bottom_product);
+        destroyNdArray(top_product);
+        destroyNdArray(bottom_sum);
+        destroyNdArray(top_sum);
+        destroyNdArray(bottom);
+        destroyNdArray(top);
+        destroyNdArray(whole);
+        return nil;
+    end;
+
+    -- Int32 through the reductions, the axes and the products; exact.
+    function testInt32(): Unit is
+        var values: Buffer[Int32] := allocateEmpty();
+        insertBack(&!values, 1);
+        insertBack(&!values, -2);
+        insertBack(&!values, 3);
+        insertBack(&!values, 4);
+        let a: NdArray[Int32] := shaped(2, 2, &values);
+        assertTrue(sum(&a) = 6, "1 - 2 + 3 + 4");
+        assertTrue(product(&a) = -24, "1 * -2 * 3 * 4");
+        assertTrue((minimum(&a) = -2) and (maximum(&a) = 4), "-2 and 4");
+        let cols: NdArray[Int32] := sumAxis(&a, 0);
+        assertTrue(twoAre(&cols, 4, 2), "the column sums 1 + 3 and -2 + 4");
+        let rows: NdArray[Int32] := meanAxis(&a, 1);
+        assertTrue(twoAre(&rows, 0, 3), "the row means -1 / 2 and 7 / 2 rounded towards zero");
+        let sq: NdArray[Int32] := matmulOf(&a, &a);
+        assertTrue((flatGet(&sq, 0) = -5) and (flatGet(&sq, 1) = -10) and (flatGet(&sq, 2) = 15) and (flatGet(&sq, 3) = 10), "the square of 1 -2 over 3 4");
+        destroyNdArray(sq);
+        destroyNdArray(rows);
+        destroyNdArray(cols);
+        destroyNdArray(a);
+        destroyFree(values);
+        return nil;
+    end;
+
+    -- Float32 and Float64 vectors whose decimals have no exact binary form,
+    -- held to the tolerance of near32 and near64.
+    function testFloatVectorsWithinTolerance(): Unit is
+        var small: Buffer[Float32] := allocateEmpty();
+        insertBack(&!small, 0.1);
+        insertBack(&!small, 0.2);
+        insertBack(&!small, 0.3);
+        insertBack(&!small, 0.4);
+        let a: NdArray[Float32] := shaped(2, 2, &small);
+        assertTrue(near32(sum(&a), 1.0), "0.1 + 0.2 + 0.3 + 0.4 is 1 in Float32");
+        assertTrue(near32(mean(&a), 0.25), "the mean is 0.25 in Float32");
+        let cols: NdArray[Float32] := meanAxis(&a, 0);
+        assertTrue(near32(flatGet(&cols, 0), 0.2) and near32(flatGet(&cols, 1), 0.3), "the column means 0.2 and 0.3 in Float32");
+        let rows: NdArray[Float32] := productAxis(&a, 1);
+        assertTrue(near32(flatGet(&rows, 0), 0.02) and near32(flatGet(&rows, 1), 0.12), "the row products 0.02 and 0.12 in Float32");
+        let sq: NdArray[Float32] := matmulOf(&a, &a);
+        assertTrue(near32(flatGet(&sq, 0), 0.07) and near32(flatGet(&sq, 3), 0.22), "the square of 0.1 0.2 over 0.3 0.4 in Float32");
+        let x: NdArray[Float64] := vector(0.1, 0.2, 0.3);
+        let ones: NdArray[Float64] := vector(1.0, 1.0, 1.0);
+        assertTrue(near64(dot(&x, &ones), 0.6), "0.1 + 0.2 + 0.3 is 0.6 in Float64");
+        assertTrue(dot(&x, &ones) /= 0.6, "and is not 0.6 exactly, so the tolerance is needed");
+        assertTrue(near64(dot(&x, &x), 0.14), "0.01 + 0.04 + 0.09 is 0.14 in Float64");
+        let means: NdArray[Float64] := meanAxis(&x, 0);
+        assertTrue(near64(flatGet(&means, 0), 0.2), "the mean of 0.1, 0.2 and 0.3 is 0.2 in Float64");
+        destroyNdArray(means);
+        destroyNdArray(ones);
+        destroyNdArray(x);
+        destroyNdArray(sq);
+        destroyNdArray(rows);
+        destroyNdArray(cols);
+        destroyNdArray(a);
+        destroyFree(small);
+        return nil;
+    end;
+
+    -- The new reductions along an axis past the rank, combine with an
+    -- unknown reduction and meanOfSums over no element, each in a child of
+    -- its own, must stop with the message of a violated requires.
+    function testAxisReductionsAndCombineRefuse(): Unit is
+        if asChild("productAxisPastTheRank") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let s: NdArray[Int64] := productAxis(&a, 2);
+            destroyNdArray(s);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        if asChild("minimumAxisPastTheRank") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let s: NdArray[Int64] := minimumAxis(&a, 2);
+            destroyNdArray(s);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        if asChild("maximumAxisPastTheRank") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let s: NdArray[Int64] := maximumAxis(&a, 2);
+            destroyNdArray(s);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        if asChild("meanAxisPastTheRank") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let s: NdArray[Int64] := meanAxis(&a, 2);
+            destroyNdArray(s);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        if asChild("combineOfReduction5") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            case combine(&a, &a, 5) of
+                when Some(value as joined: NdArray[Int64]) do
+                    destroyNdArray(joined);
+                when None do
+                    assertTrue(false, "the same shape");
+            end case;
+            destroyNdArray(a);
+            return nil;
+        end if;
+        if asChild("combineValuesOfReduction0") then
+            let x: Int64 := combineValues(1, 2, 0);
+            return nil;
+        end if;
+        if asChild("meanOfNoElement") then
+            let a: NdArray[Int64] := counting(2, 3, 1);
+            let m: NdArray[Int64] := meanOfSums(&a, 0);
+            destroyNdArray(m);
+            destroyNdArray(a);
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "productAxisPastTheRank", " of Mirco.Compute.productAxis ("), "productAxis along axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "minimumAxisPastTheRank", " of Mirco.Compute.minimumAxis ("), "minimumAxis along axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "maximumAxisPastTheRank", " of Mirco.Compute.maximumAxis ("), "maximumAxis along axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "meanAxisPastTheRank", " of Mirco.Compute.meanAxis ("), "meanAxis along axis 2 of rank 2 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "combineOfReduction5", " of Mirco.Compute.combine ("), "combine with the reduction 5 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "combineValuesOfReduction0", " of Mirco.Compute.combineValues ("), "combineValues with the reduction 0 is refused by the requires");
+        assertTrue(refusedByRequiresOf("testAxisReductionsAndCombineRefuse", "meanOfNoElement", " of Mirco.Compute.meanOfSums ("), "meanOfSums over a total of 0 is refused by the requires");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,17 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A time divided by a length named a velocity: the compiler must refuse
+-- it.  The gate checks that hilde check fails on this file.
+import Mirco.Units (MeterPerSecond, Quantity, velocity, meters, seconds);
+
+module body Example.WrongVelocity is
+    function main(): ExitCode is
+        let v: Quantity[MeterPerSecond] := velocity(seconds(2.0), meters(1.0));
+        return ExitSuccess();
+    end;
+end module body.

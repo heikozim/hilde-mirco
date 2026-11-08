@@ -1,0 +1,140 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    destroyFree,
+    length,
+    insertBack,
+    nth,
+    getSpan,
+    wholeSpan
+);
+import Standard.String (String, asSpan, destroyString);
+import Standard.SperliCollective (combine as combineBytes);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, count, dimension, dtypeCode, shapeOf);
+import Mirco.Wire (WireError, headerLength, encode as wireEncode, decode as wireDecode);
+
+module body Mirco.Sperli is
+    function sperliCode(code: Nat8): Nat8 is
+        if code = 1 then
+            return 6;
+        else if code = 2 then
+            return 5;
+        else if code = 3 then
+            return 2;
+        else if code = 4 then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    generic [T: Free(Element), R: Region, S: Region]
+    function encode(array: &[NdArray[T], R], out: &![Buffer[Nat8], S]): Index is
+        let bytes: Buffer[Nat8] := wireEncode(array);
+        let written: Index := length(&bytes);
+        var at: Index := 0;
+        while at < written do
+            insertBack(&~out, nth(&bytes, at));
+            at := at + 1;
+        end while;
+        destroyFree(bytes);
+        return written;
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function decode(bytes: Span[Nat8, R]): Either[WireError, NdArray[T]] is
+        return wireDecode(bytes);
+    end;
+
+    generic [T: Free(Element), R: Region]
+    function elementType(array: &[NdArray[T], R]): Nat8 is
+        return sperliCode(dtypeCode(array));
+    end;
+
+    generic [T: Free, R: Region]
+    function shape(array: &[NdArray[T], R]): Span[Index, R] is
+        return shapeOf(array);
+    end;
+
+    generic [T: Free, R: Region, S: Region]
+    function sameShape(first: &[NdArray[T], R], second: &[NdArray[T], S]): Bool is
+        if rank(first) /= rank(second) then
+            return false;
+        end if;
+        var axis: Index := 0;
+        while axis < rank(first) do
+            if dimension(first, axis) /= dimension(second, axis) then
+                return false;
+            end if;
+            axis := axis + 1;
+        end while;
+        return true;
+    end;
+
+    generic [Q: Region, R: Region]
+    function appendAll(bytes: Span[Nat8, Q], out: &![Buffer[Nat8], R]): Unit is
+        var at: Index := 0;
+        while at < spanLength(bytes) do
+            insertBack(&~out, bytes[at]);
+            at := at + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [T: Free(Element)]
+    function refused(why: CombineError): Either[CombineError, NdArray[T]] is
+        let refusal: Either[CombineError, NdArray[T]] := Left(left => why);
+        return refusal;
+    end;
+
+    -- Both arrays are encoded; the bytes behind the header of each are the
+    -- elements in row-major order, which Sperli reduces as flat arrays.  The
+    -- result is the header of first and the reduced bytes, read back by the
+    -- decoder of Mirco.Wire, so that it checks every element once more.
+    generic [T: Free(Element), R: Region, S: Region]
+    function combine(first: &[NdArray[T], R], second: &[NdArray[T], S], reduction: Nat8): Either[CombineError, NdArray[T]] is
+        if not sameShape(first, second) then
+            return refused(OtherShape());
+        end if;
+        let first_bytes: Buffer[Nat8] := wireEncode(first);
+        let second_bytes: Buffer[Nat8] := wireEncode(second);
+        let header: Index := headerLength(rank(first));
+        let total: Index := length(&first_bytes);
+        if (total <= header) or (length(&second_bytes) /= total) then
+            abort("Mirco.Sperli: two arrays of one shape whose bytes differ in length");
+        end if;
+        let reduced: Either[Int32, String] := combineBytes(sperliCode(dtypeCode(first)), reduction, getSpan(&first_bytes, header, total - 1), getSpan(&second_bytes, header, total - 1));
+        destroyFree(second_bytes);
+        case reduced of
+            when Left(left as code: Int32) do
+                destroyFree(first_bytes);
+                return refused(NotCombined());
+            when Right(right as values: String) do
+                var out: Buffer[Nat8] := allocateEmpty();
+                var at: Index := 0;
+                while at < header do
+                    insertBack(&!out, nth(&first_bytes, at));
+                    at := at + 1;
+                end while;
+                destroyFree(first_bytes);
+                appendAll(asSpan(&values), &!out);
+                destroyString(values);
+                let back: Either[WireError, NdArray[T]] := wireDecode(wholeSpan(&out));
+                destroyFree(out);
+                case back of
+                    when Left(left as why: WireError) do
+                        return refused(NotCombined());
+                    when Right(right as made: NdArray[T]) do
+                        let combined: Either[CombineError, NdArray[T]] := Right(right => made);
+                        return combined;
+                end case;
+        end case;
+    end;
+end module body.

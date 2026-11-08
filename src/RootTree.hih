@@ -1,0 +1,276 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Reads the streamer information of a .root file and the simple branches of its trees into arrays.
+
+- The streamer information names each class of the file with its version, checksum and members.
+- A tree of class version 19 or 20 with branches of class version 12 or 13 is read, as Root 6 writes them.
+- A branch is read when it has one leaf of numbers: one per entry, a fixed count per entry, or a count another branch holds.
+- The members of an object split into branches are read with the streamer information: numbers, arrays, std::vector and std::string.
+- Integer leaves become Int64, float leaves Float32 and double leaves Float64; nothing else is converted.
+- A range of entries can be read alone, so ranks of Sperli read a share each.
+- Every offset is checked against the bytes; a malformed tree gives a RootError, never an abort.
+
+    case readTree(bytes, key, 16777216) of
+        when Right(right as tree: Tree) do
+            destroyTree(tree);
+        when Left(left as error: RootError) do
+            skip;
+    end case;
+"""
+import Standard.Buffer (Buffer);
+import Standard.String (String);
+import Mirco.Array (NdArray);
+import Mirco.Root (RootError, RootHeader, RootKey);
+
+module Mirco.RootTree is
+    """
+    The classes of the streamer information of a file and their members.
+    """
+    type Streamers: Linear;
+
+    """
+    The streamer information of the file, the list of TStreamerInfo the header names; refused above limit
+    bytes unpacked.
+    No contract: no precondition, since a header, bytes or a limit that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readStreamers(bytes: Span[Nat8, R], header: RootHeader, limit: Index): Either[RootError, Streamers];
+
+    """
+    Gives the streamer information back.
+    No contract: a destroy function.
+    """
+    function destroyStreamers(s: Streamers): Unit;
+
+    """
+    The count of classes the streamer information describes.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function classCount(s: &[Streamers, R]): Index;
+
+    """
+    The name of the class at i.
+    """
+    generic [R: Region]
+    function classNameOf(s: &[Streamers, R], i: Index): String
+        requires i < classCount(s);
+
+    """
+    The version of the class at i.
+    """
+    generic [R: Region]
+    function classVersion(s: &[Streamers, R], i: Index): Int64
+        requires i < classCount(s);
+
+    """
+    The checksum of the class at i.
+    """
+    generic [R: Region]
+    function classChecksum(s: &[Streamers, R], i: Index): Nat64
+        requires i < classCount(s);
+
+    """
+    The count of members of the class at i, its bases among them.
+    """
+    generic [R: Region]
+    function memberCount(s: &[Streamers, R], i: Index): Index
+        requires i < classCount(s);
+
+    """
+    The name of member j of the class at i.
+    The requires bounds i; j < memberCount(s, i) is a precondition as well, held by the body, which stops the
+    programme before it reads a member past the last.
+    No contract: the bound of j cannot be a requires, since memberCount reaches C (memberCount -> classAt -> Standard.Buffer.nth -> Hilde.Array.arrayNth -> Hilde.Memory.load -> @embed) (H3098).
+    """
+    generic [R: Region]
+    function memberName(s: &[Streamers, R], i: Index, j: Index): String
+        requires i < classCount(s);
+
+    """
+    The name of the type of member j of the class at i, such as Long64_t or TObjArray.
+    The requires bounds i; the body holds j < memberCount(s, i) as for memberName.
+    No contract: the bound of j cannot be a requires, since memberCount reaches C, the chain of memberName (H3098).
+    """
+    generic [R: Region]
+    function memberTypeName(s: &[Streamers, R], i: Index, j: Index): String
+        requires i < classCount(s);
+
+    """
+    The code of the type of member j of the class at i, as Root numbers them: 3 for an int, 16 for a
+    Long64_t, 0 or 67 for a base class.
+    The requires bounds i; the body holds j < memberCount(s, i) as for memberName.
+    No contract: the bound of j cannot be a requires, since memberCount reaches C, the chain of memberName (H3098).
+    """
+    generic [R: Region]
+    function memberType(s: &[Streamers, R], i: Index, j: Index): Int64
+        requires i < classCount(s);
+
+    """
+    The branches of a tree and where their baskets are.
+    """
+    type Tree: Linear;
+
+    """
+    The tree the key of class TTree holds; refused above limit bytes unpacked, and for a class version of
+    the tree or a branch other than those of the head of this module.
+    No contract: no precondition, since a key, bytes or a limit that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region]
+    function readTree(bytes: Span[Nat8, R], key: RootKey, limit: Index): Either[RootError, Tree];
+
+    """
+    The tree as readTree reads it, with the members of a class split into branches typed by the streamer
+    information s of the same file: numbers, fixed arrays, arrays counted by another member, std::vector of
+    numbers and std::string become readable by branchInt64, branchFloat32, branchFloat64, branchOffsets and
+    branchStrings. A member s does not describe stays unreadable.
+    No contract: no precondition, since a key, bytes or a limit that do not fit give a RootError, never a stop.
+    """
+    generic [R: Region, S: Region]
+    function readTreeWith(file: Span[Nat8, R], key: RootKey, s: &[Streamers, S], limit: Index): Either[RootError, Tree];
+
+    """
+    Gives the tree back.
+    No contract: a destroy function.
+    """
+    function destroyTree(tree: Tree): Unit;
+
+    """
+    The count of entries of the tree.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function treeEntries(tree: &[Tree, R]): Index;
+
+    """
+    The tree cut down to count entries from first on: every reader of a branch then gives the values of those
+    entries only, counted from 0 again, and unpacks only the baskets that hold some of them. A range past the
+    last entry is cut at it, and a cut tree can be cut again. A rank of Sperli reads its share with rankFirst
+    and rankCount of Mirco.RNTuple over treeEntries.
+    No contract: a condition cannot borrow the linear tree it is given, so the body cuts the range instead.
+    """
+    function narrowEntries(tree: Tree, first: Index, count: Index): Tree
+        ensures treeEntries(&result) <= count;
+
+    """
+    The count of clusters of the tree that hold some of its entries, as Root iterates them: the ranges of
+    fClusterRangeEnd and fClusterSize, then clusters of fAutoFlush entries. A tree whose fAutoFlush is 0 or
+    below past its ranges, for which Root guesses a size from the bytes, holds the rest as one cluster.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function treeClusterCount(tree: &[Tree, R]): Index;
+
+    """
+    The entry, counted from the start of the tree, where its cluster c begins; 0 for the first.
+    """
+    generic [R: Region]
+    function treeClusterFirst(tree: &[Tree, R], c: Index): Index
+        requires c < treeClusterCount(tree);
+
+    """
+    Whether a basket of every branch with baskets begins where each cluster of the tree begins, so that ranks
+    cutting at clusters with narrowTreeClusters unpack no basket twice. False when a writer cut its baskets
+    elsewhere; a branch of no baskets, such as the owner of split members, is passed over.
+    No contract: the answer is the work of the file.
+    """
+    generic [R: Region]
+    function treeClustersAligned(tree: &[Tree, R]): Bool;
+
+    """
+    The tree cut down to count clusters from first on, as narrowEntries cuts it at their first and last entries,
+    so that ranks of Sperli that each take clusters share no basket that a cluster holds whole. A range past the
+    last cluster is cut at it.
+    No contract: a condition cannot borrow the linear tree it is given, so the body cuts the range instead.
+    """
+    function narrowTreeClusters(tree: Tree, first: Index, count: Index): Tree
+        ensures treeClusterCount(&result) <= count;
+
+    """
+    The count of branches at the top of the tree.
+    No contract: every Index is a possible count.
+    """
+    generic [R: Region]
+    function branchCount(tree: &[Tree, R]): Index;
+
+    """
+    The name of the branch at i.
+    """
+    generic [R: Region]
+    function branchName(tree: &[Tree, R], i: Index): String
+        requires i < branchCount(tree);
+
+    """
+    The kind of the leaf of the branch at i: the last letter of its class, such as I for TLeafI and D for
+    TLeafD, as a byte; 0 when the branch has not exactly one leaf.
+    """
+    generic [R: Region]
+    function leafKind(tree: &[Tree, R], i: Index): Nat8
+        requires i < branchCount(tree);
+
+    """
+    The count of numbers each entry of the branch at i holds: 1, or the length of its fixed array.
+    """
+    generic [R: Region]
+    function leafLength(tree: &[Tree, R], i: Index): Index
+        requires i < branchCount(tree);
+
+    """
+    true when the leaf of the branch at i holds unsigned numbers.
+    """
+    generic [R: Region]
+    function leafUnsigned(tree: &[Tree, R], i: Index): Bool
+        requires i < branchCount(tree);
+
+    """
+    The integers of the branch at i: a vector of one for each entry, a matrix of the entries by the
+    fixed length, or for a counted leaf the vector of all its numbers, which branchOffsets cuts into
+    entries; refused for a leaf of floating point numbers or an unsigned number above the largest Int64.
+    """
+    generic [R: Region, S: Region]
+    function branchInt64(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]]
+        requires i < branchCount(tree);
+
+    """
+    The numbers of the branch at i whose leaf is a TLeafD, shaped as branchInt64 shapes them.
+    """
+    generic [R: Region, S: Region]
+    function branchFloat64(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Float64]]
+        requires i < branchCount(tree);
+
+    """
+    The numbers of the branch at i whose leaf is a TLeafF, shaped as branchInt64 shapes them.
+    """
+    generic [R: Region, S: Region]
+    function branchFloat32(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Float32]]
+        requires i < branchCount(tree);
+
+    """
+    Where the numbers of each entry of the branch at i begin in the vector branchInt64, branchFloat32 or
+    branchFloat64 gives: one offset more than there are entries, the first 0 and the last the count of
+    numbers. For a leaf that is not counted they are the multiples of its fixed length.
+    """
+    generic [R: Region, S: Region]
+    function branchOffsets(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]]
+        requires i < branchCount(tree);
+
+    """
+    The texts of the branch at i whose leaf is a TLeafC, one for each entry; refused for any other leaf.
+    destroyBranchStrings gives them back.
+    """
+    generic [R: Region, S: Region]
+    function branchStrings(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, Buffer[String]]
+        requires i < branchCount(tree);
+
+    """
+    Gives back the texts branchStrings made.
+    No contract: a destroy function.
+    """
+    function destroyBranchStrings(strings: Buffer[String]): Unit;
+end module.

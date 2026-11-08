@@ -1,0 +1,144 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Each function is one call of libnetcdf against netcdf.h.  netCDF wants
+-- names that end in a zero byte, so a name is copied into memory of its
+-- length and one byte more.  Every out span is checked to have room before
+-- netCDF writes into it.
+pragma Unsafe_Module;
+pragma Foreign_Library(Name => "netcdf");
+pragma Foreign_Header(Name => "netcdf.h");
+pragma Foreign_Header(Name => "string.h");
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocateBuffer,
+    deallocate
+);
+
+module body Mirco.Bindings.NetCdf is
+    generic [R: Region]
+    function zeroFree(text: Span[Nat8, R]): Bool is
+        var at: Index := 0;
+        while at < spanLength(text) do
+            if text[at] = 0 then
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function zeroEnded(text: Span[Nat8, R]): Pointer[Nat8] is
+        let address: Address[Nat8] := allocateBuffer(spanLength(text) + 1);
+        case nullCheck(address) of
+            when Some(value as bytes: Pointer[Nat8]) do
+                let copied: Unit := @embed(Unit, "(memcpy((void*) $1, (const void*) $2.data, $2.size), ((uint8_t*) $1)[$2.size] = 0, (hilde_unit_t) 0)", bytes, text);
+                return bytes;
+            when None do
+                abort("Mirco.Bindings.NetCdf: no memory for a name");
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function create(path: Span[Nat8, R], out: Span![Int32, S]): Int32 is
+        let name: Pointer[Nat8] := zeroEnded(path);
+        let status: Int32 := @embed(Int32, "(int32_t) ($2.size < 1 ? NC_EINVAL : nc_create((const char*) $1, NC_CLOBBER | NC_NETCDF4, (int*) $2.data))", name, out);
+        deallocate(name);
+        return status;
+    end;
+
+    generic [R: Region, S: Region]
+    function open(path: Span[Nat8, R], writable: Bool, out: Span![Int32, S]): Int32 is
+        let name: Pointer[Nat8] := zeroEnded(path);
+        let status: Int32 := @embed(Int32, "(int32_t) ($3.size < 1 ? NC_EINVAL : nc_open((const char*) $1, $2 ? NC_WRITE : NC_NOWRITE, (int*) $3.data))", name, writable, out);
+        deallocate(name);
+        return status;
+    end;
+
+    function close(file: Int32): Int32 is
+        return @embed(Int32, "(int32_t) nc_close((int) $1)", file);
+    end;
+
+    function redefine(file: Int32): Int32 is
+        return @embed(Int32, "(int32_t) nc_redef((int) $1)", file);
+    end;
+
+    function endDefine(file: Int32): Int32 is
+        return @embed(Int32, "(int32_t) nc_enddef((int) $1)", file);
+    end;
+
+    generic [R: Region, S: Region]
+    function defineDimension(file: Int32, name: Span[Nat8, R], size: Index, out: Span![Int32, S]): Int32 is
+        let named: Pointer[Nat8] := zeroEnded(name);
+        let status: Int32 := @embed(Int32, "(int32_t) ($4.size < 1 ? NC_EINVAL : nc_def_dim((int) $1, (const char*) $2, (size_t) $3, (int*) $4.data))", file, named, size, out);
+        deallocate(named);
+        return status;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function defineVariable(file: Int32, name: Span[Nat8, R], floating: Bool, dimensions: Span[Int32, S], out: Span![Int32, Q]): Int32 is
+        let named: Pointer[Nat8] := zeroEnded(name);
+        let status: Int32 := @embed(Int32, "(int32_t) ($5.size < 1 ? NC_EINVAL : nc_def_var((int) $1, (const char*) $2, $3 ? NC_DOUBLE : NC_INT64, (int) $4.size, (const int*) $4.data, (int*) $5.data))", file, named, floating, dimensions, out);
+        deallocate(named);
+        return status;
+    end;
+
+    generic [R: Region, S: Region]
+    function variableOf(file: Int32, name: Span[Nat8, R], out: Span![Int32, S]): Int32 is
+        let named: Pointer[Nat8] := zeroEnded(name);
+        let status: Int32 := @embed(Int32, "(int32_t) ($3.size < 1 ? NC_EINVAL : nc_inq_varid((int) $1, (const char*) $2, (int*) $3.data))", file, named, out);
+        deallocate(named);
+        return status;
+    end;
+
+    generic [R: Region]
+    function typeOf(file: Int32, variable: Int32, out: Span![Int32, R]): Int32 is
+        return @embed(Int32, "(int32_t) ($3.size < 1 ? NC_EINVAL : nc_inq_vartype((int) $1, (int) $2, (nc_type*) $3.data))", file, variable, out);
+    end;
+
+    generic [R: Region]
+    function rankOf(file: Int32, variable: Int32, out: Span![Int32, R]): Int32 is
+        return @embed(Int32, "(int32_t) ($3.size < 1 ? NC_EINVAL : nc_inq_varndims((int) $1, (int) $2, (int*) $3.data))", file, variable, out);
+    end;
+
+    -- The size of out is checked first, since the rank goes into out[0];
+    -- then the rank, so that netCDF never writes past out.
+    generic [R: Region]
+    function dimensionsOf(file: Int32, variable: Int32, out: Span![Int32, R]): Int32 is
+        return @embed(Int32, "(int32_t) (($3.size < 1 || nc_inq_varndims((int) $1, (int) $2, (int*) $3.data) != NC_NOERR || ((int*) $3.data)[0] < 0 || (size_t) ((int*) $3.data)[0] > $3.size) ? NC_EINVAL : nc_inq_vardimid((int) $1, (int) $2, (int*) $3.data))", file, variable, out);
+    end;
+
+    generic [R: Region]
+    function lengthOf(file: Int32, dimension: Int32, out: Span![Index, R]): Int32 is
+        return @embed(Int32, "(int32_t) ($3.size < 1 ? NC_EINVAL : nc_inq_dimlen((int) $1, (int) $2, (size_t*) $3.data))", file, dimension, out);
+    end;
+
+    generic [R: Region]
+    function putFloat64(file: Int32, variable: Int32, values: Span[Float64, R]): Int32 is
+        return @embed(Int32, "(int32_t) nc_put_var_double((int) $1, (int) $2, (const double*) $3.data)", file, variable, values);
+    end;
+
+    generic [R: Region]
+    function putInt64(file: Int32, variable: Int32, values: Span[Int64, R]): Int32 is
+        return @embed(Int32, "(int32_t) nc_put_var_longlong((int) $1, (int) $2, (const long long*) $3.data)", file, variable, values);
+    end;
+
+    generic [R: Region]
+    function getFloat64(file: Int32, variable: Int32, out: Span![Float64, R]): Int32 is
+        return @embed(Int32, "(int32_t) nc_get_var_double((int) $1, (int) $2, (double*) $3.data)", file, variable, out);
+    end;
+
+    generic [R: Region]
+    function getInt64(file: Int32, variable: Int32, out: Span![Int64, R]): Int32 is
+        return @embed(Int32, "(int32_t) nc_get_var_longlong((int) $1, (int) $2, (long long*) $3.data)", file, variable, out);
+    end;
+end module body.

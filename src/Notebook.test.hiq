@@ -1,0 +1,287 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.String (String, asSpan, destroyString, length, nthByte, getSpan);
+import Standard.StringBuilder (StringBuilder, makeStringBuilder, writeString, finalize);
+import Standard.Text (equal, startsWith, formatNat);
+import Mirco.Schlucki (Table, TableError, rowCount, columnCount, textAt, intAt, writeCsv, destroyTable);
+import Mirco.Notebook (
+    Notebook,
+    NotebookError,
+    noCell,
+    badHeader,
+    badName,
+    nameTaken,
+    badRanks,
+    badHosts,
+    noModule,
+    tooManyCells,
+    zeroByte,
+    cellLimit,
+    isCellName,
+    isHostsName,
+    parseNotebook,
+    destroyNotebook,
+    cellCount,
+    cellName,
+    cellRanks,
+    cellHosts,
+    cellModule,
+    cellLine,
+    cellIndex,
+    cellSource,
+    outputText,
+    outputTable,
+    outputArray,
+    outputSvg,
+    outputPng,
+    outputOther,
+    outputKind,
+    outputWord,
+    isRecordedFile,
+    isManifest,
+    isWritten,
+    emptyManifest,
+    readManifest,
+    readWritten,
+    recordCells
+);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.Notebook.Test is
+    -- Lines 1 and 2 say what it is about; cell load on line 3, cell spread,
+    -- a job of two ranks, on line 8, with a line end of CR LF.
+    function sample(): Span[Nat8, Static] is
+        return "A notebook.\n\n--- cell load\nmodule body Cell.Load is\n    function main(): ExitCode is return ExitSuccess(); end;\nend module body.\n\n--- cell spread sperli 2 hosts.txt\r\n  module body Cell.Spread is  \r\nend module body.\r\n";
+    end;
+
+    function testParse(): Unit is
+        case parseNotebook(sample()) of
+            when Right(right as nb: Notebook) do
+                assertTrue(cellCount(&nb) = 2, "two cells");
+                assertTrue(equal(cellName(&nb, 0), "load") and equal(cellName(&nb, 1), "spread"), "the names");
+                assertTrue((cellLine(&nb, 0) = 3) and (cellLine(&nb, 1) = 8), "the lines of the cells");
+                assertTrue((cellRanks(&nb, 0) = 0) and (spanLength(cellHosts(&nb, 0)) = 0), "load runs here");
+                assertTrue((cellRanks(&nb, 1) = 2) and equal(cellHosts(&nb, 1), "hosts.txt"), "spread is a job of two ranks");
+                assertTrue(equal(cellModule(&nb, 0), "Cell.Load") and equal(cellModule(&nb, 1), "Cell.Spread"), "the modules");
+                case cellIndex(&nb, "spread") of
+                    when Some(value as i: Index) do
+                        assertTrue(i = 1, "spread is the second cell");
+                    when None do
+                        assertTrue(false, "spread is found");
+                end case;
+                case cellIndex(&nb, "nothing") of
+                    when Some(value as i: Index) do
+                        assertTrue(false, "no cell is named nothing");
+                    when None do
+                        assertTrue(true, "no cell is named nothing");
+                end case;
+                let source: String := cellSource(&nb, 0);
+                assertTrue(startsWith(asSpan(&source), "--\n--\n--\nmodule body Cell.Load is\n"), "three lines of a comment, then line 4 of the notebook");
+                assertTrue(nthByte(&source, length(&source) - 2) = 10, "the cell ends before the next cell, its empty line kept");
+                destroyString(source);
+                let last: String := cellSource(&nb, 1);
+                assertTrue(startsWith(asSpan(&last), "--\n--\n--\n--\n--\n--\n--\n--\n  module body Cell.Spread is  \r\n"), "the last cell on its line 9");
+                destroyString(last);
+                destroyNotebook(nb);
+            when Left(left as e: NotebookError) do
+                assertTrue(false, "the sample is a notebook");
+        end case;
+        return nil;
+    end;
+
+    -- Whether text is refused with code on line.
+    function refusedWith(text: Span[Nat8, Static], code: Int32, line: Index): Bool is
+        case parseNotebook(text) of
+            when Right(right as nb: Notebook) do
+                destroyNotebook(nb);
+                return false;
+            when Left(left as e: NotebookError) do
+                return (e.code = code) and (e.line = line);
+        end case;
+    end;
+
+    function testRefusals(): Unit is
+        assertTrue(refusedWith("", noCell(), 1), "an empty text has no cell");
+        assertTrue(refusedWith("module body A is\nend module body.\n", noCell(), 3), "a programme without a line of a cell");
+        assertTrue(refusedWith("--- cell\nmodule body A is\n", badHeader(), 1), "a line of a cell without a name");
+        assertTrue(refusedWith("--- cell a b\nmodule body A is\n", badHeader(), 1), "two words after cell");
+        assertTrue(refusedWith("--- cell a sperli 2\nmodule body A is\n", badHeader(), 1), "sperli without hosts");
+        assertTrue(refusedWith("--- cell a mpi 2 hosts\nmodule body A is\n", badHeader(), 1), "another word than sperli");
+        assertTrue(refusedWith("--- cell Load\nmodule body A is\n", badName(), 1), "a capital letter");
+        assertTrue(refusedWith("--- cell ../x\nmodule body A is\n", badName(), 1), "a path as a name");
+        assertTrue(refusedWith("--- cell 1a\nmodule body A is\n", badName(), 1), "a digit first");
+        assertTrue(refusedWith("--- cell a\nmodule body A is\n--- cell a\nmodule body B is\n", nameTaken(), 3), "a name taken");
+        assertTrue(refusedWith("--- cell a sperli 0 hosts\nmodule body A is\n", badRanks(), 1), "no rank");
+        assertTrue(refusedWith("--- cell a sperli 4097 hosts\nmodule body A is\n", badRanks(), 1), "more ranks than hilde run starts");
+        assertTrue(refusedWith("--- cell a sperli 02 hosts\nmodule body A is\n", badRanks(), 1), "a leading zero");
+        assertTrue(refusedWith("--- cell a sperli -1 hosts\nmodule body A is\n", badRanks(), 1), "a sign");
+        assertTrue(refusedWith("--- cell a sperli 2 ../hosts\nmodule body A is\n", badHosts(), 1), "hosts in another directory");
+        assertTrue(refusedWith("--- cell a sperli 2 /etc/hosts\nmodule body A is\n", badHosts(), 1), "hosts as an absolute path");
+        assertTrue(refusedWith("--- cell a sperli 2 .hosts\nmodule body A is\n", badHosts(), 1), "a hidden file of hosts");
+        assertTrue(refusedWith("--- cell a\nmodule body A\n", noModule(), 1), "a line of a module body without is");
+        assertTrue(refusedWith("--- cell a\nmodule body A is\n--- cell b\n-- module body B is\n", noModule(), 3), "a module body only in a comment");
+        assertTrue(refusedWith("--- cell a\nmodule body A is\n\u{0}\n", zeroByte(), 3), "a zero byte");
+        assertTrue(refusedWith("--- cell a\nmodule body A is\n--- cell b\n", noModule(), 3), "the last cell is empty");
+        return nil;
+    end;
+
+    -- One cell more than cellLimit is refused on the line of that cell.
+    function testTooManyCells(): Unit is
+        var b: StringBuilder := makeStringBuilder();
+        var i: Index := 0;
+        while i <= cellLimit() do
+            writeString(&!b, "--- cell c");
+            let number: String := digits(i);
+            writeString(&!b, asSpan(&number));
+            destroyString(number);
+            writeString(&!b, "\nmodule body A is\n");
+            i := i + 1;
+        end while;
+        let text: String := finalize(b);
+        case parseNotebook(asSpan(&text)) of
+            when Right(right as nb: Notebook) do
+                destroyNotebook(nb);
+                assertTrue(false, "1001 cells");
+            when Left(left as e: NotebookError) do
+                assertTrue((e.code = tooManyCells()) and (e.line = 2001), "1001 cells refused on the line of the last");
+        end case;
+        destroyString(text);
+        return nil;
+    end;
+
+    -- The decimal digits of i, which make the names of testTooManyCells.
+    function digits(i: Index): String is
+        case toNat64(i) of
+            when Some(value as v: Nat64) do
+                return formatNat(v);
+            when None do
+                return formatNat(0);
+        end case;
+    end;
+
+    function testNames(): Unit is
+        assertTrue(isCellName("load") and isCellName("a-1") and isCellName("z"), "small letters, digits, hyphens");
+        assertFalse(isCellName("") or isCellName("-a") or isCellName("a_b") or isCellName("a.b") or isCellName("a/b"), "no other bytes");
+        assertFalse(isCellName("abcdefghijabcdefghijabcdefghijabcdefghijabcdefghi"), "49 bytes");
+        assertTrue(isCellName("abcdefghijabcdefghijabcdefghijabcdefghijabcdefgh"), "48 bytes");
+        assertTrue(isHostsName("hosts.txt") and isHostsName("Hosts_2-a"), "a plain file");
+        assertFalse(isHostsName("") or isHostsName(".hosts") or isHostsName("-h") or isHostsName("a/b") or isHostsName(".."), "no path");
+        return nil;
+    end;
+
+    function testOutputKinds(): Unit is
+        assertTrue(outputKind("out/a.txt") = outputText(), "text");
+        assertTrue(outputKind("state/a.csv") = outputTable(), "table");
+        assertTrue(outputKind("state/a.mirc") = outputArray(), "array");
+        assertTrue(outputKind("state/a.svg") = outputSvg(), "svg");
+        assertTrue(outputKind("state/a.png") = outputPng(), "png");
+        assertTrue((outputKind("state/a.json") = outputOther()) and (outputKind("state/csv") = outputOther()), "any other file");
+        assertTrue(equal(outputWord(outputText()), "text") and equal(outputWord(outputTable()), "table"), "the words of text and table");
+        assertTrue(equal(outputWord(outputArray()), "array") and equal(outputWord(outputSvg()), "svg"), "the words of array and svg");
+        assertTrue(equal(outputWord(outputPng()), "png") and equal(outputWord(outputOther()), "file"), "the words of png and file");
+        return nil;
+    end;
+
+    function testRecordedFiles(): Unit is
+        assertTrue(isRecordedFile("state/sales.csv") and isRecordedFile("out/load.txt"), "a state and an output");
+        assertFalse(isRecordedFile("state/") or isRecordedFile("state/../x") or isRecordedFile("state/a/b"), "no other directory");
+        assertFalse(isRecordedFile("/etc/passwd") or isRecordedFile("sales.csv") or isRecordedFile("cells/a.hiq"), "only state and out");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function rowIs(t: &[Table, R], r: Index, cell: Span[Nat8, Static], file: Span[Nat8, Static], kind: Span[Nat8, Static], bytes: Int64): Bool is
+        var same: Bool := true;
+        case textAt(t, 0, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                same := same and equal(v, cell);
+            when None do
+                same := false;
+        end case;
+        case textAt(t, 1, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                same := same and equal(v, file);
+            when None do
+                same := false;
+        end case;
+        case textAt(t, 2, r) of
+            when Some(value as v: Span[Nat8, R]) do
+                same := same and equal(v, kind);
+            when None do
+                same := false;
+        end case;
+        case intAt(t, 3, r) of
+            when Some(value as v: Int64) do
+                same := same and (v = bytes);
+            when None do
+                same := false;
+        end case;
+        return same;
+    end;
+
+    -- A first run of load records its files and leaves out what is not its
+    -- own or names another directory; a second run of load and spread
+    -- replaces the rows of load, keeps those of plot and adds spread.
+    function testManifest(): Unit is
+        let empty: Table := emptyManifest();
+        assertTrue(isManifest(&empty) and (rowCount(&empty) = 0), "an empty manifest");
+        case readWritten("cell,file,bytes\nload,state/sales.csv,120\nload,out/load.txt,7\nspread,state/x.csv,1\nload,../evil,3\n") of
+            when Right(right as written: Table) do
+                assertTrue(isWritten(&written), "the columns of written files");
+                let first: Table := recordCells(&empty, "load", &written);
+                assertTrue(rowCount(&first) = 2, "the two files of load");
+                assertTrue(rowIs(&first, 0, "load", "state/sales.csv", "table", 120), "the table of load");
+                assertTrue(rowIs(&first, 1, "load", "out/load.txt", "text", 7), "the output of load");
+                destroyTable(first);
+                destroyTable(written);
+            when Left(left as e: TableError) do
+                assertTrue(false, "a list of written files");
+        end case;
+        destroyTable(empty);
+        case readManifest("cell,file,kind,bytes\nload,state/old.csv,table,5\nplot,state/plot.svg,svg,900\n") of
+            when Right(right as old: Table) do
+                case readWritten("cell,file,bytes\nspread,state/sum.mirc,24\n") of
+                    when Right(right as written: Table) do
+                        let second: Table := recordCells(&old, "load,spread", &written);
+                        assertTrue(rowCount(&second) = 2, "plot kept, load dropped, spread added");
+                        assertTrue(rowIs(&second, 0, "plot", "state/plot.svg", "svg", 900), "plot kept");
+                        assertTrue(rowIs(&second, 1, "spread", "state/sum.mirc", "array", 24), "spread added");
+                        case writeCsv(&second) of
+                            when Some(value as text: String) do
+                                assertTrue(equal(asSpan(&text), "cell,file,kind,bytes\r\nplot,state/plot.svg,svg,900\r\nspread,state/sum.mirc,array,24\r\n"), "the manifest as CSV");
+                                case readManifest(asSpan(&text)) of
+                                    when Right(right as back: Table) do
+                                        assertTrue(isManifest(&back) and (rowCount(&back) = 2), "the manifest read back");
+                                        destroyTable(back);
+                                    when Left(left as e: TableError) do
+                                        assertTrue(false, "readManifest takes what writeCsv wrote");
+                                end case;
+                                destroyString(text);
+                            when None do
+                                assertTrue(false, "the manifest is written");
+                        end case;
+                        destroyTable(second);
+                        destroyTable(written);
+                    when Left(left as e: TableError) do
+                        assertTrue(false, "a list of one written file");
+                end case;
+                destroyTable(old);
+            when Left(left as e: TableError) do
+                assertTrue(false, "a manifest of two rows");
+        end case;
+        case readManifest("cell,file,bytes\nload,state/a.csv,1\n") of
+            when Right(right as t: Table) do
+                destroyTable(t);
+                assertTrue(false, "three columns are no manifest");
+            when Left(left as e: TableError) do
+                assertTrue(e.code = 2, "three columns for four kinds");
+        end case;
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,1830 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, destroyEmpty, removeLast, nth, nthMut, storeNth, lengthMut, wholeSpan, length as bufferLength);
+import Standard.String (String, fromSpan, asSpan, destroyString, length as stringLength);
+import Standard.Text (equal);
+import Standard.Bits (float64FromBits, float32FromBits);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, fromSpan as arrayOf);
+import Mirco.Root (RootError, RootFault, BadObject, Truncated, UnknownVersion, RootHeader, RootKey, readKeyAt, objectBytes, className);
+
+-- Objects of a .root file are big endian.  An object begins with its
+-- count of bytes, the bit 2 to the 30 set, and its version of two bytes;
+-- a pointer to an object begins with that count and a class tag: all ones
+-- and the name of the class ending in a zero byte when the class appears
+-- for the first time in the buffer, else the bit 2 to the 31 and the place
+-- of that first tag, counted from the start of the key and offset by 2.
+-- A pointer without the bit of the count is a reference to an object read
+-- before.
+module body Mirco.RootTree is
+    constant byte_count_mask: Nat64 := 1073741824;
+    constant class_mask: Nat64 := 2147483648;
+    constant new_class_tag: Nat64 := 4294967295;
+    constant is_referenced: Nat64 := 16;
+
+    function failed(fault: RootFault, at: Index): RootError is
+        return RootError(fault => fault, at => at);
+    end;
+
+    generic [R: Region]
+    function fits(o: Span[Nat8, R], at: Index, n: Index): Bool is
+        return (at <= spanLength(o)) and (n <= (spanLength(o) - at));
+    end;
+
+    function wide(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function place(v: Nat64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function count64(v: Index): Nat64 is
+        case toNat64(v) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A number read: its value, the place after it, and whether it fit.
+    record Step: Free is
+        value: Nat64;
+        next: Index;
+        good: Bool;
+    end;
+
+    function badStep(at: Index): Step is
+        return Step(value => 0, next => at, good => false);
+    end;
+
+    -- n bytes from at, big endian, n at most 8.
+    generic [R: Region]
+    function be(o: Span[Nat8, R], at: Index, n: Index): Step is
+        if not fits(o, at, n) then
+            return badStep(at);
+        end if;
+        var v: Nat64 := 0;
+        var i: Index := 0;
+        while i < n do
+            v := (v * 256) + wide(o[at + i]);
+            i := i + 1;
+        end while;
+        return Step(value => v, next => at + n, good => true);
+    end;
+
+    -- The two's complement of a number of n bytes as Int64.
+    function signedOf(v: Nat64, n: Index): Int64 is
+        if n >= 8 then
+            if v >= 9223372036854775808 then
+                case toInt64(v - 9223372036854775808) of
+                    when Some(value as w: Int64) do
+                        return (w - 9223372036854775807) - 1;
+                    when None do
+                        return 0;
+                end case;
+            end if;
+            case toInt64(v) of
+                when Some(value as w: Int64) do
+                    return w;
+                when None do
+                    return 0;
+            end case;
+        end if;
+        var top: Nat64 := 1;
+        var i: Index := 0;
+        while i < n do
+            top := top * 256;
+            i := i + 1;
+        end while;
+        case toInt64(v) of
+            when Some(value as w: Int64) do
+                if v >= (top / 2) then
+                    case toInt64(top) of
+                        when Some(value as t: Int64) do
+                            return w - t;
+                        when None do
+                            return 0;
+                    end case;
+                end if;
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The head of an object: its version, where it ends, the place after
+    -- the version, and whether the count was there and fits.
+    record Head: Free is
+        version: Int64;
+        finish: Index;
+        next: Index;
+        good: Bool;
+    end;
+
+    function badHead(at: Index): Head is
+        return Head(version => 0, finish => at, next => at, good => false);
+    end;
+
+    generic [R: Region]
+    function head(o: Span[Nat8, R], at: Index): Head is
+        let word: Step := be(o, at, 4);
+        if (not word.good) or (word.value < byte_count_mask) then
+            return badHead(at);
+        end if;
+        let size: Index := place(word.value - byte_count_mask);
+        if (size < 2) or (not fits(o, at + 4, size)) then
+            return badHead(at);
+        end if;
+        let version: Step := be(o, at + 4, 2);
+        return Head(version => signedOf(version.value, 2), finish => (at + 4) + size, next => at + 6, good => true);
+    end;
+
+    -- A TObject: a version, an identifier, the bits and two bytes more when
+    -- the object is referenced.
+    generic [R: Region]
+    function tobject(o: Span[Nat8, R], at: Index): Step is
+        let bits: Step := be(o, at + 6, 4);
+        if not bits.good then
+            return badStep(at);
+        end if;
+        if rem(bits.value / is_referenced, 2) = 1 then
+            if not fits(o, at + 10, 2) then
+                return badStep(at);
+            end if;
+            return Step(value => 0, next => at + 12, good => true);
+        end if;
+        return Step(value => 0, next => at + 10, good => true);
+    end;
+
+    -- A string: one byte of length, or 255 and four bytes, then the bytes.
+    record Piece: Free is
+        start: Index;
+        size: Index;
+        next: Index;
+        good: Bool;
+    end;
+
+    function badPiece(at: Index): Piece is
+        return Piece(start => at, size => 0, next => at, good => false);
+    end;
+
+    generic [R: Region]
+    function pieceAt(o: Span[Nat8, R], at: Index): Piece is
+        let first: Step := be(o, at, 1);
+        if not first.good then
+            return badPiece(at);
+        end if;
+        var size: Index := place(first.value);
+        var start: Index := at + 1;
+        if size = 255 then
+            let long: Step := be(o, at + 1, 4);
+            if not long.good then
+                return badPiece(at);
+            end if;
+            size := place(long.value);
+            start := at + 5;
+        end if;
+        if not fits(o, start, size) then
+            return badPiece(at);
+        end if;
+        return Piece(start => start, size => size, next => start + size, good => true);
+    end;
+
+    -- A TNamed: its head, a TObject, the name and the title; the name comes
+    -- back with next the end of the TNamed.
+    generic [R: Region]
+    function named(o: Span[Nat8, R], at: Index): Piece is
+        let h: Head := head(o, at);
+        if not h.good then
+            return badPiece(at);
+        end if;
+        let t: Step := tobject(o, h.next);
+        if not t.good then
+            return badPiece(at);
+        end if;
+        let name: Piece := pieceAt(o, t.next);
+        if not name.good then
+            return badPiece(at);
+        end if;
+        let title: Piece := pieceAt(o, name.next);
+        if (not title.good) or (title.next > h.finish) then
+            return badPiece(at);
+        end if;
+        return Piece(start => name.start, size => name.size, next => h.finish, good => true);
+    end;
+
+    -- The first tag of a class, its place in the buffer and its name.
+    record ClassRef: Free is
+        tagAt: Index;
+        start: Index;
+        size: Index;
+    end;
+
+    -- A pointer: null, a reference to an object read before, or an object
+    -- of a class with the place of its first byte and its end.
+    record Pointer: Free is
+        null: Bool;
+        reference: Bool;
+        nameStart: Index;
+        nameSize: Index;
+        start: Index;
+        finish: Index;
+        good: Bool;
+    end;
+
+    function badPointer(at: Index): Pointer is
+        return Pointer(null => false, reference => false, nameStart => at, nameSize => 0, start => at, finish => at, good => false);
+    end;
+
+    generic [R: Region, S: Region]
+    function pointerAt(o: Span[Nat8, R], at: Index, key_length: Index, classes: &![Buffer[ClassRef], S]): Pointer is
+        let first: Step := be(o, at, 4);
+        if not first.good then
+            return badPointer(at);
+        end if;
+        if first.value = 0 then
+            return Pointer(null => true, reference => false, nameStart => at, nameSize => 0, start => at + 4, finish => at + 4, good => true);
+        end if;
+        if first.value < byte_count_mask then
+            return Pointer(null => false, reference => true, nameStart => at, nameSize => 0, start => at + 4, finish => at + 4, good => true);
+        end if;
+        let size: Index := place(first.value - byte_count_mask);
+        if (size < 4) or (not fits(o, at + 4, size)) then
+            return badPointer(at);
+        end if;
+        let finish: Index := (at + 4) + size;
+        let tag: Step := be(o, at + 4, 4);
+        if tag.value = new_class_tag then
+            var p: Index := at + 8;
+            while (p < finish) and (o[p] /= 0) do
+                p := p + 1;
+            end while;
+            if p >= finish then
+                return badPointer(at);
+            end if;
+            insertBack(&~classes, ClassRef(tagAt => at + 4, start => at + 8, size => p - (at + 8)));
+            return Pointer(null => false, reference => false, nameStart => at + 8, nameSize => p - (at + 8), start => p + 1, finish => finish, good => true);
+        end if;
+        if tag.value < class_mask then
+            return badPointer(at);
+        end if;
+        let shift: Nat64 := count64(key_length + 2);
+        if (tag.value - class_mask) < shift then
+            return badPointer(at);
+        end if;
+        let wanted: Index := place((tag.value - class_mask) - shift);
+        let known: Index := lengthMut(&~classes);
+        var k: Index := 0;
+        while k < known do
+            let c: ClassRef := nthMut(&~classes, k);
+            if c.tagAt = wanted then
+                return Pointer(null => false, reference => false, nameStart => c.start, nameSize => c.size, start => at + 8, finish => finish, good => true);
+            end if;
+            k := k + 1;
+        end while;
+        return badPointer(at);
+    end;
+
+    -- The start of a TObjArray: its count of entries, the place of the first
+    -- and its end.
+    record ArrayStart: Free is
+        size: Index;
+        next: Index;
+        finish: Index;
+        good: Bool;
+    end;
+
+    generic [R: Region]
+    function arrayAt(o: Span[Nat8, R], at: Index): ArrayStart is
+        let bad: ArrayStart := ArrayStart(size => 0, next => at, finish => at, good => false);
+        let h: Head := head(o, at);
+        if not h.good then
+            return bad;
+        end if;
+        let t: Step := tobject(o, h.next);
+        if not t.good then
+            return bad;
+        end if;
+        let name: Piece := pieceAt(o, t.next);
+        if not name.good then
+            return bad;
+        end if;
+        let n: Step := be(o, name.next, 4);
+        if (not n.good) or (n.value >= 2147483648) or (not fits(o, name.next, 8)) then
+            return bad;
+        end if;
+        return ArrayStart(size => place(n.value), next => name.next + 8, finish => h.finish, good => true);
+    end;
+
+    generic [R: Region]
+    function textIs(o: Span[Nat8, R], start: Index, size: Index, word: Span[Nat8, Static]): Bool is
+        return equal(spanPart(o, start, size), word);
+    end;
+
+    -- The streamer information.
+    record ClassRec: Free is
+        nameStart: Index;
+        nameSize: Index;
+        version: Int64;
+        checksum: Nat64;
+        first: Index;
+        members: Index;
+    end;
+
+    record MemberRec: Free is
+        nameStart: Index;
+        nameSize: Index;
+        typeStart: Index;
+        typeSize: Index;
+        kind: Int64;
+        arrayLength: Index;
+    end;
+
+    record Streamers: Linear is
+        bytes: String;
+        classes: Buffer[ClassRec];
+        members: Buffer[MemberRec];
+    end;
+
+    -- One TStreamerInfo at at: the TNamed of the class, its checksum and
+    -- version, and the pointer to the TObjArray of its members, each a
+    -- subclass of TStreamerElement around one.
+    generic [R: Region, S: Region, Q: Region, P: Region]
+    function readInfo(o: Span[Nat8, R], at: Index, key_length: Index, refs: &![Buffer[ClassRef], S], classes: &![Buffer[ClassRec], Q], members: &![Buffer[MemberRec], P]): Bool is
+        let h: Head := head(o, at);
+        if not h.good then
+            return false;
+        end if;
+        let cls: Piece := named(o, h.next);
+        if not cls.good then
+            return false;
+        end if;
+        let checksum: Step := be(o, cls.next, 4);
+        let version: Step := be(o, cls.next + 4, 4);
+        if not (checksum.good and version.good) then
+            return false;
+        end if;
+        let list: Pointer := pointerAt(o, cls.next + 8, key_length, &~refs);
+        if (not list.good) or list.null or list.reference then
+            return false;
+        end if;
+        let arr: ArrayStart := arrayAt(o, list.start);
+        if not arr.good then
+            return false;
+        end if;
+        let first: Index := lengthMut(&~members);
+        var p: Index := arr.next;
+        var j: Index := 0;
+        while j < arr.size do
+            let e: Pointer := pointerAt(o, p, key_length, &~refs);
+            if (not e.good) or e.null or e.reference then
+                return false;
+            end if;
+            let sub: Head := head(o, e.start);
+            if not sub.good then
+                return false;
+            end if;
+            -- A TStreamerSTLstring holds a TStreamerSTL, which holds the
+            -- TStreamerElement; every other element holds it at once.
+            var base: Head := head(o, sub.next);
+            if base.good and textIs(o, e.nameStart, e.nameSize, "TStreamerSTLstring") then
+                base := head(o, base.next);
+            end if;
+            if not base.good then
+                return false;
+            end if;
+            let name: Piece := named(o, base.next);
+            if not name.good then
+                return false;
+            end if;
+            let kind: Step := be(o, name.next, 4);
+            let array_length: Step := be(o, name.next + 8, 4);
+            let dims: Step := be(o, name.next + 12, 4);
+            if not (kind.good and (array_length.good and dims.good)) then
+                return false;
+            end if;
+            var skipped: Index := 20;
+            if base.version = 1 then
+                skipped := 4 * place(dims.value);
+            end if;
+            let type_name: Piece := pieceAt(o, (name.next + 16) + skipped);
+            if (not type_name.good) or (type_name.next > base.finish) then
+                return false;
+            end if;
+            insertBack(&~members, MemberRec(nameStart => name.start, nameSize => name.size, typeStart => type_name.start, typeSize => type_name.size, kind => signedOf(kind.value, 4), arrayLength => place(array_length.value)));
+            p := e.finish;
+            j := j + 1;
+        end while;
+        insertBack(classes, ClassRec(nameStart => cls.start, nameSize => cls.size, version => signedOf(version.value, 4), checksum => checksum.value, first => first, members => arr.size));
+        return true;
+    end;
+
+    -- The list of TStreamerInfo: a TList, each entry a pointer followed by
+    -- its option string.  Entries of other classes are skipped.
+    generic [R: Region, S: Region, Q: Region]
+    function readList(o: Span[Nat8, R], key_length: Index, classes: &![Buffer[ClassRec], S], members: &![Buffer[MemberRec], Q]): Option[Index] is
+        var refs: Buffer[ClassRef] := allocateEmpty();
+        let h: Head := head(o, 0);
+        let t: Step := tobject(o, h.next);
+        if not (h.good and t.good) then
+            destroyFree(refs);
+            return Some(value => 0);
+        end if;
+        let name: Piece := pieceAt(o, t.next);
+        let n: Step := be(o, name.next, 4);
+        if not (name.good and n.good) then
+            destroyFree(refs);
+            return Some(value => name.next);
+        end if;
+        var p: Index := name.next + 4;
+        var k: Index := 0;
+        while k < place(n.value) do
+            let e: Pointer := pointerAt(o, p, key_length, &!refs);
+            if (not e.good) or e.reference then
+                destroyFree(refs);
+                return Some(value => p);
+            end if;
+            if (not e.null) and textIs(o, e.nameStart, e.nameSize, "TStreamerInfo") then
+                if not readInfo(o, e.start, key_length, &!refs, &~classes, &~members) then
+                    destroyFree(refs);
+                    return Some(value => e.start);
+                end if;
+            end if;
+            let option: Piece := pieceAt(o, e.finish);
+            if not option.good then
+                destroyFree(refs);
+                return Some(value => e.finish);
+            end if;
+            p := option.next;
+            k := k + 1;
+        end while;
+        destroyFree(refs);
+        return None();
+    end;
+
+    generic [R: Region]
+    function readStreamers(bytes: Span[Nat8, R], header: RootHeader, limit: Index): Either[RootError, Streamers] is
+        case readKeyAt(bytes, header.seekInfo) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as key: RootKey) do
+                case objectBytes(bytes, key, limit) of
+                    when Left(left as e: RootError) do
+                        return Left(left => e);
+                    when Right(right as info: String) do
+                        var classes: Buffer[ClassRec] := allocateEmpty();
+                        var members: Buffer[MemberRec] := allocateEmpty();
+                        case readList(asSpan(&info), key.keyLength, &!classes, &!members) of
+                            when Some(value as at: Index) do
+                                destroyFree(classes);
+                                destroyFree(members);
+                                destroyString(info);
+                                return Left(left => failed(BadObject(), at));
+                            when None do
+                                return Right(right => Streamers(bytes => info, classes => classes, members => members));
+                        end case;
+                end case;
+        end case;
+    end;
+
+    function destroyStreamers(s: Streamers): Unit is
+        let { bytes: String, classes: Buffer[ClassRec], members: Buffer[MemberRec] } := s;
+        destroyString(bytes);
+        destroyFree(classes);
+        destroyFree(members);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function classCount(s: &[Streamers, R]): Index is
+        return bufferLength(&(s->classes));
+    end;
+
+    generic [R: Region]
+    function classAt(s: &[Streamers, R], i: Index): ClassRec is
+        return nth(&(s->classes), i);
+    end;
+
+    generic [R: Region]
+    function memberAt(s: &[Streamers, R], i: Index, j: Index): MemberRec is
+        let c: ClassRec := classAt(s, i);
+        if j >= c.members then
+            abort("Mirco.RootTree: a member beyond the members of its class");
+        end if;
+        return nth(&(s->members), c.first + j);
+    end;
+
+    generic [R: Region]
+    function copyOut(s: &[Streamers, R], start: Index, size: Index): String is
+        return fromSpan(spanPart(asSpan(&(s->bytes)), start, size));
+    end;
+
+    generic [R: Region]
+    function classNameOf(s: &[Streamers, R], i: Index): String is
+        let c: ClassRec := classAt(s, i);
+        return copyOut(s, c.nameStart, c.nameSize);
+    end;
+
+    generic [R: Region]
+    function classVersion(s: &[Streamers, R], i: Index): Int64 is
+        let picked: ClassRec := classAt(s, i);
+        return picked.version;
+    end;
+
+    generic [R: Region]
+    function classChecksum(s: &[Streamers, R], i: Index): Nat64 is
+        let picked: ClassRec := classAt(s, i);
+        return picked.checksum;
+    end;
+
+    generic [R: Region]
+    function memberCount(s: &[Streamers, R], i: Index): Index is
+        let picked: ClassRec := classAt(s, i);
+        return picked.members;
+    end;
+
+    generic [R: Region]
+    function memberName(s: &[Streamers, R], i: Index, j: Index): String is
+        let m: MemberRec := memberAt(s, i, j);
+        return copyOut(s, m.nameStart, m.nameSize);
+    end;
+
+    generic [R: Region]
+    function memberTypeName(s: &[Streamers, R], i: Index, j: Index): String is
+        let m: MemberRec := memberAt(s, i, j);
+        return copyOut(s, m.typeStart, m.typeSize);
+    end;
+
+    generic [R: Region]
+    function memberType(s: &[Streamers, R], i: Index, j: Index): Int64 is
+        let picked: MemberRec := memberAt(s, i, j);
+        return picked.kind;
+    end;
+
+    -- A branch: its name, its one leaf, and where in the bytes of the tree
+    -- the tables of its baskets lie: the bytes of each basket, its first
+    -- entry and its seek.
+    record BranchRec: Free is
+        nameStart: Index;
+        nameSize: Index;
+        kind: Nat8;
+        length: Index;
+        unsigned: Bool;
+        counted: Bool;
+        entries: Index;
+        baskets: Index;
+        entryAt: Index;
+        seekAt: Index;
+        element: Bool;
+        ownerStart: Index;
+        ownerSize: Index;
+        header: Index;
+    end;
+
+    record Tree: Linear is
+        bytes: String;
+        entries: Index;
+        branches: Buffer[BranchRec];
+        start: Index;
+        stop: Index;
+        starts: Buffer[Index];
+        clusters: Index;
+        invariant start <= stop;
+    end;
+
+    -- The leaf of a branch: its kind, length, sign and whether it is counted.
+    record LeafRec: Free is
+        kind: Nat8;
+        length: Index;
+        unsigned: Bool;
+        counted: Bool;
+        good: Bool;
+    end;
+
+    generic [R: Region, S: Region]
+    function readLeaf(o: Span[Nat8, R], at: Index, key_length: Index, refs: &![Buffer[ClassRef], S]): LeafRec is
+        let bad: LeafRec := LeafRec(kind => 0, length => 0, unsigned => false, counted => false, good => false);
+        let p: Pointer := pointerAt(o, at, key_length, &~refs);
+        if (not p.good) or p.null or p.reference then
+            return bad;
+        end if;
+        var kind: Nat8 := 0;
+        if (p.nameSize = 6) and textIs(o, p.nameStart, 5, "TLeaf") then
+            kind := o[p.nameStart + 5];
+        end if;
+        let outer: Head := head(o, p.start);
+        if not outer.good then
+            return bad;
+        end if;
+        let inner: Head := head(o, outer.next);
+        if not inner.good then
+            return bad;
+        end if;
+        let name: Piece := named(o, inner.next);
+        if not name.good then
+            return bad;
+        end if;
+        let length: Step := be(o, name.next, 4);
+        let unsigned: Step := be(o, name.next + 13, 1);
+        if not (length.good and unsigned.good) then
+            return bad;
+        end if;
+        let counter: Pointer := pointerAt(o, name.next + 14, key_length, &~refs);
+        if not counter.good then
+            return bad;
+        end if;
+        return LeafRec(kind => kind, length => place(length.value), unsigned => (unsigned.value = 1), counted => not counter.null, good => true);
+    end;
+
+    -- One branch at the place of its pointer, the end of the pointer back,
+    -- 0 for a malformed one and 1 for a version this reader does not know.
+    -- A TBranchElement is the TBranch it holds first, with its branches
+    -- below it read as well, at most eight levels deep; a branch of another
+    -- class is kept by its name only.
+    generic [R: Region, S: Region, Q: Region]
+    function readBranch(o: Span[Nat8, R], at: Index, key_length: Index, refs: &![Buffer[ClassRef], S], out: &![Buffer[BranchRec], Q], depth: Index): Index is
+        let p: Pointer := pointerAt(o, at, key_length, &~refs);
+        if (not p.good) or p.null or p.reference then
+            return 0;
+        end if;
+        let h: Head := head(o, p.start);
+        if not h.good then
+            return 0;
+        end if;
+        let element: Bool := textIs(o, p.nameStart, p.nameSize, "TBranchElement");
+        if element and (depth < 8) then
+            let base: Head := head(o, h.next);
+            if not base.good then
+                return 0;
+            end if;
+            let owner: Piece := pieceAt(o, base.finish);
+            if not owner.good then
+                return 0;
+            end if;
+            let done: Index := readBody(o, h.next, key_length, &~refs, &~out, depth, owner, true);
+            if done <= 1 then
+                return done;
+            end if;
+            return p.finish;
+        end if;
+        if not textIs(o, p.nameStart, p.nameSize, "TBranch") then
+            let inner: Head := head(o, h.next);
+            let other: Piece := named(o, inner.next);
+            if not (inner.good and other.good) then
+                return 0;
+            end if;
+            insertBack(out, BranchRec(nameStart => other.start, nameSize => other.size, kind => 0, length => 0, unsigned => false, counted => false, entries => 0, baskets => 0, entryAt => 0, seekAt => 0, element => false, ownerStart => 0, ownerSize => 0, header => 0));
+            return p.finish;
+        end if;
+        let done: Index := readBody(o, p.start, key_length, &~refs, &~out, depth, badPiece(0), false);
+        if done <= 1 then
+            return done;
+        end if;
+        return p.finish;
+    end;
+
+    -- The TBranch of version 12 or 13 whose head is at at: its record into
+    -- out after those of its branches, and the end of its head back, or 0
+    -- and 1 as readBranch gives them.  owner is the class a TBranchElement
+    -- names, of which the branch is a member.
+    generic [R: Region, S: Region, Q: Region]
+    function readBody(o: Span[Nat8, R], at: Index, key_length: Index, refs: &![Buffer[ClassRef], S], out: &![Buffer[BranchRec], Q], depth: Index, owner: Piece, element: Bool): Index is
+        let h: Head := head(o, at);
+        if not h.good then
+            return 0;
+        end if;
+        if (h.version /= 12) and (h.version /= 13) then
+            return 1;
+        end if;
+        let name: Piece := named(o, h.next);
+        if not name.good then
+            return 0;
+        end if;
+        let fill: Head := head(o, name.next);
+        if not fill.good then
+            return 0;
+        end if;
+        let written: Step := be(o, fill.finish + 12, 4);
+        var q: Index := fill.finish + 24;
+        if h.version = 13 then
+            let features: Head := head(o, q);
+            if not features.good then
+                return 0;
+            end if;
+            q := features.finish;
+        end if;
+        let most: Step := be(o, q + 4, 4);
+        let entries: Step := be(o, q + 12, 8);
+        if not (written.good and most.good and entries.good) then
+            return 0;
+        end if;
+        let subs: ArrayStart := arrayAt(o, q + 44);
+        if not subs.good then
+            return 0;
+        end if;
+        var s: Index := subs.next;
+        var k: Index := 0;
+        while k < subs.size do
+            let next: Index := readBranch(o, s, key_length, &~refs, &~out, depth + 1);
+            if next <= 1 then
+                return next;
+            end if;
+            if next <= s then
+                return 0;
+            end if;
+            s := next;
+            k := k + 1;
+        end while;
+        let leaves: ArrayStart := arrayAt(o, subs.finish);
+        if not leaves.good then
+            return 0;
+        end if;
+        var leaf: LeafRec := LeafRec(kind => 0, length => 0, unsigned => false, counted => false, good => true);
+        if leaves.size = 1 then
+            leaf := readLeaf(o, leaves.next, key_length, &~refs);
+            if not leaf.good then
+                return 0;
+            end if;
+        end if;
+        let baskets: ArrayStart := arrayAt(o, leaves.finish);
+        if not baskets.good then
+            return 0;
+        end if;
+        let n: Index := place(most.value);
+        let bytes_at: Index := baskets.finish + 1;
+        let entry_at: Index := (bytes_at + (4 * n)) + 1;
+        let seek_at: Index := (entry_at + (8 * n)) + 1;
+        if not fits(o, seek_at, 8 * n) then
+            return 0;
+        end if;
+        let used: Index := place(written.value);
+        if used > n then
+            return 0;
+        end if;
+        var kind: Nat8 := leaf.kind;
+        if (leaves.size /= 1) or (subs.size /= 0) then
+            kind := 0;
+        end if;
+        insertBack(out, BranchRec(nameStart => name.start, nameSize => name.size, kind => kind, length => leaf.length, unsigned => leaf.unsigned, counted => leaf.counted, entries => place(entries.value), baskets => used, entryAt => entry_at, seekAt => seek_at, element => element, ownerStart => owner.start, ownerSize => owner.size, header => 0));
+        return h.finish;
+    end;
+
+    -- The first entry of each cluster of a tree of total entries, as Root
+    -- iterates them: within the range i, up to the entry fClusterRangeEnd[i]
+    -- and including it, clusters of fClusterSize[i] entries; after the last
+    -- range, or for a size of 0, clusters of fAutoFlush entries when that is
+    -- above 0. Root guesses the size from the bytes otherwise; then the rest
+    -- of the tree is one cluster. The r ends stand at ends, the r sizes after
+    -- them and a byte. Refused for more than 2 to the 20 clusters.
+    generic [R: Region, S: Region]
+    function clusterStarts(o: Span[Nat8, R], ends: Index, r: Index, total: Index, auto_flush: Int64, starts: &![Buffer[Index], S]): Bool is
+        var flushing: Index := 0;
+        if auto_flush > 0 then
+            case toIndex(auto_flush) of
+                when Some(value as n: Index) do
+                    flushing := n;
+                when None do
+                    return false;
+            end case;
+        end if;
+        var at: Index := 0;
+        var range: Index := 0;
+        var made: Index := 0;
+        while at < total do
+            if made >= 1048576 then
+                return false;
+            end if;
+            insertBack(&~starts, at);
+            made := made + 1;
+            var last: Index := total;
+            var size: Index := 0;
+            var searching: Bool := true;
+            while searching and (range < r) do
+                let closing: Step := be(o, ends + (8 * range), 8);
+                if not closing.good then
+                    return false;
+                end if;
+                if place(closing.value) >= at then
+                    let sized: Step := be(o, (ends + (8 * r)) + (1 + (8 * range)), 8);
+                    if not sized.good then
+                        return false;
+                    end if;
+                    last := place(closing.value) + 1;
+                    size := place(sized.value);
+                    searching := false;
+                else
+                    range := range + 1;
+                end if;
+            end while;
+            if size = 0 then
+                size := flushing;
+            end if;
+            var next: Index := total;
+            if (size > 0) and (size < (total - at)) then
+                next := at + size;
+            end if;
+            if next > last then
+                next := last;
+            end if;
+            if next <= at then
+                return false;
+            end if;
+            at := next;
+        end while;
+        return true;
+    end;
+
+    -- The TTree of version 19 or 20: the TNamed, the attributes of line,
+    -- fill and marker, fEntries and the numbers after it, the two tables of
+    -- cluster ranges, in version 20 the features of input and output, then
+    -- the branches.
+    generic [R: Region, S: Region, Q: Region]
+    function readBranches(o: Span[Nat8, R], key_length: Index, out: &![Buffer[BranchRec], S], starts: &![Buffer[Index], Q]): Either[RootError, Index] is
+        let h: Head := head(o, 0);
+        if not h.good then
+            return Left(left => failed(BadObject(), 0));
+        end if;
+        if (h.version /= 19) and (h.version /= 20) then
+            return Left(left => failed(UnknownVersion(), 0));
+        end if;
+        let name: Piece := named(o, h.next);
+        if not name.good then
+            return Left(left => failed(BadObject(), h.next));
+        end if;
+        let line: Head := head(o, name.next);
+        let fill: Head := head(o, line.finish);
+        let marker: Head := head(o, fill.finish);
+        if not (line.good and fill.good and marker.good) then
+            return Left(left => failed(BadObject(), name.next));
+        end if;
+        let base: Index := marker.finish;
+        let entries: Step := be(o, base, 8);
+        let ranges: Step := be(o, base + 64, 4);
+        if (not (entries.good and ranges.good)) or (ranges.value >= 1048576) then
+            return Left(left => failed(BadObject(), base));
+        end if;
+        let r: Index := place(ranges.value);
+        let flush: Step := be(o, base + 100, 8);
+        if (not flush.good) or (not fits(o, base + 116, 2 + (16 * r))) then
+            return Left(left => failed(BadObject(), base));
+        end if;
+        if not clusterStarts(o, base + 117, r, place(entries.value), signedOf(flush.value, 8), starts) then
+            return Left(left => failed(BadObject(), base + 116));
+        end if;
+        var list_at: Index := ((base + 116) + 2) + (16 * r);
+        if h.version = 20 then
+            let features: Head := head(o, list_at);
+            if not features.good then
+                return Left(left => failed(BadObject(), base + 116));
+            end if;
+            list_at := features.finish;
+        end if;
+        let list: ArrayStart := arrayAt(o, list_at);
+        if not list.good then
+            return Left(left => failed(BadObject(), list_at));
+        end if;
+        var refs: Buffer[ClassRef] := allocateEmpty();
+        var p: Index := list.next;
+        var k: Index := 0;
+        while k < list.size do
+            let next: Index := readBranch(o, p, key_length, &!refs, &~out, 0);
+            if next = 1 then
+                destroyFree(refs);
+                return Left(left => failed(UnknownVersion(), p));
+            end if;
+            if next <= p then
+                destroyFree(refs);
+                return Left(left => failed(BadObject(), p));
+            end if;
+            p := next;
+            k := k + 1;
+        end while;
+        destroyFree(refs);
+        return Right(right => place(entries.value));
+    end;
+
+    generic [R: Region]
+    function readTree(bytes: Span[Nat8, R], key: RootKey, limit: Index): Either[RootError, Tree] is
+        if not equal(className(bytes, key), "TTree") then
+            return Left(left => failed(BadObject(), key.seekKey));
+        end if;
+        case objectBytes(bytes, key, limit) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as o: String) do
+                var branches: Buffer[BranchRec] := allocateEmpty();
+                var starts: Buffer[Index] := allocateEmpty();
+                case readBranches(asSpan(&o), key.keyLength, &!branches, &!starts) of
+                    when Left(left as e: RootError) do
+                        destroyFree(branches);
+                        destroyFree(starts);
+                        destroyString(o);
+                        return Left(left => e);
+                    when Right(right as entries: Index) do
+                        let clusters: Index := bufferLength(&starts);
+                        return Right(right => Tree(bytes => o, entries => entries, branches => branches, start => 0, stop => entries, starts => starts, clusters => clusters));
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function readTreeWith(file: Span[Nat8, R], key: RootKey, s: &[Streamers, S], limit: Index): Either[RootError, Tree] is
+        case readTree(file, key, limit) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as tree: Tree) do
+                let { bytes: String, entries: Index, branches: Buffer[BranchRec], start: Index, stop: Index, starts: Buffer[Index], clusters: Index } := tree;
+                var typed: Buffer[BranchRec] := branches;
+                typeElements(asSpan(&bytes), &!typed, s);
+                return Right(right => Tree(bytes => bytes, entries => entries, branches => typed, start => start, stop => stop, starts => starts, clusters => clusters));
+        end case;
+    end;
+
+    -- The members of a class that a TBranchElement holds take the kind of
+    -- their leaf from the streamer information of the class: a number, a
+    -- fixed array of numbers, an array counted by another member (one byte
+    -- before each entry), a std::vector of numbers (a count of bytes, a
+    -- version and a count, ten bytes before each entry) or a std::string
+    -- (a count of bytes and a version before its text).
+    generic [R: Region, Q: Region, S: Region]
+    function typeElements(o: Span[Nat8, R], branches: &![Buffer[BranchRec], Q], s: &[Streamers, S]): Unit is
+        let n: Index := lengthMut(&~branches);
+        var k: Index := 0;
+        while k < n do
+            let b: BranchRec := nthMut(&~branches, k);
+            if b.element and (b.kind = 0) then
+                storeNth(&~branches, k, typedBranch(o, b, s));
+            end if;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The place after the last dot of the name of b, where the member it
+    -- names begins; a fixed array ends the name of its member at its
+    -- bracket.
+    generic [R: Region]
+    function memberStart(o: Span[Nat8, R], b: BranchRec): Index is
+        var i: Index := b.nameSize;
+        while i > 0 do
+            if o[(b.nameStart + i) - 1] = 46 then
+                return b.nameStart + i;
+            end if;
+            i := i - 1;
+        end while;
+        return b.nameStart;
+    end;
+
+    generic [R: Region, S: Region]
+    function typedBranch(o: Span[Nat8, R], b: BranchRec, s: &[Streamers, S]): BranchRec is
+        let owner: Span[Nat8, R] := spanPart(o, b.ownerStart, b.ownerSize);
+        let start: Index := memberStart(o, b);
+        var finish: Index := start;
+        while (finish < (b.nameStart + b.nameSize)) and (o[finish] /= 91) do
+            finish := finish + 1;
+        end while;
+        let member: Span[Nat8, R] := spanPart(o, start, finish - start);
+        var i: Index := 0;
+        while i < classCount(s) do
+            let c: ClassRec := classAt(s, i);
+            let same_class: Bool := equal(spanPart(asSpan(&(s->bytes)), c.nameStart, c.nameSize), owner);
+            if same_class then
+                var j: Index := 0;
+                while j < c.members do
+                    let m: MemberRec := memberAt(s, i, j);
+                    let same_member: Bool := equal(spanPart(asSpan(&(s->bytes)), m.nameStart, m.nameSize), member);
+                    if same_member then
+                        return withMember(b, m, spanPart(asSpan(&(s->bytes)), m.typeStart, m.typeSize));
+                    end if;
+                    j := j + 1;
+                end while;
+            end if;
+            i := i + 1;
+        end while;
+        return b;
+    end;
+
+    -- The leaf kind of a basic type code of the streamer information, 0 for
+    -- one this reader does not read.
+    function kindOfCode(code: Int64): Nat8 is
+        if (code = 1) or (code = 11) then
+            return 66;
+        end if;
+        if (code = 2) or (code = 12) then
+            return 83;
+        end if;
+        if (code = 3) or ((code = 6) or (code = 13)) then
+            return 73;
+        end if;
+        if (code = 4) or ((code = 14) or ((code = 16) or (code = 17))) then
+            return 76;
+        end if;
+        if code = 5 then
+            return 70;
+        end if;
+        if code = 8 then
+            return 68;
+        end if;
+        if code = 18 then
+            return 79;
+        end if;
+        return 0;
+    end;
+
+    function unsignedCode(code: Int64): Bool is
+        return (code >= 11) and ((code <= 14) or (code = 17));
+    end;
+
+    -- The code of the element type a std::vector names, 0 for another.
+    generic [R: Region]
+    function codeOfVector(t: Span[Nat8, R]): Int64 is
+        if equal(t, "vector<char>") then
+            return 1;
+        end if;
+        if equal(t, "vector<short>") then
+            return 2;
+        end if;
+        if equal(t, "vector<int>") then
+            return 3;
+        end if;
+        if equal(t, "vector<long>") or equal(t, "vector<Long64_t>") then
+            return 16;
+        end if;
+        if equal(t, "vector<float>") then
+            return 5;
+        end if;
+        if equal(t, "vector<double>") then
+            return 8;
+        end if;
+        if equal(t, "vector<unsigned char>") then
+            return 11;
+        end if;
+        if equal(t, "vector<unsigned short>") then
+            return 12;
+        end if;
+        if equal(t, "vector<unsigned int>") then
+            return 13;
+        end if;
+        if equal(t, "vector<unsigned long>") or equal(t, "vector<ULong64_t>") then
+            return 17;
+        end if;
+        if equal(t, "vector<bool>") then
+            return 18;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function withMember(b: BranchRec, m: MemberRec, type_name: Span[Nat8, R]): BranchRec is
+        let one: Index := 1;
+        let six: Index := 6;
+        let ten: Index := 10;
+        let chars: Nat8 := 67;
+        var r: BranchRec := b;
+        if (m.kind >= 1) and (m.kind <= 18) then
+            r.kind := kindOfCode(m.kind);
+            r.unsigned := unsignedCode(m.kind);
+            return r;
+        end if;
+        if (m.kind >= 21) and (m.kind <= 38) then
+            r.kind := kindOfCode(m.kind - 20);
+            r.unsigned := unsignedCode(m.kind - 20);
+            if m.arrayLength > 0 then
+                r.length := m.arrayLength;
+            end if;
+            return r;
+        end if;
+        if (m.kind >= 41) and (m.kind <= 58) then
+            r.kind := kindOfCode(m.kind - 40);
+            r.unsigned := unsignedCode(m.kind - 40);
+            r.counted := true;
+            r.length := one;
+            r.header := one;
+            return r;
+        end if;
+        if equal(type_name, "string") then
+            r.kind := chars;
+            r.header := six;
+            return r;
+        end if;
+        let inner: Int64 := codeOfVector(type_name);
+        if inner > 0 then
+            r.kind := kindOfCode(inner);
+            r.unsigned := unsignedCode(inner);
+            r.counted := true;
+            r.length := one;
+            r.header := ten;
+        end if;
+        return r;
+    end;
+
+    function destroyTree(tree: Tree): Unit is
+        let { bytes: String, entries: Index, branches: Buffer[BranchRec], start: Index, stop: Index, starts: Buffer[Index], clusters: Index } := tree;
+        destroyFree(starts);
+        destroyString(bytes);
+        destroyFree(branches);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function treeEntries(tree: &[Tree, R]): Index is
+        return tree->stop - tree->start;
+    end;
+
+    -- The count of clusters that hold some of the entries since to upto:
+    -- the one since lies in, and each that begins after it and before upto.
+    generic [R: Region]
+    function clustersWithin(starts: &[Buffer[Index], R], since: Index, upto: Index): Index is
+        if since >= upto then
+            return 0;
+        end if;
+        var seen: Index := 1;
+        var k: Index := 0;
+        while k < bufferLength(starts) do
+            let s: Index := nth(starts, k);
+            if (s > since) and (s < upto) then
+                seen := seen + 1;
+            end if;
+            k := k + 1;
+        end while;
+        return seen;
+    end;
+
+    -- The entry of the tree, counted from its start, where its cluster c
+    -- begins; its count of entries for c at or past its count of clusters.
+    generic [R: Region]
+    function clusterEntryOf(tree: &[Tree, R], c: Index): Index is
+        if c = 0 then
+            return 0;
+        end if;
+        var seen: Index := 0;
+        var k: Index := 0;
+        while k < bufferLength(&(tree->starts)) do
+            let s: Index := nth(&(tree->starts), k);
+            if (s > tree->start) and (s < tree->stop) then
+                seen := seen + 1;
+                if seen = c then
+                    return s - tree->start;
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        return tree->stop - tree->start;
+    end;
+
+    generic [R: Region]
+    function treeClusterCount(tree: &[Tree, R]): Index is
+        return tree->clusters;
+    end;
+
+    generic [R: Region]
+    function treeClusterFirst(tree: &[Tree, R], c: Index): Index is
+        return clusterEntryOf(tree, c);
+    end;
+
+    generic [R: Region]
+    function treeClustersAligned(tree: &[Tree, R]): Bool is
+        var b: Index := 0;
+        while b < bufferLength(&(tree->branches)) do
+            let branch: BranchRec := nth(&(tree->branches), b);
+            var k: Index := 0;
+            while (branch.baskets > 0) and (k < bufferLength(&(tree->starts))) do
+                let s: Index := nth(&(tree->starts), k);
+                if (s >= tree->start) and (s < tree->stop) then
+                    if not basketBeginsAt(asSpan(&(tree->bytes)), branch, s) then
+                        return false;
+                    end if;
+                end if;
+                k := k + 1;
+            end while;
+            b := b + 1;
+        end while;
+        return true;
+    end;
+
+    -- Whether one of the baskets of the branch begins at the entry s.
+    generic [R: Region]
+    function basketBeginsAt(o: Span[Nat8, R], branch: BranchRec, s: Index): Bool is
+        var j: Index := 0;
+        while j < branch.baskets do
+            let first: Step := be(o, branch.entryAt + (8 * j), 8);
+            if first.good and (place(first.value) = s) then
+                return true;
+            end if;
+            j := j + 1;
+        end while;
+        return false;
+    end;
+
+    function narrowTreeClusters(tree: Tree, first: Index, count: Index): Tree is
+        let since: Index := clusterEntryOf(&tree, first);
+        var upto: Index := treeEntries(&tree);
+        if first < treeClusterCount(&tree) then
+            if count < (treeClusterCount(&tree) - first) then
+                upto := clusterEntryOf(&tree, first + count);
+            end if;
+        end if;
+        return narrowEntries(tree, since, upto - since);
+    end;
+
+    function narrowEntries(tree: Tree, first: Index, count: Index): Tree is
+        let { bytes: String, entries: Index, branches: Buffer[BranchRec], start: Index, stop: Index, starts: Buffer[Index], clusters: Index } := tree;
+        var since: Index := stop;
+        if first < (stop - start) then
+            since := start + first;
+        end if;
+        var upto: Index := stop;
+        if count < (stop - since) then
+            upto := since + count;
+        end if;
+        let inside: Index := clustersWithin(&starts, since, upto);
+        return Tree(bytes => bytes, entries => entries, branches => branches, start => since, stop => upto, starts => starts, clusters => inside);
+    end;
+
+    generic [R: Region]
+    function branchCount(tree: &[Tree, R]): Index is
+        return bufferLength(&(tree->branches));
+    end;
+
+    generic [R: Region]
+    function branchAt(tree: &[Tree, R], i: Index): BranchRec is
+        return nth(&(tree->branches), i);
+    end;
+
+    generic [R: Region]
+    function branchName(tree: &[Tree, R], i: Index): String is
+        let b: BranchRec := branchAt(tree, i);
+        return fromSpan(spanPart(asSpan(&(tree->bytes)), b.nameStart, b.nameSize));
+    end;
+
+    generic [R: Region]
+    function leafKind(tree: &[Tree, R], i: Index): Nat8 is
+        let picked: BranchRec := branchAt(tree, i);
+        return picked.kind;
+    end;
+
+    generic [R: Region]
+    function leafLength(tree: &[Tree, R], i: Index): Index is
+        let picked: BranchRec := branchAt(tree, i);
+        return picked.length;
+    end;
+
+    generic [R: Region]
+    function leafUnsigned(tree: &[Tree, R], i: Index): Bool is
+        let picked: BranchRec := branchAt(tree, i);
+        return picked.unsigned;
+    end;
+
+    -- The bytes of one number of a leaf kind: B and O one, S two, I and F
+    -- four, L and D eight; 0 for a kind this reader does not read.
+    function widthOf(kind: Nat8): Index is
+        if (kind = 66) or (kind = 79) then
+            return 1;
+        end if;
+        if kind = 83 then
+            return 2;
+        end if;
+        if (kind = 73) or (kind = 70) then
+            return 4;
+        end if;
+        if (kind = 76) or (kind = 68) then
+            return 8;
+        end if;
+        return 0;
+    end;
+
+    -- The raw numbers of a branch, each as its bits, basket after basket;
+    -- o is the bytes of the tree.
+    generic [R: Region, S: Region]
+    function rawValues(bytes: Span[Nat8, R], o: Span[Nat8, S], b: BranchRec, limit: Index, start: Index, stop: Index): Either[RootError, Buffer[Nat64]] is
+        var offsets: Buffer[Index] := allocateEmpty();
+        let values: Either[RootError, Buffer[Nat64]] := rawValuesWith(bytes, o, b, limit, start, stop, &!offsets);
+        destroyFree(offsets);
+        return values;
+    end;
+
+    -- The raw numbers of the entries start to stop of a branch and, into
+    -- offsets, where the numbers of each entry begin, with the count of all
+    -- numbers at the end. A basket outside the entries is not unpacked; one
+    -- that holds some of them is decoded whole and cut.
+    generic [R: Region, S: Region, Q: Region]
+    function rawValuesWith(bytes: Span[Nat8, R], o: Span[Nat8, S], b: BranchRec, limit: Index, start: Index, stop: Index, offsets: &![Buffer[Index], Q]): Either[RootError, Buffer[Nat64]] is
+        let width: Index := widthOf(b.kind);
+        if (width = 0) or (b.length = 0) then
+            return Left(left => failed(BadObject(), b.nameStart));
+        end if;
+        let zero: Index := 0;
+        insertBack(&~offsets, zero);
+        var out: Buffer[Nat64] := allocateEmpty();
+        var j: Index := 0;
+        while j < b.baskets do
+            let seek: Step := be(o, b.seekAt + (8 * j), 8);
+            let first: Step := be(o, b.entryAt + (8 * j), 8);
+            var last: Index := b.entries;
+            if (j + 1) < b.baskets then
+                let following: Step := be(o, b.entryAt + (8 * (j + 1)), 8);
+                last := place(following.value);
+            end if;
+            let opening: Index := place(first.value);
+            if (not seek.good) or (not first.good) or (last < opening) then
+                destroyFree(out);
+                return Left(left => failed(BadObject(), b.seekAt));
+            end if;
+            if (last > start) and (opening < stop) then
+                case basketPiece(bytes, place(seek.value), b, width, opening, last, limit) of
+                    when Left(left as e: RootError) do
+                        destroyFree(out);
+                        return Left(left => e);
+                    when Right(right as piece: Piece64) do
+                        let { values: Buffer[Nat64], ends: Buffer[Index] } := piece;
+                        var since: Index := opening;
+                        if since < start then
+                            since := start;
+                        end if;
+                        var upto: Index := last;
+                        if upto > stop then
+                            upto := stop;
+                        end if;
+                        var n: Index := since;
+                        while n < upto do
+                            let a: Index := nth(&ends, n - opening);
+                            let z: Index := nth(&ends, (n - opening) + 1);
+                            var k: Index := a;
+                            while k < z do
+                                insertBack(&!out, nth(&values, k));
+                                k := k + 1;
+                            end while;
+                            insertBack(&~offsets, bufferLength(&out));
+                            n := n + 1;
+                        end while;
+                        destroyFree(values);
+                        destroyFree(ends);
+                end case;
+            end if;
+            j := j + 1;
+        end while;
+        let places: Index := lengthMut(&~offsets);
+        let total: Index := nthMut(&~offsets, places - 1);
+        var expected: Index := (stop - start) * b.length;
+        if b.counted then
+            expected := total;
+        end if;
+        if (bufferLength(&out) /= expected) or (total /= expected) or (places /= ((stop - start) + 1)) then
+            destroyFree(out);
+            return Left(left => failed(BadObject(), b.entryAt));
+        end if;
+        return Right(right => out);
+    end;
+
+    -- The numbers of one basket and where the numbers of each of its entries
+    -- begin, from 0, with their count at the end.
+    record Piece64: Linear is
+        values: Buffer[Nat64];
+        ends: Buffer[Index];
+    end;
+
+    -- The basket at seek of the entries opening to last of b, decoded whole;
+    -- refused when its places do not give one end for each entry, rising,
+    -- the last at the count of its numbers.
+    generic [R: Region]
+    function basketPiece(bytes: Span[Nat8, R], seek: Index, b: BranchRec, width: Index, opening: Index, last: Index, limit: Index): Either[RootError, Piece64] is
+        let zero: Index := 0;
+        var values: Buffer[Nat64] := allocateEmpty();
+        var ends: Buffer[Index] := allocateEmpty();
+        insertBack(&!ends, zero);
+        var fault: Option[RootError] := None();
+        if b.counted then
+            fault := countedBasket(bytes, seek, last - opening, width, b.header, limit, &!values, &!ends);
+        else
+            fault := basketValues(bytes, seek, (last - opening) * b.length, width, limit, &!values);
+            var entry: Index := opening;
+            while entry < last do
+                insertBack(&!ends, ((entry - opening) + 1) * b.length);
+                entry := entry + 1;
+            end while;
+        end if;
+        case fault of
+            when Some(value as e: RootError) do
+                destroyFree(values);
+                destroyFree(ends);
+                return Left(left => e);
+            when None do
+                skip;
+        end case;
+        var good: Bool := bufferLength(&ends) = ((last - opening) + 1);
+        var k: Index := 1;
+        while good and (k < bufferLength(&ends)) do
+            good := nth(&ends, k - 1) <= nth(&ends, k);
+            k := k + 1;
+        end while;
+        if good then
+            good := nth(&ends, bufferLength(&ends) - 1) = bufferLength(&values);
+        end if;
+        if not good then
+            destroyFree(values);
+            destroyFree(ends);
+            return Left(left => failed(BadObject(), seek));
+        end if;
+        return Right(right => Piece64(values => values, ends => ends));
+    end;
+
+    -- The numbers of one basket of a counted leaf, entries of them: the
+    -- data end at fLast, the last field but one of the key of the basket,
+    -- and after them stand the count of entries plus one, the place of each
+    -- entry in the basket from the start of the key, and a last place that
+    -- is not used.
+    generic [R: Region, S: Region, Q: Region]
+    function countedBasket(bytes: Span[Nat8, R], seek: Index, entries: Index, width: Index, header: Index, limit: Index, out: &![Buffer[Nat64], S], offsets: &![Buffer[Index], Q]): Option[RootError] is
+        case readKeyAt(bytes, seek) of
+            when Left(left as e: RootError) do
+                return Some(value => e);
+            when Right(right as key: RootKey) do
+                let last_field: Step := be(bytes, (seek + key.keyLength) - 5, 4);
+                if (key.keyLength < 5) or (not last_field.good) or (place(last_field.value) < key.keyLength) then
+                    return Some(value => failed(BadObject(), seek));
+                end if;
+                case objectBytes(bytes, key, limit) of
+                    when Left(left as e: RootError) do
+                        return Some(value => e);
+                    when Right(right as payload: String) do
+                        let fault: Option[RootError] := countedDecode(asSpan(&payload), seek, key.keyLength, place(last_field.value) - key.keyLength, entries, width, header, &~out, &~offsets);
+                        destroyString(payload);
+                        return fault;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function countedDecode(data: Span[Nat8, R], seek: Index, key_length: Index, data_length: Index, entries: Index, width: Index, header: Index, out: &![Buffer[Nat64], S], offsets: &![Buffer[Index], Q]): Option[RootError] is
+        let written: Step := be(data, data_length, 4);
+        if (not written.good) or (place(written.value) /= (entries + 1)) or (not fits(data, data_length + 4, 4 * entries)) then
+            return Some(value => failed(Truncated(), seek));
+        end if;
+        var e: Index := 0;
+        while e < entries do
+            let first: Step := be(data, (data_length + 4) + (4 * e), 4);
+            var finish: Index := data_length;
+            if (e + 1) < entries then
+                let following: Step := be(data, (data_length + 4) + (4 * (e + 1)), 4);
+                finish := place(following.value) - key_length;
+            end if;
+            let at: Index := place(first.value);
+            if (at < key_length) or ((e = 0) and (at /= key_length)) or (finish > data_length) or ((at - key_length) > finish) then
+                return Some(value => failed(BadObject(), seek));
+            end if;
+            let start: Index := at - key_length;
+            if ((finish - start) < header) or (rem((finish - start) - header, width) /= 0) then
+                return Some(value => failed(BadObject(), seek));
+            end if;
+            let n: Index := ((finish - start) - header) / width;
+            if header = 10 then
+                let told: Step := be(data, start + 6, 4);
+                if place(told.value) /= n then
+                    return Some(value => failed(BadObject(), seek));
+                end if;
+            end if;
+            var k: Index := 0;
+            while k < n do
+                let v: Step := be(data, (start + header) + (k * width), width);
+                insertBack(&~out, v.value);
+                k := k + 1;
+            end while;
+            insertBack(&~offsets, lengthMut(&~out));
+            e := e + 1;
+        end while;
+        return None();
+    end;
+
+    -- The numbers of one basket: the key at seek, its bytes unpacked, and
+    -- wanted numbers of width bytes from their start.
+    generic [R: Region, S: Region]
+    function basketValues(bytes: Span[Nat8, R], seek: Index, wanted: Index, width: Index, limit: Index, out: &![Buffer[Nat64], S]): Option[RootError] is
+        case readKeyAt(bytes, seek) of
+            when Left(left as e: RootError) do
+                return Some(value => e);
+            when Right(right as key: RootKey) do
+                case objectBytes(bytes, key, limit) of
+                    when Left(left as e: RootError) do
+                        return Some(value => e);
+                    when Right(right as payload: String) do
+                        let fault: Option[RootError] := decode(asSpan(&payload), seek, wanted, width, &~out);
+                        destroyString(payload);
+                        return fault;
+                end case;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function decode(data: Span[Nat8, R], seek: Index, wanted: Index, width: Index, out: &![Buffer[Nat64], S]): Option[RootError] is
+        if not fits(data, 0, wanted * width) then
+            return Some(value => failed(Truncated(), seek));
+        end if;
+        var k: Index := 0;
+        while k < wanted do
+            let v: Step := be(data, k * width, width);
+            insertBack(&~out, v.value);
+            k := k + 1;
+        end while;
+        return None();
+    end;
+
+    -- A vector of the entries, or a matrix of the entries by the length.
+    generic [T: Free(Element), R: Region]
+    function shaped(b: BranchRec, values: &[Buffer[T], R], entries: Index): NdArray[T] is
+        var shape: Buffer[Index] := allocateEmpty();
+        if b.counted then
+            insertBack(&!shape, bufferLength(values));
+        else
+            insertBack(&!shape, entries);
+        end if;
+        if (b.length > 1) and (not b.counted) then
+            insertBack(&!shape, b.length);
+        end if;
+        let made: NdArray[T] := arrayOf(wholeSpan(&shape), wholeSpan(values));
+        destroyFree(shape);
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function branchInt64(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]] is
+        let b: BranchRec := branchAt(tree, i);
+        if (b.kind = 70) or (b.kind = 68) then
+            return Left(left => failed(BadObject(), b.nameStart));
+        end if;
+        case rawValues(bytes, asSpan(&(tree->bytes)), b, limit, tree->start, tree->stop) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as raw: Buffer[Nat64]) do
+                let width: Index := widthOf(b.kind);
+                var values: Buffer[Int64] := allocateEmpty();
+                var fitting: Bool := true;
+                var k: Index := 0;
+                while k < bufferLength(&raw) do
+                    let v: Nat64 := nth(&raw, k);
+                    if b.unsigned then
+                        case toInt64(v) of
+                            when Some(value as w: Int64) do
+                                insertBack(&!values, w);
+                            when None do
+                                fitting := false;
+                                insertBack(&!values, 0);
+                        end case;
+                    else
+                        insertBack(&!values, signedOf(v, width));
+                    end if;
+                    k := k + 1;
+                end while;
+                destroyFree(raw);
+                if not fitting then
+                    destroyFree(values);
+                    return Left(left => failed(BadObject(), b.entryAt));
+                end if;
+                let made: NdArray[Int64] := shaped(b, &values, tree->stop - tree->start);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function branchFloat64(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Float64]] is
+        let b: BranchRec := branchAt(tree, i);
+        if b.kind /= 68 then
+            return Left(left => failed(BadObject(), b.nameStart));
+        end if;
+        case rawValues(bytes, asSpan(&(tree->bytes)), b, limit, tree->start, tree->stop) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as raw: Buffer[Nat64]) do
+                var values: Buffer[Float64] := allocateEmpty();
+                var k: Index := 0;
+                while k < bufferLength(&raw) do
+                    insertBack(&!values, float64FromBits(nth(&raw, k)));
+                    k := k + 1;
+                end while;
+                destroyFree(raw);
+                let made: NdArray[Float64] := shaped(b, &values, tree->stop - tree->start);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function branchOffsets(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Int64]] is
+        let b: BranchRec := branchAt(tree, i);
+        var offsets: Buffer[Index] := allocateEmpty();
+        case rawValuesWith(bytes, asSpan(&(tree->bytes)), b, limit, tree->start, tree->stop, &!offsets) of
+            when Left(left as e: RootError) do
+                destroyFree(offsets);
+                return Left(left => e);
+            when Right(right as raw: Buffer[Nat64]) do
+                destroyFree(raw);
+                var values: Buffer[Int64] := allocateEmpty();
+                var k: Index := 0;
+                while k < bufferLength(&offsets) do
+                    case toInt64(nth(&offsets, k)) of
+                        when Some(value as w: Int64) do
+                            insertBack(&!values, w);
+                        when None do
+                            insertBack(&!values, 0);
+                    end case;
+                    k := k + 1;
+                end while;
+                var shape: Buffer[Index] := allocateEmpty();
+                insertBack(&!shape, bufferLength(&offsets));
+                destroyFree(offsets);
+                let made: NdArray[Int64] := arrayOf(wholeSpan(&shape), wholeSpan(&values));
+                destroyFree(shape);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function branchStrings(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, Buffer[String]] is
+        let b: BranchRec := branchAt(tree, i);
+        if b.kind /= 67 then
+            return Left(left => failed(BadObject(), b.nameStart));
+        end if;
+        var out: Buffer[String] := allocateEmpty();
+        case stringValues(bytes, asSpan(&(tree->bytes)), b, limit, tree->start, tree->stop, &!out) of
+            when Some(value as e: RootError) do
+                destroyBranchStrings(out);
+                return Left(left => e);
+            when None do
+                skip;
+        end case;
+        if bufferLength(&out) /= (tree->stop - tree->start) then
+            destroyBranchStrings(out);
+            return Left(left => failed(BadObject(), b.entryAt));
+        end if;
+        return Right(right => out);
+    end;
+
+    function destroyBranchStrings(strings: Buffer[String]): Unit is
+        var rest: Buffer[String] := strings;
+        while lengthMut(&!rest) > 0 do
+            destroyString(removeLast(&!rest));
+        end while;
+        destroyEmpty(rest);
+        return nil;
+    end;
+
+    -- The texts of the entries start to stop of a leaf of characters, basket
+    -- after basket; o is the bytes of the tree. A basket outside the entries
+    -- is not unpacked; the texts of one that holds some of them are taken
+    -- from the last to the first and given back in their order.
+    generic [R: Region, S: Region, Q: Region]
+    function stringValues(bytes: Span[Nat8, R], o: Span[Nat8, S], b: BranchRec, limit: Index, start: Index, stop: Index, out: &![Buffer[String], Q]): Option[RootError] is
+        var j: Index := 0;
+        while j < b.baskets do
+            let seek: Step := be(o, b.seekAt + (8 * j), 8);
+            let first: Step := be(o, b.entryAt + (8 * j), 8);
+            var last: Index := b.entries;
+            if (j + 1) < b.baskets then
+                let following: Step := be(o, b.entryAt + (8 * (j + 1)), 8);
+                last := place(following.value);
+            end if;
+            let opening: Index := place(first.value);
+            if (not seek.good) or (not first.good) or (last < opening) then
+                return Some(value => failed(BadObject(), b.seekAt));
+            end if;
+            if (last > start) and (opening < stop) then
+                var texts: Buffer[String] := allocateEmpty();
+                case stringBasket(bytes, place(seek.value), last - opening, b.header, limit, &!texts) of
+                    when Some(value as e: RootError) do
+                        destroyBranchStrings(texts);
+                        return Some(value => e);
+                    when None do
+                        skip;
+                end case;
+                var kept: Buffer[String] := allocateEmpty();
+                var entry: Index := opening + lengthMut(&!texts);
+                while lengthMut(&!texts) > 0 do
+                    entry := entry - 1;
+                    let text: String := removeLast(&!texts);
+                    if (entry >= start) and (entry < stop) then
+                        insertBack(&!kept, text);
+                    else
+                        destroyString(text);
+                    end if;
+                end while;
+                destroyEmpty(texts);
+                while lengthMut(&!kept) > 0 do
+                    insertBack(&~out, removeLast(&!kept));
+                end while;
+                destroyEmpty(kept);
+            end if;
+            j := j + 1;
+        end while;
+        return None();
+    end;
+
+    generic [R: Region, S: Region]
+    function stringBasket(bytes: Span[Nat8, R], seek: Index, entries: Index, header: Index, limit: Index, out: &![Buffer[String], S]): Option[RootError] is
+        case readKeyAt(bytes, seek) of
+            when Left(left as e: RootError) do
+                return Some(value => e);
+            when Right(right as key: RootKey) do
+                let last_field: Step := be(bytes, (seek + key.keyLength) - 5, 4);
+                if (key.keyLength < 5) or (not last_field.good) or (place(last_field.value) < key.keyLength) then
+                    return Some(value => failed(BadObject(), seek));
+                end if;
+                case objectBytes(bytes, key, limit) of
+                    when Left(left as e: RootError) do
+                        return Some(value => e);
+                    when Right(right as payload: String) do
+                        let fault: Option[RootError] := stringDecode(asSpan(&payload), seek, key.keyLength, place(last_field.value) - key.keyLength, entries, header, &~out);
+                        destroyString(payload);
+                        return fault;
+                end case;
+        end case;
+    end;
+
+    -- Each text is one byte of length, or 255 and four bytes of length, then
+    -- its bytes; the table after the data must give the place of each.
+    generic [R: Region, S: Region]
+    function stringDecode(data: Span[Nat8, R], seek: Index, key_length: Index, data_length: Index, entries: Index, header: Index, out: &![Buffer[String], S]): Option[RootError] is
+        let written: Step := be(data, data_length, 4);
+        if (not written.good) or (place(written.value) /= (entries + 1)) or (not fits(data, data_length + 4, 4 * entries)) then
+            return Some(value => failed(Truncated(), seek));
+        end if;
+        var p: Index := 0;
+        var e: Index := 0;
+        while e < entries do
+            let placed: Step := be(data, (data_length + 4) + (4 * e), 4);
+            let lead: Step := be(data, p + header, 1);
+            if (place(placed.value) /= (key_length + p)) or (not lead.good) then
+                return Some(value => failed(BadObject(), seek));
+            end if;
+            var size: Index := place(lead.value);
+            var start: Index := (p + header) + 1;
+            if size = 255 then
+                let long: Step := be(data, (p + header) + 1, 4);
+                if not long.good then
+                    return Some(value => failed(Truncated(), seek));
+                end if;
+                size := place(long.value);
+                start := (p + header) + 5;
+            end if;
+            if (start > data_length) or (size > (data_length - start)) then
+                return Some(value => failed(BadObject(), seek));
+            end if;
+            insertBack(&~out, fromSpan(spanPart(data, start, size)));
+            p := start + size;
+            e := e + 1;
+        end while;
+        if p /= data_length then
+            return Some(value => failed(BadObject(), seek));
+        end if;
+        return None();
+    end;
+
+    function bits32(v: Nat64): Nat32 is
+        case toNat32(v) of
+            when Some(value as w: Nat32) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    generic [R: Region, S: Region]
+    function branchFloat32(bytes: Span[Nat8, R], tree: &[Tree, S], i: Index, limit: Index): Either[RootError, NdArray[Float32]] is
+        let b: BranchRec := branchAt(tree, i);
+        if b.kind /= 70 then
+            return Left(left => failed(BadObject(), b.nameStart));
+        end if;
+        case rawValues(bytes, asSpan(&(tree->bytes)), b, limit, tree->start, tree->stop) of
+            when Left(left as e: RootError) do
+                return Left(left => e);
+            when Right(right as raw: Buffer[Nat64]) do
+                var values: Buffer[Float32] := allocateEmpty();
+                var k: Index := 0;
+                while k < bufferLength(&raw) do
+                    insertBack(&!values, float32FromBits(bits32(nth(&raw, k))));
+                    k := k + 1;
+                end while;
+                destroyFree(raw);
+                let made: NdArray[Float32] := shaped(b, &values, tree->stop - tree->start);
+                destroyFree(values);
+                return Right(right => made);
+        end case;
+    end;
+end module body.

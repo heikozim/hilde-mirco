@@ -1,0 +1,971 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Each function is one call of libduckdb against duckdb.h, or a few that
+-- only make sense together.  A handle of DuckDB is a pointer and goes to
+-- Hilde as a Nat64; a result is a duckdb_result in memory of its own,
+-- since the struct is filled by DuckDB.  Every text goes to C as a copy
+-- with a final zero byte.  Every database is opened through one instance
+-- cache of the programme: DuckDB locks a file per process, so a second
+-- database on the same file in the same process would share that lock,
+-- and a reader would weaken the lock of the writer to a shared one.  The
+-- cache gives such an open the database that is there, and refuses it in
+-- another mode.  A cell is read only after its column, its row and its
+-- type are checked, so no read leaves the memory of the chunk.  The lock
+-- of the configuration holds against "SET" and "RESET", but not against
+-- the functions refusedByLayer names: they set logging, profiling or the
+-- parser directly (with libduckdb 1.5.6, "CALL enable_logging" changed
+-- logging_storage to stdout, and after "CALL enable_profiling" with a
+-- save_location every statement failed without an error), so no SQL
+-- that names one is given to DuckDB, and a database whose views or
+-- macros name one is not kept open.
+pragma Unsafe_Module;
+pragma Foreign_Library(Name => "duckdb");
+pragma Foreign_Header(Name => "duckdb.h");
+pragma Foreign_Header(Name => "string.h");
+
+import Hilde.Memory (
+    Pointer,
+    Address,
+    nullCheck,
+    allocateBuffer,
+    deallocate
+);
+import Standard.Buffer (Buffer, initialize, destroyFree, getSpanMut, wholeSpan);
+
+module body Mirco.Bindings.DuckDB is
+    function openDone(): Int32 is
+        return 0;
+    end;
+
+    function libraryTooOld(): Int32 is
+        return 1;
+    end;
+
+    function configRefused(): Int32 is
+        return 2;
+    end;
+
+    function openFailed(): Int32 is
+        return 3;
+    end;
+
+    function fileHeld(): Int32 is
+        return 4;
+    end;
+
+    function layerMissing(): Int32 is
+        return 5;
+    end;
+
+    function definitionRefused(): Int32 is
+        return 6;
+    end;
+
+    function minimumMajor(): Int32 is
+        return 1;
+    end;
+
+    function minimumMinor(): Int32 is
+        return 5;
+    end;
+
+    function minimumPatch(): Int32 is
+        return 6;
+    end;
+
+    generic [R: Region]
+    function zeroFree(text: Span[Nat8, R]): Bool is
+        var at: Index := 0;
+        while at < spanLength(text) do
+            if text[at] = 0 then
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    -- A capital of A to Z as its small letter, any other byte as it is.
+    function lowerByte(b: Nat8): Nat8 is
+        if (b >= 65) and (b <= 90) then
+            return b + 32;
+        end if;
+        return b;
+    end;
+
+    -- Whether the bytes of text from start up to stop are word, given in
+    -- small letters, read in any case.
+    generic [R: Region]
+    function nameIs(text: Span[Nat8, R], start: Index, stop: Index, word: Span[Nat8, Static]): Bool is
+        if (stop - start) /= spanLength(word) then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < spanLength(word) do
+            if lowerByte(text[start + k]) /= word[k] then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    -- The end of the run of letters, digits and underscores at start.
+    generic [R: Region]
+    function runEnd(text: Span[Nat8, R], start: Index): Index is
+        var at: Index := start;
+        while (at < spanLength(text)) and isNamePart(text[at]) do
+            at := at + 1;
+        end while;
+        return at;
+    end;
+
+    -- The first byte at or after start that is no double quote, no blank
+    -- and in no comment, as DuckDB passes over them between a name and its
+    -- parenthesis: a comment runs from two hyphens to the end of the line,
+    -- or from a slash and an asterisk to an asterisk and a slash, nested.
+    -- Every byte up to the space counts as a blank, and so does every byte
+    -- of 127 or more, since DuckDB's reader takes some of them for a blank
+    -- as well (the no-break space U+00A0, two bytes that begin with 194,
+    -- stands between a name and its parenthesis there) and the rest would
+    -- end the statement; so more is passed over than DuckDB does, never
+    -- less, and no high byte hides the parenthesis of a refused name.
+    generic [R: Region]
+    function afterBlanks(text: Span[Nat8, R], start: Index): Index is
+        var at: Index := start;
+        while at < spanLength(text) do
+            let b: Nat8 := text[at];
+            if (b <= 32) or (b = 34) or (b >= 127) then
+                at := at + 1;
+            else if (b = 45) and byteAt(text, at + 1, 45) then
+                at := at + 2;
+                while (at < spanLength(text)) and (text[at] /= 10) and (text[at] /= 13) do
+                    at := at + 1;
+                end while;
+            else if (b = 47) and byteAt(text, at + 1, 42) then
+                var depth: Index := 1;
+                at := at + 2;
+                while (at < spanLength(text)) and (depth > 0) do
+                    if (text[at] = 47) and byteAt(text, at + 1, 42) then
+                        depth := depth + 1;
+                        at := at + 2;
+                    else if (text[at] = 42) and byteAt(text, at + 1, 47) then
+                        depth := depth - 1;
+                        at := at + 2;
+                    else
+                        at := at + 1;
+                    end if;
+                end while;
+            else
+                return at;
+            end if;
+        end while;
+        return at;
+    end;
+
+    -- Whether the name from start up to stop is one that refusedByLayer
+    -- refuses wherever it stands.
+    generic [R: Region]
+    function refusedName(text: Span[Nat8, R], start: Index, stop: Index): Bool is
+        return nameIs(text, start, stop, "pragma") or nameIs(text, start, stop, "enable_logging")
+            or nameIs(text, start, stop, "disable_logging") or nameIs(text, start, stop, "truncate_duckdb_logs")
+            or nameIs(text, start, stop, "enable_profiling") or nameIs(text, start, stop, "disable_profiling")
+            or nameIs(text, start, stop, "enable_peg_parser") or nameIs(text, start, stop, "disable_peg_parser")
+            or nameIs(text, start, stop, "query_table") or nameIs(text, start, stop, "json_execute_serialized_sql");
+    end;
+
+    -- Each run of letters, digits and underscores is read once, from its
+    -- first byte to its last, and its leading digits are passed over, so
+    -- that 1query is read as query.
+    generic [R: Region]
+    function refusedByLayer(text: Span[Nat8, R]): Bool is
+        var at: Index := 0;
+        while at < spanLength(text) do
+            if isNamePart(text[at]) then
+                let stop: Index := runEnd(text, at);
+                var start: Index := at;
+                while (start < stop) and (text[start] >= 48) and (text[start] <= 57) do
+                    start := start + 1;
+                end while;
+                if refusedName(text, start, stop) then
+                    return true;
+                end if;
+                if nameIs(text, start, stop, "query") and byteAt(text, afterBlanks(text, stop), 40) then
+                    return true;
+                end if;
+                at := stop;
+            else
+                at := at + 1;
+            end if;
+        end while;
+        return false;
+    end;
+
+    generic [R: Region]
+    function zeroEnded(text: Span[Nat8, R]): Pointer[Nat8] is
+        let address: Address[Nat8] := allocateBuffer(spanLength(text) + 1);
+        case nullCheck(address) of
+            when Some(value as bytes: Pointer[Nat8]) do
+                let copied: Unit := @embed(Unit, "(memcpy((void*) $1, (const void*) $2.data, $2.size), ((uint8_t*) $1)[$2.size] = 0, (hilde_unit_t) 0)", bytes, text);
+                return bytes;
+            when None do
+                abort("Mirco.Bindings.DuckDB: no memory for a text");
+        end case;
+    end;
+
+    -- Eight bytes of zeros, the room of one handle that C writes.
+    function handleCell(): Pointer[Nat8] is
+        let address: Address[Nat8] := allocateBuffer(8);
+        case nullCheck(address) of
+            when Some(value as bytes: Pointer[Nat8]) do
+                let cleared: Unit := @embed(Unit, "(memset((void*) $1, 0, 8), (hilde_unit_t) 0)", bytes);
+                return bytes;
+            when None do
+                abort("Mirco.Bindings.DuckDB: no memory for a handle");
+        end case;
+    end;
+
+    -- The version as major times 1000000, plus minor times 1000, plus the
+    -- patch, read from "v1.5.6" or "1.5.6-dev"; each part above 999 or a
+    -- text that is not there gives 0.
+    function versionNumber(): Int64 is
+        return @embed(Int64, "__extension__ ({ const char* v = duckdb_library_version(); int64_t part[3] = {0, 0, 0}; int k = 0; int bad = (v == NULL); if (!bad && *v == 'v') { v++; } while (!bad && *v != 0 && k < 3) { if (*v >= '0' && *v <= '9') { part[k] = part[k] * 10 + (*v - '0'); if (part[k] > 999) { bad = 1; } } else if (*v == '.') { k++; } else { break; } v++; } bad ? (int64_t) 0 : part[0] * 1000000 + part[1] * 1000 + part[2]; })");
+    end;
+
+    function libraryFits(): Bool is
+        let lowest: Int64 := (int32ToInt64(minimumMajor()) * 1000000) + (int32ToInt64(minimumMinor()) * 1000) + int32ToInt64(minimumPatch());
+        return versionNumber() >= lowest;
+    end;
+
+    function int32ToInt64(value: Int32): Int64 is
+        return @embed(Int64, "((int64_t) $1)", value);
+    end;
+
+    -- The instance cache of the programme, made by the first open and kept
+    -- until the programme ends; 0 when there was no memory for it.  The
+    -- first of two tasks that race here keeps its cache, the other gives
+    -- its own back.
+    function sharedCache(): Nat64 is
+        return @embed(Nat64, "__extension__ ({ static duckdb_instance_cache mirco_duckdb_cache = NULL; duckdb_instance_cache seen = __atomic_load_n(&mirco_duckdb_cache, __ATOMIC_ACQUIRE); if (seen == NULL) { duckdb_instance_cache made = duckdb_create_instance_cache(); if (made != NULL) { if (__atomic_compare_exchange_n(&mirco_duckdb_cache, &seen, made, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE)) { seen = made; } else { duckdb_destroy_instance_cache(&made); } } } (uint64_t) (uintptr_t) seen; })");
+    end;
+
+    function createConfig(): Nat64 is
+        return @embed(Nat64, "__extension__ ({ duckdb_config made = NULL; if (duckdb_create_config(&made) != DuckDBSuccess) { if (made != NULL) { duckdb_destroy_config(&made); } made = NULL; } (uint64_t) (uintptr_t) made; })");
+    end;
+
+    function destroyConfig(config: Nat64): Unit is
+        let done: Unit := @embed(Unit, "__extension__ ({ duckdb_config held = (duckdb_config) (uintptr_t) $1; if (held != NULL) { duckdb_destroy_config(&held); } (hilde_unit_t) 0; })", config);
+        return nil;
+    end;
+
+    -- 1 when DuckDB refused the setting.  DuckDB answers success for a
+    -- name it does not know, so the settings are read back after the open.
+    function setOption(config: Nat64, name: Span[Nat8, Static], value: Span[Nat8, Static]): Int32 is
+        let key: Pointer[Nat8] := zeroEnded(name);
+        let text: Pointer[Nat8] := zeroEnded(value);
+        let refused: Int32 := @embed(Int32, "((int32_t) (duckdb_set_config((duckdb_config) (uintptr_t) $1, (const char*) $2, (const char*) $3) != DuckDBSuccess))", config, key, text);
+        deallocate(key);
+        deallocate(text);
+        return refused;
+    end;
+
+    -- The safe layer, lock_configuration last: once it is set, no "SET" or
+    -- "RESET" changes a setting again.  DuckDB lets SQL read and write the
+    -- files of its directory for temporary files although external access
+    -- is off, and for a database in memory that directory is .tmp of the
+    -- working directory, so a database in memory gets none.  A file keeps
+    -- its own, the name of the file and .tmp, for the data that does not
+    -- fit into memory.
+    function configure(config: Nat64, read_only: Bool, memory: Bool): Int32 is
+        var refused: Int32 := 0;
+        if read_only then
+            refused := refused + setOption(config, "access_mode", "READ_ONLY");
+        else
+            refused := refused + setOption(config, "access_mode", "READ_WRITE");
+        end if;
+        if memory then
+            refused := refused + setOption(config, "temp_directory", "");
+        end if;
+        refused := refused + setOption(config, "enable_external_access", "false");
+        refused := refused + setOption(config, "autoinstall_known_extensions", "false");
+        refused := refused + setOption(config, "autoload_known_extensions", "false");
+        refused := refused + setOption(config, "allow_community_extensions", "false");
+        refused := refused + setOption(config, "lock_configuration", "true");
+        return refused;
+    end;
+
+    -- Whether path names a database in memory as DuckDB reads it: ":memory:"
+    -- and every name that begins with it.
+    generic [R: Region]
+    function inMemory(path: Span[Nat8, R]): Bool is
+        let word: Span[Nat8, Static] := ":memory:";
+        if spanLength(path) < spanLength(word) then
+            return false;
+        end if;
+        var k: Index := 0;
+        while k < spanLength(word) do
+            if path[k] /= word[k] then
+                return false;
+            end if;
+            k := k + 1;
+        end while;
+        return true;
+    end;
+
+    function failedOpen(failure: Int32): Opened is
+        return Opened(database => 0, connection => 0, failure => failure);
+    end;
+
+    generic [R: Region]
+    function openSafe(path: Span[Nat8, R], read_only: Bool): Opened is
+        if (spanLength(path) = 0) or (not zeroFree(path)) then
+            return failedOpen(openFailed());
+        end if;
+        if not libraryFits() then
+            return failedOpen(libraryTooOld());
+        end if;
+        let cache: Nat64 := sharedCache();
+        if cache = 0 then
+            return failedOpen(openFailed());
+        end if;
+        let config: Nat64 := createConfig();
+        if config = 0 then
+            return failedOpen(configRefused());
+        end if;
+        let memory: Bool := inMemory(path);
+        if configure(config, read_only, memory) /= 0 then
+            destroyConfig(config);
+            return failedOpen(configRefused());
+        end if;
+        let name: Pointer[Nat8] := zeroEnded(path);
+        let cell: Pointer[Nat8] := handleCell();
+        -- A lock held by another process, or this one holding the file in
+        -- another mode, is fileHeld; DuckDB says so only in its words.
+        let failure: Int32 := @embed(Int32, "__extension__ ({ duckdb_database made = NULL; char* words = NULL; int32_t code = 0; if (duckdb_get_or_create_from_cache((duckdb_instance_cache) (uintptr_t) $1, (const char*) $2, &made, (duckdb_config) (uintptr_t) $3, &words) != DuckDBSuccess) { code = (words != NULL && (strstr(words, \"Could not set lock\") != NULL || strstr(words, \"different configuration\") != NULL)) ? 4 : 3; if (made != NULL) { duckdb_close(&made); } } else { *(uint64_t*) $4 = (uint64_t) (uintptr_t) made; } if (words != NULL) { duckdb_free(words); } code; })", cache, name, config, cell);
+        let database: Nat64 := @embed(Nat64, "(*(const uint64_t*) $1)", cell);
+        deallocate(cell);
+        deallocate(name);
+        destroyConfig(config);
+        if (failure /= 0) or (database = 0) then
+            closeSafe(database, 0);
+            if failure = 0 then
+                return failedOpen(openFailed());
+            end if;
+            return failedOpen(failure);
+        end if;
+        let connection: Nat64 := @embed(Nat64, "__extension__ ({ duckdb_connection made = NULL; if (duckdb_connect((duckdb_database) (uintptr_t) $1, &made) != DuckDBSuccess) { if (made != NULL) { duckdb_disconnect(&made); } made = NULL; } (uint64_t) (uintptr_t) made; })", database);
+        if connection = 0 then
+            closeSafe(database, 0);
+            return failedOpen(openFailed());
+        end if;
+        if not settingsHold(connection, memory) then
+            closeSafe(database, connection);
+            return failedOpen(layerMissing());
+        end if;
+        if not definitionsAllowed(connection) then
+            closeSafe(database, connection);
+            return failedOpen(definitionRefused());
+        end if;
+        return Opened(database => database, connection => connection, failure => openDone());
+    end;
+
+    -- Whether every setting of configure is that of the open database.
+    -- current_setting is named with its catalog, since a file may hold a
+    -- macro of that name.
+    function settingsHold(connection: Nat64, memory: Bool): Bool is
+        if not answersTrue(connection, "SELECT CAST(system.main.current_setting('enable_external_access') AS VARCHAR) = 'false' AND CAST(system.main.current_setting('autoinstall_known_extensions') AS VARCHAR) = 'false' AND CAST(system.main.current_setting('autoload_known_extensions') AS VARCHAR) = 'false' AND CAST(system.main.current_setting('allow_community_extensions') AS VARCHAR) = 'false' AND CAST(system.main.current_setting('lock_configuration') AS VARCHAR) = 'true'") then
+            return false;
+        end if;
+        if memory then
+            return answersTrue(connection, "SELECT CAST(system.main.current_setting('temp_directory') AS VARCHAR) = ''");
+        end if;
+        return true;
+    end;
+
+    -- Whether sql gives one row of one boolean, and that is true.
+    function answersTrue(connection: Nat64, sql: Span[Nat8, Static]): Bool is
+        let result: Nat64 := query(connection, sql);
+        var holds: Bool := false;
+        if (resultFailure(result) = 0) and (resultColumns(result) = 1) and isBoolColumn(result, 0) then
+            let chunk: Nat64 := nextChunk(result);
+            if chunkRows(chunk) = 1 then
+                if cellValid(result, chunk, 0, 0) then
+                    holds := cellBool(result, chunk, 0, 0);
+                end if;
+            end if;
+            destroyChunk(chunk);
+        end if;
+        destroyResult(result);
+        return holds;
+    end;
+
+    -- Whether no view and no macro of the database has a text that
+    -- refusedByLayer refuses: a file made elsewhere may hold one, and a
+    -- statement that reads it would run the function inside.  The functions
+    -- of the catalog are named with it, since the file may hold macros of
+    -- their names; a failed query keeps the database closed.
+    function definitionsAllowed(connection: Nat64): Bool is
+        let result: Nat64 := query(connection, "SELECT sql FROM system.main.duckdb_views() WHERE NOT internal AND sql IS NOT NULL UNION ALL SELECT macro_definition FROM system.main.duckdb_functions() WHERE NOT internal AND macro_definition IS NOT NULL");
+        var allowed: Bool := (resultFailure(result) = 0) and (resultColumns(result) = 1) and isTextColumn(result, 0);
+        var chunk: Nat64 := 0;
+        if allowed then
+            chunk := nextChunk(result);
+        end if;
+        while chunk /= 0 do
+            var r: Index := 0;
+            while r < chunkRows(chunk) do
+                if cellValid(result, chunk, 0, r) and textRefused(result, chunk, r) then
+                    allowed := false;
+                end if;
+                r := r + 1;
+            end while;
+            destroyChunk(chunk);
+            chunk := nextChunk(result);
+        end while;
+        destroyResult(result);
+        return allowed;
+    end;
+
+    -- Whether refusedByLayer refuses the text in row r of the one column of
+    -- a chunk, copied out of the chunk first; a copy that comes out short
+    -- counts as refused.
+    function textRefused(result: Nat64, chunk: Nat64, r: Index): Bool is
+        let n: Index := cellTextLength(result, chunk, 0, r);
+        if n = 0 then
+            return false;
+        end if;
+        var bytes: Buffer[Nat8] := initialize(n, 0);
+        let copied: Index := cellText(result, chunk, 0, r, getSpanMut(&!bytes, 0, n - 1));
+        let refused: Bool := (copied /= n) or refusedByLayer(wholeSpan(&bytes));
+        destroyFree(bytes);
+        return refused;
+    end;
+
+    function closeSafe(database: Nat64, connection: Nat64): Unit is
+        let done: Unit := @embed(Unit, "__extension__ ({ duckdb_connection c = (duckdb_connection) (uintptr_t) $2; duckdb_database d = (duckdb_database) (uintptr_t) $1; if (c != NULL) { duckdb_disconnect(&c); } if (d != NULL) { duckdb_close(&d); } (hilde_unit_t) 0; })", database, connection);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function libraryVersion(out: Span![Nat8, R]): Index is
+        return @embed(Index, "__extension__ ({ const char* v = duckdb_library_version(); size_t n = v == NULL ? 0 : strlen(v); memcpy((void*) $1.data, (const void*) (v == NULL ? \"\" : v), n < $1.size ? n : $1.size); (hilde_index_t) n; })", out);
+    end;
+
+    generic [R: Region]
+    function run(connection: Nat64, sql: Span[Nat8, R]): Int32 is
+        let result: Nat64 := query(connection, sql);
+        let failure: Int32 := resultFailure(result);
+        destroyResult(result);
+        return failure;
+    end;
+
+    -- DuckDB fills the result even when the statement fails, and it must be
+    -- destroyed either way; resultFailure tells which.  A failure may also
+    -- come with no error and no result inside (with libduckdb 1.5.6, every
+    -- statement after enable_profiling into a file the layer refuses), so
+    -- a failure without an error is given back at once and counts as 0.
+    generic [R: Region]
+    function query(connection: Nat64, sql: Span[Nat8, R]): Nat64 is
+        if (connection = 0) or (not zeroFree(sql)) or refusedByLayer(sql) then
+            return 0;
+        end if;
+        let text: Pointer[Nat8] := zeroEnded(sql);
+        let result: Nat64 := @embed(Nat64, "__extension__ ({ duckdb_result* made = (duckdb_result*) duckdb_malloc(sizeof(duckdb_result)); if (made != NULL) { memset((void*) made, 0, sizeof(duckdb_result)); if (duckdb_query((duckdb_connection) (uintptr_t) $1, (const char*) $2, made) != DuckDBSuccess && duckdb_result_error(made) == NULL) { duckdb_destroy_result(made); duckdb_free((void*) made); made = NULL; } } (uint64_t) (uintptr_t) made; })", connection, text);
+        deallocate(text);
+        return result;
+    end;
+
+    function resultFailure(result: Nat64): Int32 is
+        if result = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "__extension__ ({ duckdb_result* r = (duckdb_result*) (uintptr_t) $1; duckdb_result_error(r) == NULL ? (int32_t) 0 : (int32_t) 1 + (int32_t) duckdb_result_error_type(r); })", result);
+    end;
+
+    function resultColumns(result: Nat64): Index is
+        if resultFailure(result) /= 0 then
+            return 0;
+        end if;
+        return @embed(Index, "((hilde_index_t) duckdb_column_count((duckdb_result*) (uintptr_t) $1))", result);
+    end;
+
+    function resultType(result: Nat64, c: Index): Int32 is
+        if c >= resultColumns(result) then
+            return 0;
+        end if;
+        return @embed(Int32, "((int32_t) duckdb_column_type((duckdb_result*) (uintptr_t) $1, (idx_t) $2))", result, c);
+    end;
+
+    function isIntColumn(result: Nat64, c: Index): Bool is
+        let t: Int32 := resultType(result, c);
+        return @embed(Bool, "($1 == DUCKDB_TYPE_BIGINT || $1 == DUCKDB_TYPE_INTEGER || $1 == DUCKDB_TYPE_SMALLINT || $1 == DUCKDB_TYPE_TINYINT)", t);
+    end;
+
+    function isFloatColumn(result: Nat64, c: Index): Bool is
+        let t: Int32 := resultType(result, c);
+        return @embed(Bool, "($1 == DUCKDB_TYPE_DOUBLE || $1 == DUCKDB_TYPE_FLOAT)", t);
+    end;
+
+    function isTextColumn(result: Nat64, c: Index): Bool is
+        let t: Int32 := resultType(result, c);
+        return @embed(Bool, "($1 == DUCKDB_TYPE_VARCHAR)", t);
+    end;
+
+    function isBoolColumn(result: Nat64, c: Index): Bool is
+        let t: Int32 := resultType(result, c);
+        return @embed(Bool, "($1 == DUCKDB_TYPE_BOOLEAN)", t);
+    end;
+
+    function nextChunk(result: Nat64): Nat64 is
+        if resultFailure(result) /= 0 then
+            return 0;
+        end if;
+        return @embed(Nat64, "((uint64_t) (uintptr_t) duckdb_fetch_chunk(*(duckdb_result*) (uintptr_t) $1))", result);
+    end;
+
+    function chunkRows(chunk: Nat64): Index is
+        if chunk = 0 then
+            return 0;
+        end if;
+        return @embed(Index, "((hilde_index_t) duckdb_data_chunk_get_size((duckdb_data_chunk) (uintptr_t) $1))", chunk);
+    end;
+
+    function destroyChunk(chunk: Nat64): Unit is
+        let done: Unit := @embed(Unit, "__extension__ ({ duckdb_data_chunk held = (duckdb_data_chunk) (uintptr_t) $1; if (held != NULL) { duckdb_destroy_data_chunk(&held); } (hilde_unit_t) 0; })", chunk);
+        return nil;
+    end;
+
+    function destroyResult(result: Nat64): Unit is
+        let done: Unit := @embed(Unit, "__extension__ ({ duckdb_result* held = (duckdb_result*) (uintptr_t) $1; if (held != NULL) { duckdb_destroy_result(held); duckdb_free((void*) held); } (hilde_unit_t) 0; })", result);
+        return nil;
+    end;
+
+    -- Stops the programme unless column c and row r lie in the chunk.
+    function holdCell(result: Nat64, chunk: Nat64, c: Index, r: Index): Unit is
+        if (c >= resultColumns(result)) or (r >= chunkRows(chunk)) then
+            abort("Mirco.Bindings.DuckDB: a cell outside the chunk");
+        end if;
+        return nil;
+    end;
+
+    function cellValid(result: Nat64, chunk: Nat64, c: Index, r: Index): Bool is
+        holdCell(result, chunk, c, r);
+        return @embed(Bool, "__extension__ ({ uint64_t* v = duckdb_vector_get_validity(duckdb_data_chunk_get_vector((duckdb_data_chunk) (uintptr_t) $1, (idx_t) $2)); v == NULL || duckdb_validity_row_is_valid(v, (idx_t) $3); })", chunk, c, r);
+    end;
+
+    function cellFloat(result: Nat64, chunk: Nat64, c: Index, r: Index): Float64 is
+        holdCell(result, chunk, c, r);
+        if not isFloatColumn(result, c) then
+            abort("Mirco.Bindings.DuckDB: a column of no Float64 read as one");
+        end if;
+        let t: Int32 := resultType(result, c);
+        return @embed(Float64, "__extension__ ({ void* data = duckdb_vector_get_data(duckdb_data_chunk_get_vector((duckdb_data_chunk) (uintptr_t) $1, (idx_t) $2)); $4 == DUCKDB_TYPE_DOUBLE ? ((const double*) data)[$3] : (double) ((const float*) data)[$3]; })", chunk, c, r, t);
+    end;
+
+    function cellInt(result: Nat64, chunk: Nat64, c: Index, r: Index): Int64 is
+        holdCell(result, chunk, c, r);
+        if not isIntColumn(result, c) then
+            abort("Mirco.Bindings.DuckDB: a column of no Int64 read as one");
+        end if;
+        let t: Int32 := resultType(result, c);
+        return @embed(Int64, "__extension__ ({ void* data = duckdb_vector_get_data(duckdb_data_chunk_get_vector((duckdb_data_chunk) (uintptr_t) $1, (idx_t) $2)); $4 == DUCKDB_TYPE_BIGINT ? ((const int64_t*) data)[$3] : ($4 == DUCKDB_TYPE_INTEGER ? (int64_t) ((const int32_t*) data)[$3] : ($4 == DUCKDB_TYPE_SMALLINT ? (int64_t) ((const int16_t*) data)[$3] : (int64_t) ((const int8_t*) data)[$3])); })", chunk, c, r, t);
+    end;
+
+    function cellBool(result: Nat64, chunk: Nat64, c: Index, r: Index): Bool is
+        holdCell(result, chunk, c, r);
+        if not isBoolColumn(result, c) then
+            abort("Mirco.Bindings.DuckDB: a column of no Bool read as one");
+        end if;
+        return @embed(Bool, "(((const bool*) duckdb_vector_get_data(duckdb_data_chunk_get_vector((duckdb_data_chunk) (uintptr_t) $1, (idx_t) $2)))[$3])", chunk, c, r);
+    end;
+
+    function cellTextLength(result: Nat64, chunk: Nat64, c: Index, r: Index): Index is
+        holdCell(result, chunk, c, r);
+        if not isTextColumn(result, c) then
+            abort("Mirco.Bindings.DuckDB: a column of no text read as one");
+        end if;
+        return @embed(Index, "((hilde_index_t) duckdb_string_t_length(((duckdb_string_t*) duckdb_vector_get_data(duckdb_data_chunk_get_vector((duckdb_data_chunk) (uintptr_t) $1, (idx_t) $2)))[$3]))", chunk, c, r);
+    end;
+
+    generic [R: Region]
+    function cellText(result: Nat64, chunk: Nat64, c: Index, r: Index, out: Span![Nat8, R]): Index is
+        holdCell(result, chunk, c, r);
+        if not isTextColumn(result, c) then
+            abort("Mirco.Bindings.DuckDB: a column of no text read as one");
+        end if;
+        return @embed(Index, "__extension__ ({ duckdb_string_t* s = ((duckdb_string_t*) duckdb_vector_get_data(duckdb_data_chunk_get_vector((duckdb_data_chunk) (uintptr_t) $1, (idx_t) $2))) + $3; size_t n = (size_t) duckdb_string_t_length(*s); if (n > $4.size) { n = $4.size; } if (n > 0) { memcpy((void*) $4.data, (const void*) duckdb_string_t_data(s), n); } (hilde_index_t) n; })", chunk, c, r, out);
+    end;
+
+    -- DuckDB makes a statement even when it refuses the text, and it must
+    -- be destroyed either way.
+    generic [R: Region]
+    function prepare(connection: Nat64, sql: Span[Nat8, R]): Nat64 is
+        if (connection = 0) or (not zeroFree(sql)) or refusedByLayer(sql) then
+            return 0;
+        end if;
+        let text: Pointer[Nat8] := zeroEnded(sql);
+        let statement: Nat64 := @embed(Nat64, "__extension__ ({ duckdb_prepared_statement made = NULL; if (duckdb_prepare((duckdb_connection) (uintptr_t) $1, (const char*) $2, &made) != DuckDBSuccess) { duckdb_destroy_prepare(&made); made = NULL; } (uint64_t) (uintptr_t) made; })", connection, text);
+        deallocate(text);
+        return statement;
+    end;
+
+    function parameterCount(statement: Nat64): Index is
+        if statement = 0 then
+            return 0;
+        end if;
+        return @embed(Index, "((hilde_index_t) duckdb_nparams((duckdb_prepared_statement) (uintptr_t) $1))", statement);
+    end;
+
+    -- Whether i is a question mark of the statement; a bind beyond them is
+    -- refused here as well as by DuckDB.
+    function holdsParameter(statement: Nat64, i: Index): Bool is
+        return (i >= 1) and (i <= parameterCount(statement));
+    end;
+
+    function bindFloat(statement: Nat64, i: Index, value: Float64): Int32 is
+        if not holdsParameter(statement, i) then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_bind_double((duckdb_prepared_statement) (uintptr_t) $1, (idx_t) $2, $3) != DuckDBSuccess))", statement, i, value);
+    end;
+
+    function bindInt(statement: Nat64, i: Index, value: Int64): Int32 is
+        if not holdsParameter(statement, i) then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_bind_int64((duckdb_prepared_statement) (uintptr_t) $1, (idx_t) $2, $3) != DuckDBSuccess))", statement, i, value);
+    end;
+
+    function bindBool(statement: Nat64, i: Index, value: Bool): Int32 is
+        if not holdsParameter(statement, i) then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_bind_boolean((duckdb_prepared_statement) (uintptr_t) $1, (idx_t) $2, $3 ? true : false) != DuckDBSuccess))", statement, i, value);
+    end;
+
+    generic [R: Region]
+    function bindText(statement: Nat64, i: Index, value: Span[Nat8, R]): Int32 is
+        if not holdsParameter(statement, i) then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_bind_varchar_length((duckdb_prepared_statement) (uintptr_t) $1, (idx_t) $2, $3.size == 0 ? \"\" : (const char*) $3.data, (idx_t) $3.size) != DuckDBSuccess))", statement, i, value);
+    end;
+
+    function bindNull(statement: Nat64, i: Index): Int32 is
+        if not holdsParameter(statement, i) then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_bind_null((duckdb_prepared_statement) (uintptr_t) $1, (idx_t) $2) != DuckDBSuccess))", statement, i);
+    end;
+
+    function executePrepared(statement: Nat64): Int64 is
+        if statement = 0 then
+            return -1;
+        end if;
+        return @embed(Int64, "__extension__ ({ duckdb_result res; int64_t out; memset(&res, 0, sizeof(res)); if (duckdb_execute_prepared((duckdb_prepared_statement) (uintptr_t) $1, &res) == DuckDBSuccess) { out = (int64_t) duckdb_rows_changed(&res); } else { out = (int64_t) -1 - (int64_t) duckdb_result_error_type(&res); } duckdb_destroy_result(&res); out; })", statement);
+    end;
+
+    function changedRows(outcome: Int64): Nat64 is
+        if outcome < 0 then
+            return 0;
+        end if;
+        return @embed(Nat64, "((uint64_t) $1)", outcome);
+    end;
+
+    -- -1 minus the outcome, which lies from 0 to the last error type of
+    -- DuckDB for a failure; an outcome below the range of Int32 is no
+    -- outcome of executePrepared.
+    function outcomeError(outcome: Int64): Int32 is
+        if (outcome >= 0) or (outcome < -2147483647) then
+            return -1;
+        end if;
+        return @embed(Int32, "((int32_t) (-1 - $1))", outcome);
+    end;
+
+    function destroyPrepared(statement: Nat64): Unit is
+        let done: Unit := @embed(Unit, "__extension__ ({ duckdb_prepared_statement held = (duckdb_prepared_statement) (uintptr_t) $1; if (held != NULL) { duckdb_destroy_prepare(&held); } (hilde_unit_t) 0; })", statement);
+        return nil;
+    end;
+
+    function appendDone(): Int32 is
+        return 0;
+    end;
+
+    function insertRefused(): Int32 is
+        return 1;
+    end;
+
+    function appenderRefused(): Int32 is
+        return 2;
+    end;
+
+    function isSpace(b: Nat8): Bool is
+        return (b = 32) or (b = 9) or (b = 10) or (b = 13);
+    end;
+
+    function isNameStart(b: Nat8): Bool is
+        return ((b >= 65) and (b <= 90)) or ((b >= 97) and (b <= 122)) or (b = 95);
+    end;
+
+    function isNamePart(b: Nat8): Bool is
+        return isNameStart(b) or ((b >= 48) and (b <= 57));
+    end;
+
+    generic [R: Region]
+    function skipSpaces(text: Span[Nat8, R], start: Index): Index is
+        var at: Index := start;
+        while (at < spanLength(text)) and isSpace(text[at]) do
+            at := at + 1;
+        end while;
+        return at;
+    end;
+
+    generic [R: Region]
+    function byteAt(text: Span[Nat8, R], at: Index, b: Nat8): Bool is
+        return (at < spanLength(text)) and (text[at] = b);
+    end;
+
+    -- The end of the name that begins at start; start itself when none does.
+    generic [R: Region]
+    function nameEnd(text: Span[Nat8, R], start: Index): Index is
+        if not ((start < spanLength(text)) and isNameStart(text[start])) then
+            return start;
+        end if;
+        var at: Index := start + 1;
+        while (at < spanLength(text)) and isNamePart(text[at]) do
+            at := at + 1;
+        end while;
+        return at;
+    end;
+
+    -- The end of word, given in capitals and read in any case, at start;
+    -- start itself when it is not there or a name goes on after it.
+    generic [R: Region]
+    function wordEnd(text: Span[Nat8, R], start: Index, word: Span[Nat8, Static]): Index is
+        if (start + spanLength(word)) > spanLength(text) then
+            return start;
+        end if;
+        var k: Index := 0;
+        while k < spanLength(word) do
+            let b: Nat8 := text[start + k];
+            if (b /= word[k]) and (b /= (word[k] + 32)) then
+                return start;
+            end if;
+            k := k + 1;
+        end while;
+        let after: Index := start + spanLength(word);
+        if (after < spanLength(text)) and isNamePart(text[after]) then
+            return start;
+        end if;
+        return after;
+    end;
+
+    -- Where an insert of the form of insertColumns has its table and the
+    -- list of its columns; columns is 0 for any other text.
+    record InsertShape: Free is
+        tableStart: Index;
+        tableEnd: Index;
+        listStart: Index;
+        columns: Index;
+    end;
+
+    function noShape(): InsertShape is
+        return InsertShape(tableStart => 0, tableEnd => 0, listStart => 0, columns => 0);
+    end;
+
+    -- The parts in their order: "INSERT", "INTO", the table, the names in
+    -- parentheses, "VALUES", as many question marks in parentheses, and at
+    -- most a semicolon.  Anything else, a quoted name, a schema, an
+    -- expression or a second row among them, is refused.
+    generic [R: Region]
+    function insertShape(sql: Span[Nat8, R]): InsertShape is
+        var at: Index := skipSpaces(sql, 0);
+        var next: Index := wordEnd(sql, at, "INSERT");
+        if next = at then
+            return noShape();
+        end if;
+        at := skipSpaces(sql, next);
+        next := wordEnd(sql, at, "INTO");
+        if next = at then
+            return noShape();
+        end if;
+        let table_start: Index := skipSpaces(sql, next);
+        let table_end: Index := nameEnd(sql, table_start);
+        if table_end = table_start then
+            return noShape();
+        end if;
+        at := skipSpaces(sql, table_end);
+        if not byteAt(sql, at, 40) then
+            return noShape();
+        end if;
+        let list_start: Index := at + 1;
+        at := list_start;
+        var columns: Index := 0;
+        var more: Bool := true;
+        while more do
+            at := skipSpaces(sql, at);
+            next := nameEnd(sql, at);
+            if next = at then
+                return noShape();
+            end if;
+            columns := columns + 1;
+            at := skipSpaces(sql, next);
+            if byteAt(sql, at, 44) then
+                at := at + 1;
+            else if byteAt(sql, at, 41) then
+                more := false;
+            else
+                return noShape();
+            end if;
+        end while;
+        at := skipSpaces(sql, at + 1);
+        next := wordEnd(sql, at, "VALUES");
+        if next = at then
+            return noShape();
+        end if;
+        at := skipSpaces(sql, next);
+        if not byteAt(sql, at, 40) then
+            return noShape();
+        end if;
+        at := at + 1;
+        var marks: Index := 0;
+        more := true;
+        while more do
+            at := skipSpaces(sql, at);
+            if not byteAt(sql, at, 63) then
+                return noShape();
+            end if;
+            marks := marks + 1;
+            at := skipSpaces(sql, at + 1);
+            if byteAt(sql, at, 44) then
+                at := at + 1;
+            else if byteAt(sql, at, 41) then
+                more := false;
+            else
+                return noShape();
+            end if;
+        end while;
+        at := skipSpaces(sql, at + 1);
+        if byteAt(sql, at, 59) then
+            at := skipSpaces(sql, at + 1);
+        end if;
+        if (at /= spanLength(sql)) or (marks /= columns) then
+            return noShape();
+        end if;
+        return InsertShape(tableStart => table_start, tableEnd => table_end, listStart => list_start, columns => columns);
+    end;
+
+    generic [R: Region]
+    function insertColumns(sql: Span[Nat8, R]): Index is
+        let shape: InsertShape := insertShape(sql);
+        return shape.columns;
+    end;
+
+    function failedAppending(failure: Int32): Appending is
+        return Appending(appender => 0, columns => 0, failure => failure);
+    end;
+
+    -- The appender is made for the table and given the columns one by one,
+    -- each name read again from the list that insertShape checked.
+    generic [R: Region]
+    function openAppender(connection: Nat64, sql: Span[Nat8, R]): Appending is
+        let shape: InsertShape := insertShape(sql);
+        if (shape.columns = 0) or (not zeroFree(sql)) then
+            return failedAppending(insertRefused());
+        end if;
+        if connection = 0 then
+            return failedAppending(appenderRefused());
+        end if;
+        let table: Pointer[Nat8] := zeroEnded(spanPart(sql, shape.tableStart, shape.tableEnd - shape.tableStart));
+        let appender: Nat64 := @embed(Nat64, "__extension__ ({ duckdb_appender made = NULL; if (duckdb_appender_create_ext((duckdb_connection) (uintptr_t) $1, NULL, NULL, (const char*) $2, &made) != DuckDBSuccess) { if (made != NULL) { duckdb_appender_destroy(&made); } made = NULL; } (uint64_t) (uintptr_t) made; })", connection, table);
+        deallocate(table);
+        if appender = 0 then
+            return failedAppending(appenderRefused());
+        end if;
+        var at: Index := shape.listStart;
+        var c: Index := 0;
+        while c < shape.columns do
+            at := skipSpaces(sql, at);
+            let after: Index := nameEnd(sql, at);
+            let name: Pointer[Nat8] := zeroEnded(spanPart(sql, at, after - at));
+            let refused: Int32 := @embed(Int32, "((int32_t) (duckdb_appender_add_column((duckdb_appender) (uintptr_t) $1, (const char*) $2) != DuckDBSuccess))", appender, name);
+            deallocate(name);
+            if refused /= 0 then
+                dropAppender(appender);
+                return failedAppending(appenderRefused());
+            end if;
+            at := skipSpaces(sql, after) + 1;
+            c := c + 1;
+        end while;
+        let held: Index := @embed(Index, "((hilde_index_t) duckdb_appender_column_count((duckdb_appender) (uintptr_t) $1))", appender);
+        if held /= shape.columns then
+            dropAppender(appender);
+            return failedAppending(appenderRefused());
+        end if;
+        return Appending(appender => appender, columns => shape.columns, failure => appendDone());
+    end;
+
+    function appendFloat(appender: Nat64, value: Float64): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_append_double((duckdb_appender) (uintptr_t) $1, $2) != DuckDBSuccess))", appender, value);
+    end;
+
+    function appendInt(appender: Nat64, value: Int64): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_append_int64((duckdb_appender) (uintptr_t) $1, $2) != DuckDBSuccess))", appender, value);
+    end;
+
+    function appendBool(appender: Nat64, value: Bool): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_append_bool((duckdb_appender) (uintptr_t) $1, $2 ? true : false) != DuckDBSuccess))", appender, value);
+    end;
+
+    generic [R: Region]
+    function appendText(appender: Nat64, value: Span[Nat8, R]): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_append_varchar_length((duckdb_appender) (uintptr_t) $1, $2.size == 0 ? \"\" : (const char*) $2.data, (idx_t) $2.size) != DuckDBSuccess))", appender, value);
+    end;
+
+    function appendNull(appender: Nat64): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_append_null((duckdb_appender) (uintptr_t) $1) != DuckDBSuccess))", appender);
+    end;
+
+    function endRow(appender: Nat64): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "((int32_t) (duckdb_appender_end_row((duckdb_appender) (uintptr_t) $1) != DuckDBSuccess))", appender);
+    end;
+
+    -- The error type is read from the error data of the appender, which
+    -- is given back at once.
+    function flushAppender(appender: Nat64): Int32 is
+        if appender = 0 then
+            return 1;
+        end if;
+        return @embed(Int32, "__extension__ ({ duckdb_appender a = (duckdb_appender) (uintptr_t) $1; int32_t code = 0; if (duckdb_appender_flush(a) != DuckDBSuccess) { duckdb_error_data e = duckdb_appender_error_data(a); code = 1 + (e == NULL ? (int32_t) 0 : (int32_t) duckdb_error_data_error_type(e)); if (e != NULL) { duckdb_destroy_error_data(&e); } } code; })", appender);
+    end;
+
+    -- Cleared first, since a destroy flushes what the appender holds.
+    function dropAppender(appender: Nat64): Unit is
+        let done: Unit := @embed(Unit, "__extension__ ({ duckdb_appender held = (duckdb_appender) (uintptr_t) $1; if (held != NULL) { (void) duckdb_appender_clear(held); (void) duckdb_appender_destroy(&held); } (hilde_unit_t) 0; })", appender);
+        return nil;
+    end;
+end module body.

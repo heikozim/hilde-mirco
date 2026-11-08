@@ -1,0 +1,815 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- Every algorithm works on a copy of the matrix in a buffer in row-major
+-- order: the element at row i and column j of a matrix of n columns lies
+-- at i * n + j.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    destroyFree,
+    length,
+    nth,
+    nthMut,
+    storeNth,
+    swapIndex,
+    wholeSpan
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, dimension, count, flatGet, fromSpan, destroyNdArray);
+import Mirco.Math (squareRoot, absolute);
+
+module body Mirco.Linalg is
+    constant maximum_sweeps: Index := 100;
+
+    -- A decomposition of two parts holds a vector of one zero as its third,
+    -- which part never hands out.
+    record Decomposition: Linear is
+        first: NdArray[Float64];
+        second: NdArray[Float64];
+        third: NdArray[Float64];
+        size: Index;
+        invariant (size = 2) or (size = 3);
+    end;
+
+    generic [R: Region]
+    function parts(d: &[Decomposition, R]): Index is
+        return d->size;
+    end;
+
+    function placeholder(): NdArray[Float64] is
+        var w: Buffer[Float64] := allocateEmpty();
+        insertBack(&!w, 0.0);
+        let made: NdArray[Float64] := vectorOf(&w);
+        destroyFree(w);
+        return made;
+    end;
+
+    function twoParts(first: NdArray[Float64], second: NdArray[Float64]): Decomposition is
+        return Decomposition(first => first, second => second, third => placeholder(), size => 2);
+    end;
+
+    function threeParts(first: NdArray[Float64], second: NdArray[Float64], third: NdArray[Float64]): Decomposition is
+        return Decomposition(first => first, second => second, third => third, size => 3);
+    end;
+
+    generic [R: Region]
+    function copyOf(a: &[NdArray[Float64], R]): NdArray[Float64] is
+        let w: Buffer[Float64] := elementsOf(a);
+        var shape: Buffer[Index] := allocateEmpty();
+        var axis: Index := 0;
+        while axis < rank(a) do
+            insertBack(&!shape, dimension(a, axis));
+            axis := axis + 1;
+        end while;
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&w));
+        destroyFree(shape);
+        destroyFree(w);
+        return made;
+    end;
+
+    generic [R: Region]
+    function part(d: &[Decomposition, R], which: Index): NdArray[Float64] is
+        if which = 0 then
+            return copyOf(&(d->first));
+        end if;
+        if which = 1 then
+            return copyOf(&(d->second));
+        end if;
+        if d->size < 3 then
+            abort("Mirco.Linalg: a decomposition of two parts has no third");
+        end if;
+        return copyOf(&(d->third));
+    end;
+
+    function destroyDecomposition(d: Decomposition): Unit is
+        let { first: NdArray[Float64], second: NdArray[Float64], third: NdArray[Float64], size: Index } := d;
+        destroyArray(first);
+        destroyArray(second);
+        destroyArray(third);
+        return nil;
+    end;
+
+    function destroyArray(a: NdArray[Float64]): Unit is
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    -- The elements of a in a buffer, row-major.
+    generic [R: Region]
+    function elementsOf(a: &[NdArray[Float64], R]): Buffer[Float64] is
+        var w: Buffer[Float64] := allocateEmpty();
+        let n: Index := count(a);
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!w, flatGet(a, at));
+            at := at + 1;
+        end while;
+        return w;
+    end;
+
+    -- A new matrix of rows and cols from the buffer w.
+    generic [R: Region]
+    function matrixOf(rows: Index, cols: Index, w: &[Buffer[Float64], R]): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(w));
+        destroyFree(shape);
+        return made;
+    end;
+
+    -- A new vector from the buffer w.
+    generic [R: Region]
+    function vectorOf(w: &[Buffer[Float64], R]): NdArray[Float64] is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, length(w));
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(w));
+        destroyFree(shape);
+        return made;
+    end;
+
+    -- The side of a square matrix; anything else stops the programme.
+    generic [R: Region]
+    function side(a: &[NdArray[Float64], R]): Index is
+        let n: Index := dimension(a, 0);
+        if dimension(a, 1) /= n then
+            abort("Mirco.Linalg: the matrix is not square");
+        end if;
+        return n;
+    end;
+
+    -- The decomposition into lower and upper triangles of the n by n matrix w in place, Doolittle with
+    -- partial pivoting: l below the diagonal with ones on it, u on and
+    -- above it.  The rows swapped are in order.  The count of the row
+    -- exchanges comes back, for the sign of the determinant, or -1 when a
+    -- pivot is zero.
+    generic [R: Region, S: Region]
+    function factor(w: &![Buffer[Float64], R], order: &![Buffer[Index], S], n: Index): Int64 is
+        var swaps: Int64 := 0;
+        var k: Index := 0;
+        while k < n do
+            var best: Index := k;
+            var largest: Float64 := absolute(nthMut(&~w, (k * n) + k));
+            var i: Index := k + 1;
+            while i < n do
+                let v: Float64 := absolute(nthMut(&~w, (i * n) + k));
+                if v > largest then
+                    largest := v;
+                    best := i;
+                end if;
+                i := i + 1;
+            end while;
+            if largest = 0.0 then
+                return -1;
+            end if;
+            if best /= k then
+                var j: Index := 0;
+                while j < n do
+                    swapIndex(&~w, (k * n) + j, (best * n) + j);
+                    j := j + 1;
+                end while;
+                swapIndex(&~order, k, best);
+                swaps := swaps + 1;
+            end if;
+            let pivot: Float64 := nthMut(&~w, (k * n) + k);
+            i := k + 1;
+            while i < n do
+                let factor_ik: Float64 := nthMut(&~w, (i * n) + k) / pivot;
+                storeNth(&~w, (i * n) + k, factor_ik);
+                var j: Index := k + 1;
+                while j < n do
+                    let below: Float64 := nthMut(&~w, (i * n) + j);
+                    let above: Float64 := nthMut(&~w, (k * n) + j);
+                    storeNth(&~w, (i * n) + j, below - (factor_ik * above));
+                    j := j + 1;
+                end while;
+                i := i + 1;
+            end while;
+            k := k + 1;
+        end while;
+        return swaps;
+    end;
+
+    function identityOrder(n: Index): Buffer[Index] is
+        var order: Buffer[Index] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            insertBack(&!order, i);
+            i := i + 1;
+        end while;
+        return order;
+    end;
+
+    -- Solves l u x = p b for the columns of b, m of them, in place in b.
+    generic [R: Region, S: Region, Q: Region]
+    function substitute(w: &![Buffer[Float64], R], order: &![Buffer[Index], S], b: &![Buffer[Float64], Q], n: Index, m: Index): Unit is
+        var permuted: Buffer[Float64] := initialize(n * m, 0.0);
+        var i: Index := 0;
+        while i < n do
+            let source: Index := nthMut(&~order, i);
+            var c: Index := 0;
+            while c < m do
+                let v: Float64 := nthMut(&~b, (source * m) + c);
+                storeNth(&!permuted, (i * m) + c, v);
+                c := c + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var c: Index := 0;
+        while c < m do
+            i := 0;
+            while i < n do
+                var s: Float64 := nthMut(&!permuted, (i * m) + c);
+                var j: Index := 0;
+                while j < i do
+                    let l: Float64 := nthMut(&~w, (i * n) + j);
+                    let y: Float64 := nthMut(&!permuted, (j * m) + c);
+                    s := s - (l * y);
+                    j := j + 1;
+                end while;
+                storeNth(&!permuted, (i * m) + c, s);
+                i := i + 1;
+            end while;
+            var r: Index := n;
+            while r > 0 do
+                r := r - 1;
+                var s: Float64 := nthMut(&!permuted, (r * m) + c);
+                var j: Index := r + 1;
+                while j < n do
+                    let u: Float64 := nthMut(&~w, (r * n) + j);
+                    let x: Float64 := nthMut(&!permuted, (j * m) + c);
+                    s := s - (u * x);
+                    j := j + 1;
+                end while;
+                let d: Float64 := nthMut(&~w, (r * n) + r);
+                storeNth(&!permuted, (r * m) + c, s / d);
+            end while;
+            c := c + 1;
+        end while;
+        i := 0;
+        while i < (n * m) do
+            let v: Float64 := nthMut(&!permuted, i);
+            storeNth(&~b, i, v);
+            i := i + 1;
+        end while;
+        destroyFree(permuted);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function solve(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]] is
+        let n: Index := side(a);
+        if dimension(b, 0) /= n then
+            abort("Mirco.Linalg: b has not as many rows as a");
+        end if;
+        var m: Index := 1;
+        if rank(b) = 2 then
+            m := dimension(b, 1);
+        end if;
+        var w: Buffer[Float64] := elementsOf(a);
+        var order: Buffer[Index] := identityOrder(n);
+        let swaps: Int64 := factor(&!w, &!order, n);
+        let regular: Bool := swaps >= 0;
+        if not regular then
+            destroyFree(w);
+            destroyFree(order);
+            return None();
+        end if;
+        var x: Buffer[Float64] := elementsOf(b);
+        substitute(&!w, &!order, &!x, n, m);
+        destroyFree(w);
+        destroyFree(order);
+        var made: NdArray[Float64] := vectorOf(&x);
+        if rank(b) = 2 then
+            destroyArray(made);
+            made := matrixOf(n, m, &x);
+        end if;
+        destroyFree(x);
+        return Some(value => made);
+    end;
+
+    generic [R: Region]
+    function determinant(a: &[NdArray[Float64], R]): Float64 is
+        let n: Index := side(a);
+        var w: Buffer[Float64] := elementsOf(a);
+        var order: Buffer[Index] := identityOrder(n);
+        let swaps: Int64 := factor(&!w, &!order, n);
+        let regular: Bool := swaps >= 0;
+        var d: Float64 := 0.0;
+        if regular then
+            d := 1.0;
+            var i: Index := 0;
+            while i < n do
+                d := d * nthMut(&!w, (i * n) + i);
+                i := i + 1;
+            end while;
+            if rem(swaps, 2) = 1 then
+                d := 0.0 - d;
+            end if;
+        end if;
+        destroyFree(w);
+        destroyFree(order);
+        return d;
+    end;
+
+    function identity(n: Index): Buffer[Float64] is
+        var w: Buffer[Float64] := initialize(n * n, 0.0);
+        var i: Index := 0;
+        while i < n do
+            storeNth(&!w, (i * n) + i, 1.0);
+            i := i + 1;
+        end while;
+        return w;
+    end;
+
+    generic [R: Region]
+    function inverse(a: &[NdArray[Float64], R]): Option[NdArray[Float64]] is
+        let n: Index := side(a);
+        var w: Buffer[Float64] := elementsOf(a);
+        var order: Buffer[Index] := identityOrder(n);
+        let swaps: Int64 := factor(&!w, &!order, n);
+        let regular: Bool := swaps >= 0;
+        if not regular then
+            destroyFree(w);
+            destroyFree(order);
+            return None();
+        end if;
+        var x: Buffer[Float64] := identity(n);
+        substitute(&!w, &!order, &!x, n, n);
+        destroyFree(w);
+        destroyFree(order);
+        let made: NdArray[Float64] := matrixOf(n, n, &x);
+        destroyFree(x);
+        return Some(value => made);
+    end;
+
+    generic [R: Region]
+    function cholesky(a: &[NdArray[Float64], R]): Option[NdArray[Float64]] is
+        let n: Index := side(a);
+        var l: Buffer[Float64] := initialize(n * n, 0.0);
+        var j: Index := 0;
+        while j < n do
+            var s: Float64 := flatGet(a, (j * n) + j);
+            var k: Index := 0;
+            while k < j do
+                let v: Float64 := nthMut(&!l, (j * n) + k);
+                s := s - (v * v);
+                k := k + 1;
+            end while;
+            if not (s > 0.0) then
+                destroyFree(l);
+                return None();
+            end if;
+            let d: Float64 := squareRoot(s);
+            storeNth(&!l, (j * n) + j, d);
+            var i: Index := j + 1;
+            while i < n do
+                var t: Float64 := flatGet(a, (i * n) + j);
+                k := 0;
+                while k < j do
+                    let li: Float64 := nthMut(&!l, (i * n) + k);
+                    let lj: Float64 := nthMut(&!l, (j * n) + k);
+                    t := t - (li * lj);
+                    k := k + 1;
+                end while;
+                storeNth(&!l, (i * n) + j, t / d);
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        let made: NdArray[Float64] := matrixOf(n, n, &l);
+        destroyFree(l);
+        return Some(value => made);
+    end;
+
+    -- Householder: column k of r below the diagonal is reflected onto the
+    -- diagonal by v = x - alpha e, alpha of the opposite sign of x at 0.  The
+    -- reflectors, one after the other, applied to the first n columns of the
+    -- identity give q.  A column that is zero already needs none.
+    generic [R: Region, S: Region, Q: Region]
+    function factorQr(a: &[NdArray[Float64], R], q_out: &![Buffer[Float64], S], r_out: &![Buffer[Float64], Q]): Unit is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        if m < n then
+            abort("Mirco.Linalg: qr needs at least as many rows as columns");
+        end if;
+        var r: Buffer[Float64] := elementsOf(a);
+        var vs: Buffer[Float64] := initialize(m * n, 0.0);
+        var k: Index := 0;
+        while k < n do
+            var norm: Float64 := 0.0;
+            var i: Index := k;
+            while i < m do
+                let x: Float64 := nthMut(&!r, (i * n) + k);
+                norm := norm + (x * x);
+                i := i + 1;
+            end while;
+            norm := squareRoot(norm);
+            if norm > 0.0 then
+                let x0: Float64 := nthMut(&!r, (k * n) + k);
+                var alpha: Float64 := 0.0 - norm;
+                if x0 < 0.0 then
+                    alpha := norm;
+                end if;
+                var vnorm: Float64 := 0.0;
+                i := k;
+                while i < m do
+                    var v: Float64 := nthMut(&!r, (i * n) + k);
+                    if i = k then
+                        v := v - alpha;
+                    end if;
+                    storeNth(&!vs, (i * n) + k, v);
+                    vnorm := vnorm + (v * v);
+                    i := i + 1;
+                end while;
+                vnorm := squareRoot(vnorm);
+                if vnorm > 0.0 then
+                    i := k;
+                    while i < m do
+                        let v: Float64 := nthMut(&!vs, (i * n) + k);
+                        storeNth(&!vs, (i * n) + k, v / vnorm);
+                        i := i + 1;
+                    end while;
+                    reflect(&!vs, &!r, k, m, n, n, k);
+                end if;
+            end if;
+            k := k + 1;
+        end while;
+        var q: Buffer[Float64] := initialize(m * n, 0.0);
+        var d: Index := 0;
+        while d < n do
+            storeNth(&!q, (d * n) + d, 1.0);
+            d := d + 1;
+        end while;
+        k := n;
+        while k > 0 do
+            k := k - 1;
+            reflect(&!vs, &!q, k, m, n, n, 0);
+        end while;
+        var i: Index := 0;
+        while i < (m * n) do
+            let v: Float64 := nthMut(&!q, i);
+            insertBack(&~q_out, v);
+            i := i + 1;
+        end while;
+        i := 0;
+        while i < n do
+            var j: Index := 0;
+            while j < n do
+                var v: Float64 := 0.0;
+                if j >= i then
+                    v := nthMut(&!r, (i * n) + j);
+                end if;
+                insertBack(&~r_out, v);
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        destroyFree(r);
+        destroyFree(vs);
+        destroyFree(q);
+        return nil;
+    end;
+
+    -- Applies the reflector in column k of vs, rows k to m - 1, to the
+    -- columns from first of target, which has cols columns: t := t - 2 v v t.
+    generic [R: Region, S: Region]
+    function reflect(vs: &![Buffer[Float64], R], target: &![Buffer[Float64], S], k: Index, m: Index, n: Index, cols: Index, first: Index): Unit is
+        var j: Index := first;
+        while j < cols do
+            var dot: Float64 := 0.0;
+            var i: Index := k;
+            while i < m do
+                let v: Float64 := nthMut(&~vs, (i * n) + k);
+                let t: Float64 := nthMut(&~target, (i * cols) + j);
+                dot := dot + (v * t);
+                i := i + 1;
+            end while;
+            i := k;
+            while i < m do
+                let v: Float64 := nthMut(&~vs, (i * n) + k);
+                let t: Float64 := nthMut(&~target, (i * cols) + j);
+                storeNth(&~target, (i * cols) + j, t - (2.0 * v * dot));
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function qr(a: &[NdArray[Float64], R]): Decomposition is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        var q: Buffer[Float64] := allocateEmpty();
+        var r: Buffer[Float64] := allocateEmpty();
+        factorQr(a, &!q, &!r);
+        let qm: NdArray[Float64] := matrixOf(m, n, &q);
+        let rm: NdArray[Float64] := matrixOf(n, n, &r);
+        destroyFree(q);
+        destroyFree(r);
+        return Decomposition(first => qm, second => rm, third => placeholder(), size => 2);
+    end;
+
+    -- x = r^-1 q^T b; a zero on the diagonal of r means a is not of full
+    -- column rank.
+    generic [R: Region, S: Region]
+    function lstsq(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]] is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        if dimension(b, 0) /= m then
+            abort("Mirco.Linalg: b has not as many rows as a");
+        end if;
+        var q: Buffer[Float64] := allocateEmpty();
+        var r: Buffer[Float64] := allocateEmpty();
+        factorQr(a, &!q, &!r);
+        var y: Buffer[Float64] := initialize(n, 0.0);
+        var j: Index := 0;
+        while j < n do
+            var s: Float64 := 0.0;
+            var i: Index := 0;
+            while i < m do
+                s := s + (nthMut(&!q, (i * n) + j) * flatGet(b, i));
+                i := i + 1;
+            end while;
+            storeNth(&!y, j, s);
+            j := j + 1;
+        end while;
+        var row: Index := n;
+        var full: Bool := true;
+        while row > 0 do
+            row := row - 1;
+            let d: Float64 := nthMut(&!r, (row * n) + row);
+            if d = 0.0 then
+                full := false;
+                row := 0;
+            else
+                var s: Float64 := nthMut(&!y, row);
+                var c: Index := row + 1;
+                while c < n do
+                    let u: Float64 := nthMut(&!r, (row * n) + c);
+                    let x: Float64 := nthMut(&!y, c);
+                    s := s - (u * x);
+                    c := c + 1;
+                end while;
+                storeNth(&!y, row, s / d);
+            end if;
+        end while;
+        destroyFree(q);
+        destroyFree(r);
+        if not full then
+            destroyFree(y);
+            return None();
+        end if;
+        let made: NdArray[Float64] := vectorOf(&y);
+        destroyFree(y);
+        return Some(value => made);
+    end;
+
+    -- The rotation of Jacobi that makes the element at p, q zero: t is the
+    -- smaller root of t^2 + 2 theta t - 1 = 0.
+    function rotationTangent(theta: Float64): Float64 is
+        let root: Float64 := squareRoot((theta * theta) + 1.0);
+        if theta < 0.0 then
+            return -1.0 / (root - theta);
+        end if;
+        return 1.0 / (theta + root);
+    end;
+
+    generic [R: Region]
+    function eigenSymmetric(a: &[NdArray[Float64], R]): Decomposition is
+        let n: Index := side(a);
+        var w: Buffer[Float64] := elementsOf(a);
+        var v: Buffer[Float64] := identity(n);
+        var sweep: Index := 0;
+        var rotating: Bool := true;
+        while rotating and (sweep < maximum_sweeps) do
+            var off: Float64 := 0.0;
+            var total: Float64 := 0.0;
+            var i: Index := 0;
+            while i < (n * n) do
+                let x: Float64 := nthMut(&!w, i);
+                total := total + (x * x);
+                if rem(i, n + 1) /= 0 then
+                    off := off + (x * x);
+                end if;
+                i := i + 1;
+            end while;
+            if off <= (total * 0.00000000000000000000000000000001) then
+                rotating := false;
+            else
+                var p: Index := 0;
+                while p < n do
+                    var q: Index := p + 1;
+                    while q < n do
+                        let apq: Float64 := nthMut(&!w, (p * n) + q);
+                        if apq /= 0.0 then
+                            let app: Float64 := nthMut(&!w, (p * n) + p);
+                            let aqq: Float64 := nthMut(&!w, (q * n) + q);
+                            let t: Float64 := rotationTangent((aqq - app) / (2.0 * apq));
+                            let c: Float64 := 1.0 / squareRoot((t * t) + 1.0);
+                            let s: Float64 := t * c;
+                            rotate(&!w, &!v, n, p, q, c, s);
+                        end if;
+                        q := q + 1;
+                    end while;
+                    p := p + 1;
+                end while;
+            end if;
+            sweep := sweep + 1;
+        end while;
+        var values: Buffer[Float64] := allocateEmpty();
+        var k: Index := 0;
+        while k < n do
+            insertBack(&!values, nthMut(&!w, (k * n) + k));
+            k := k + 1;
+        end while;
+        sortColumns(&!values, &!v, n, n, true);
+        let vm: NdArray[Float64] := vectorOf(&values);
+        let vectors: NdArray[Float64] := matrixOf(n, n, &v);
+        destroyFree(w);
+        destroyFree(v);
+        destroyFree(values);
+        return Decomposition(first => vm, second => vectors, third => placeholder(), size => 2);
+    end;
+
+    -- w := J^T w J and v := v J for the rotation J in the plane p, q.
+    generic [R: Region, S: Region]
+    function rotate(w: &![Buffer[Float64], R], v: &![Buffer[Float64], S], n: Index, p: Index, q: Index, c: Float64, s: Float64): Unit is
+        var k: Index := 0;
+        while k < n do
+            let wkp: Float64 := nthMut(&~w, (k * n) + p);
+            let wkq: Float64 := nthMut(&~w, (k * n) + q);
+            storeNth(&~w, (k * n) + p, (c * wkp) - (s * wkq));
+            storeNth(&~w, (k * n) + q, (s * wkp) + (c * wkq));
+            k := k + 1;
+        end while;
+        k := 0;
+        while k < n do
+            let wpk: Float64 := nthMut(&~w, (p * n) + k);
+            let wqk: Float64 := nthMut(&~w, (q * n) + k);
+            storeNth(&~w, (p * n) + k, (c * wpk) - (s * wqk));
+            storeNth(&~w, (q * n) + k, (s * wpk) + (c * wqk));
+            k := k + 1;
+        end while;
+        k := 0;
+        while k < n do
+            let vkp: Float64 := nthMut(&~v, (k * n) + p);
+            let vkq: Float64 := nthMut(&~v, (k * n) + q);
+            storeNth(&~v, (k * n) + p, (c * vkp) - (s * vkq));
+            storeNth(&~v, (k * n) + q, (s * vkp) + (c * vkq));
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Sorts the values, and the columns of the matrix m of rows rows and
+    -- cols columns with them, ascending or descending; a selection sort, as
+    -- the counts are those of a matrix's side.
+    generic [R: Region, S: Region]
+    function sortColumns(values: &![Buffer[Float64], R], m: &![Buffer[Float64], S], rows: Index, cols: Index, ascending: Bool): Unit is
+        var i: Index := 0;
+        while i < cols do
+            var chosen: Index := i;
+            var j: Index := i + 1;
+            while j < cols do
+                let vj: Float64 := nthMut(&~values, j);
+                let vc: Float64 := nthMut(&~values, chosen);
+                if (ascending and (vj < vc)) or ((not ascending) and (vj > vc)) then
+                    chosen := j;
+                end if;
+                j := j + 1;
+            end while;
+            if chosen /= i then
+                swapIndex(&~values, i, chosen);
+                var r: Index := 0;
+                while r < rows do
+                    swapIndex(&~m, (r * cols) + i, (r * cols) + chosen);
+                    r := r + 1;
+                end while;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- One-sided Jacobi of Hestenes: columns i and j of u are rotated until
+    -- every pair is orthogonal; the singular values are the norms of the
+    -- columns, u is normalised, and v collects the rotations.
+    generic [R: Region]
+    function svd(a: &[NdArray[Float64], R]): Decomposition is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        if m < n then
+            abort("Mirco.Linalg: svd needs at least as many rows as columns");
+        end if;
+        var u: Buffer[Float64] := elementsOf(a);
+        var v: Buffer[Float64] := identity(n);
+        var sweep: Index := 0;
+        var rotating: Bool := true;
+        while rotating and (sweep < maximum_sweeps) do
+            rotating := false;
+            var i: Index := 0;
+            while i < n do
+                var j: Index := i + 1;
+                while j < n do
+                    var alpha: Float64 := 0.0;
+                    var beta: Float64 := 0.0;
+                    var gamma: Float64 := 0.0;
+                    var k: Index := 0;
+                    while k < m do
+                        let x: Float64 := nthMut(&!u, (k * n) + i);
+                        let y: Float64 := nthMut(&!u, (k * n) + j);
+                        alpha := alpha + (x * x);
+                        beta := beta + (y * y);
+                        gamma := gamma + (x * y);
+                        k := k + 1;
+                    end while;
+                    if absolute(gamma) > (0.000000000000001 * squareRoot(alpha * beta)) then
+                        rotating := true;
+                        let t: Float64 := rotationTangent((beta - alpha) / (2.0 * gamma));
+                        let c: Float64 := 1.0 / squareRoot((t * t) + 1.0);
+                        let s: Float64 := t * c;
+                        rotateColumns(&!u, m, n, i, j, c, s);
+                        rotateColumns(&!v, n, n, i, j, c, s);
+                    end if;
+                    j := j + 1;
+                end while;
+                i := i + 1;
+            end while;
+            sweep := sweep + 1;
+        end while;
+        var sigma: Buffer[Float64] := allocateEmpty();
+        var c: Index := 0;
+        while c < n do
+            var norm: Float64 := 0.0;
+            var k: Index := 0;
+            while k < m do
+                let x: Float64 := nthMut(&!u, (k * n) + c);
+                norm := norm + (x * x);
+                k := k + 1;
+            end while;
+            norm := squareRoot(norm);
+            insertBack(&!sigma, norm);
+            if norm > 0.0 then
+                k := 0;
+                while k < m do
+                    let x: Float64 := nthMut(&!u, (k * n) + c);
+                    storeNth(&!u, (k * n) + c, x / norm);
+                    k := k + 1;
+                end while;
+            end if;
+            c := c + 1;
+        end while;
+        var order: Buffer[Float64] := allocateEmpty();
+        c := 0;
+        while c < n do
+            insertBack(&!order, nthMut(&!sigma, c));
+            c := c + 1;
+        end while;
+        sortColumns(&!sigma, &!u, m, n, false);
+        sortColumns(&!order, &!v, n, n, false);
+        var vt: Buffer[Float64] := initialize(n * n, 0.0);
+        var r: Index := 0;
+        while r < n do
+            c := 0;
+            while c < n do
+                let x: Float64 := nthMut(&!v, (c * n) + r);
+                storeNth(&!vt, (r * n) + c, x);
+                c := c + 1;
+            end while;
+            r := r + 1;
+        end while;
+        let um: NdArray[Float64] := matrixOf(m, n, &u);
+        let sm: NdArray[Float64] := vectorOf(&sigma);
+        let vtm: NdArray[Float64] := matrixOf(n, n, &vt);
+        destroyFree(u);
+        destroyFree(v);
+        destroyFree(vt);
+        destroyFree(sigma);
+        destroyFree(order);
+        return Decomposition(first => um, second => sm, third => vtm, size => 3);
+    end;
+
+    -- Columns i and j of the matrix w of rows rows and cols columns become
+    -- c x - s y and s x + c y.
+    generic [R: Region]
+    function rotateColumns(w: &![Buffer[Float64], R], rows: Index, cols: Index, i: Index, j: Index, c: Float64, s: Float64): Unit is
+        var k: Index := 0;
+        while k < rows do
+            let x: Float64 := nthMut(&~w, (k * cols) + i);
+            let y: Float64 := nthMut(&~w, (k * cols) + j);
+            storeNth(&~w, (k * cols) + i, (c * x) - (s * y));
+            storeNth(&~w, (k * cols) + j, (s * x) + (c * y));
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+end module body.

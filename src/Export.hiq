@@ -1,0 +1,157 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A C caller sees mirco_dot, mirco_mean, mirco_deviation and mirco_matmul,
+-- each span as a pointer and a length, after hilde_start.
+import Standard.Buffer (Buffer, allocateEmpty, insertBack, destroyFree, wholeSpan);
+import Standard.Bits (float64Bits, float64FromBits);
+import Mirco.Element (Element);
+import Mirco.Numeric (Numeric);
+import Mirco.Array (NdArray, fromSpan, destroyNdArray, count, flatGet);
+import Mirco.Compute (dot, matmul);
+import Mirco.Stats (standardDeviation);
+
+module body Mirco.Export is
+    constant nan_bits: Nat64 := 9221120237041090560;
+
+    function nan(): Float64 is
+        return float64FromBits(nan_bits);
+    end;
+
+    function wide(b: Nat8): Nat64 is
+        case toNat64(b) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The Float64 of the eight bytes from at, little endian.
+    generic [R: Region]
+    function floatAt(bytes: Span[Nat8, R], at: Index): Float64 is
+        var bits: Nat64 := 0;
+        var i: Index := 8;
+        while i > 0 do
+            i := i - 1;
+            bits := modularAdd(modularMultiply(bits, 256), wide(bytes[at + i]));
+        end while;
+        return float64FromBits(bits);
+    end;
+
+    -- The bytes as an array of the shape rows by cols, or of n elements
+    -- when cols is 0.
+    generic [R: Region]
+    function arrayOf(bytes: Span[Nat8, R], rows: Index, cols: Index): NdArray[Float64] is
+        var values: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while (at + 8) <= spanLength(bytes) do
+            insertBack(&!values, floatAt(bytes, at));
+            at := at + 8;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        if cols > 0 then
+            insertBack(&!shape, cols);
+        end if;
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        return made;
+    end;
+
+    generic [R: Region]
+    function isVector(bytes: Span[Nat8, R]): Bool is
+        return (spanLength(bytes) > 0) and (rem(spanLength(bytes), 8) = 0);
+    end;
+
+    pragma Foreign_Export(External_Name => "mirco_dot");
+    generic [R: Region, S: Region]
+    function dotBytes(a: Span[Nat8, R], b: Span[Nat8, S]): Float64 is
+        if (not isVector(a)) or (spanLength(a) /= spanLength(b)) then
+            return nan();
+        end if;
+        let x: NdArray[Float64] := arrayOf(a, spanLength(a) / 8, 0);
+        let y: NdArray[Float64] := arrayOf(b, spanLength(b) / 8, 0);
+        let d: Float64 := dot(&x, &y);
+        destroyNdArray(x);
+        destroyNdArray(y);
+        return d;
+    end;
+
+    pragma Foreign_Export(External_Name => "mirco_mean");
+    generic [R: Region]
+    function meanBytes(values: Span[Nat8, R]): Float64 is
+        if not isVector(values) then
+            return nan();
+        end if;
+        let n: Index := spanLength(values) / 8;
+        var total: Float64 := 0.0;
+        var i: Index := 0;
+        while i < n do
+            total := total + floatAt(values, 8 * i);
+            i := i + 1;
+        end while;
+        case toFloat64(n) of
+            when Some(value as w: Float64) do
+                return total / w;
+            when None do
+                return nan();
+        end case;
+    end;
+
+    pragma Foreign_Export(External_Name => "mirco_deviation");
+    generic [R: Region]
+    function deviationBytes(values: Span[Nat8, R], ddof: Index): Float64 is
+        if (not isVector(values)) or ((spanLength(values) / 8) <= ddof) then
+            return nan();
+        end if;
+        let x: NdArray[Float64] := arrayOf(values, spanLength(values) / 8, 0);
+        let d: Float64 := standardDeviation(&x, ddof);
+        destroyNdArray(x);
+        return d;
+    end;
+
+    pragma Foreign_Export(External_Name => "mirco_matmul");
+    generic [R: Region, S: Region, Q: Region]
+    function matmulBytes(a: Span[Nat8, R], b: Span[Nat8, S], rows: Index, inner: Index, cols: Index, out: Span![Nat8, Q]): Bool is
+        if (rows = 0) or (inner = 0) or (cols = 0) then
+            return false;
+        end if;
+        if (spanLength(a) /= (8 * (rows * inner))) or (spanLength(b) /= (8 * (inner * cols))) then
+            return false;
+        end if;
+        let x: NdArray[Float64] := arrayOf(a, rows, inner);
+        let y: NdArray[Float64] := arrayOf(b, inner, cols);
+        let p: NdArray[Float64] := matmul(&x, &y);
+        var o: Span![Nat8, Q] := out;
+        var i: Index := 0;
+        while i < count(&p) do
+            var bits: Nat64 := float64Bits(flatGet(&p, i));
+            var k: Index := 0;
+            while k < 8 do
+                o[(8 * i) + k] := byteOf(rem(bits, 256));
+                bits := bits / 256;
+                k := k + 1;
+            end while;
+            i := i + 1;
+        end while;
+        destroyNdArray(x);
+        destroyNdArray(y);
+        destroyNdArray(p);
+        return true;
+    end;
+
+    function byteOf(v: Nat64): Nat8 is
+        case toNat8(v) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 0;
+        end case;
+    end;
+end module body.

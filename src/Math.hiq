@@ -1,0 +1,93 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Mirco.Bindings.Libm (
+    squareRoot as cSquareRoot,
+    exponential as cExponential,
+    logarithm as cLogarithm,
+    logarithm10 as cLogarithm10,
+    logarithmOnePlus as cLogarithmOnePlus,
+    power as cPower,
+    sine as cSine,
+    cosine as cCosine,
+    tangent as cTangent,
+    arcTangent2 as cArcTangent2,
+    floor as cFloor,
+    ceiling as cCeiling,
+    absolute as cAbsolute
+);
+
+module body Mirco.Math is
+    function pi(): Float64 is
+        return 3.141592653589793;
+    end;
+
+    function euler(): Float64 is
+        return 2.718281828459045;
+    end;
+
+    -- x - x is zero for every finite x, and a NaN for an infinity and a NaN.
+    function isFinite(x: Float64): Bool is
+        return (x - x) = 0.0;
+    end;
+
+    function isNaN(x: Float64): Bool is
+        return x /= x;
+    end;
+
+    function squareRoot(x: Float64): Float64 is
+        return cSquareRoot(x);
+    end;
+
+    function exponential(x: Float64): Float64 is
+        return cExponential(x);
+    end;
+
+    function logarithm(x: Float64): Float64 is
+        return cLogarithm(x);
+    end;
+
+    function logarithmOnePlus(x: Float64): Float64 is
+        return cLogarithmOnePlus(x);
+    end;
+
+    function logarithm10(x: Float64): Float64 is
+        return cLogarithm10(x);
+    end;
+
+    function power(base: Float64, exponent: Float64): Float64 is
+        return cPower(base, exponent);
+    end;
+
+    function sine(x: Float64): Float64 is
+        return cSine(x);
+    end;
+
+    function cosine(x: Float64): Float64 is
+        return cCosine(x);
+    end;
+
+    function tangent(x: Float64): Float64 is
+        return cTangent(x);
+    end;
+
+    function arcTangent2(y: Float64, x: Float64): Float64 is
+        return cArcTangent2(y, x);
+    end;
+
+    function floor(x: Float64): Float64 is
+        return cFloor(x);
+    end;
+
+    function ceiling(x: Float64): Float64 is
+        return cCeiling(x);
+    end;
+
+    function absolute(x: Float64): Float64 is
+        return cAbsolute(x);
+    end;
+end module body.

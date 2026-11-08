@@ -1,0 +1,105 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Mirco.Array (NdArray, count, flatGet);
+import Mirco.Math (absolute);
+
+module body Mirco.Integrate is
+    constant maximum_depth: Index := 50;
+
+    generic [R: Region]
+    function trapezoid(y: &[NdArray[Float64], R], dx: Float64): Float64 is
+        let n: Index := count(y);
+        var total: Float64 := 0.0;
+        var at: Index := 1;
+        while at < n do
+            total := total + ((flatGet(y, at - 1) + flatGet(y, at)) * dx);
+            at := at + 1;
+        end while;
+        return total / 2.0;
+    end;
+
+    generic [R: Region, S: Region]
+    function trapezoidOver(y: &[NdArray[Float64], R], x: &[NdArray[Float64], S]): Float64 is
+        let n: Index := count(y);
+        var total: Float64 := 0.0;
+        var at: Index := 1;
+        while at < n do
+            let width: Float64 := flatGet(x, at) - flatGet(x, at - 1);
+            total := total + ((flatGet(y, at - 1) + flatGet(y, at)) * width);
+            at := at + 1;
+        end while;
+        return total / 2.0;
+    end;
+
+    -- Simpson's rule over the samples from first to last, an even number
+    -- of intervals.
+    generic [R: Region]
+    function simpsonPart(y: &[NdArray[Float64], R], first: Index, last: Index, dx: Float64): Float64 is
+        var total: Float64 := flatGet(y, first) + flatGet(y, last);
+        var at: Index := first + 1;
+        while at < last do
+            if rem(at - first, 2) = 1 then
+                total := total + (4.0 * flatGet(y, at));
+            else
+                total := total + (2.0 * flatGet(y, at));
+            end if;
+            at := at + 1;
+        end while;
+        return (total * dx) / 3.0;
+    end;
+
+    generic [R: Region]
+    function simpson(y: &[NdArray[Float64], R], dx: Float64): Float64 is
+        let n: Index := count(y);
+        if n = 2 then
+            return trapezoid(y, dx);
+        end if;
+        if rem(n, 2) = 1 then
+            return simpsonPart(y, 0, n - 1, dx);
+        end if;
+        let rest: Float64 := (flatGet(y, n - 4) + (3.0 * flatGet(y, n - 3)) + (3.0 * flatGet(y, n - 2)) + flatGet(y, n - 1)) * dx;
+        let eighths: Float64 := (3.0 * rest) / 8.0;
+        if n = 4 then
+            return eighths;
+        end if;
+        return simpsonPart(y, 0, n - 4, dx) + eighths;
+    end;
+
+    -- One Simpson step over a to b with the values at both ends and the middle.
+    function step(fa: Float64, fm: Float64, fb: Float64, a: Float64, b: Float64): Float64 is
+        return ((b - a) / 6.0) * (fa + (4.0 * fm) + fb);
+    end;
+
+    -- Splits a to b in two halves while the two halves differ from the
+    -- whole by more than fifteen times the tolerance, the error estimate
+    -- of Richardson for Simpson's rule.
+    function adaptive(f: Fn[Float64, Float64], a: Float64, b: Float64, fa: Float64, fm: Float64, fb: Float64, whole: Float64, tolerance: Float64, depth: Index): Float64 is
+        let m: Float64 := (a + b) / 2.0;
+        let lm: Float64 := (a + m) / 2.0;
+        let rm: Float64 := (m + b) / 2.0;
+        let flm: Float64 := f(lm);
+        let frm: Float64 := f(rm);
+        let left: Float64 := step(fa, flm, fm, a, m);
+        let right: Float64 := step(fm, frm, fb, m, b);
+        let both: Float64 := left + right;
+        let difference: Float64 := both - whole;
+        if (depth >= maximum_depth) or (absolute(difference) <= (15.0 * tolerance)) then
+            return both + (difference / 15.0);
+        end if;
+        let first: Float64 := adaptive(f, a, m, fa, flm, fm, left, tolerance / 2.0, depth + 1);
+        let second: Float64 := adaptive(f, m, b, fm, frm, fb, right, tolerance / 2.0, depth + 1);
+        return first + second;
+    end;
+
+    function integrate(f: Fn[Float64, Float64], a: Float64, b: Float64, tolerance: Float64): Float64 is
+        let fa: Float64 := f(a);
+        let fb: Float64 := f(b);
+        let fm: Float64 := f((a + b) / 2.0);
+        return adaptive(f, a, b, fa, fm, fb, step(fa, fm, fb, a, b), tolerance, 0);
+    end;
+end module body.

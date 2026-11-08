@@ -1,0 +1,240 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (String, fromLiteral, asSpan, destroyString, length);
+import Standard.Bits (float64Bits, float64FromBits);
+import Mirco.Bindings.Number (parseChecked, formatWith);
+
+module body Mirco.Text is
+    constant nan_bits: Nat64 := 9221120237041090560;
+    constant infinity_bits: Nat64 := 9218868437227405312;
+
+    function isDigit(b: Nat8): Bool is
+        return (b >= 48) and (b <= 57);
+    end;
+
+    function isBlank(b: Nat8): Bool is
+        return (b = 32) or (b = 9);
+    end;
+
+    -- The byte in lower case, for the letters of nan and inf.
+    function lower(b: Nat8): Nat8 is
+        if (b >= 65) and (b <= 90) then
+            return b + 32;
+        end if;
+        return b;
+    end;
+
+    -- True when the bytes of text from at on, as many as word has, are word
+    -- in any case.
+    generic [R: Region]
+    function wordAt(text: Span[Nat8, R], at: Index, last: Index, word: Span[Nat8, Static]): Bool is
+        if (last - at) /= spanLength(word) then
+            return false;
+        end if;
+        var i: Index := 0;
+        while i < spanLength(word) do
+            if lower(text[at + i]) /= word[i] then
+                return false;
+            end if;
+            i := i + 1;
+        end while;
+        return true;
+    end;
+
+    -- The first byte that is not a blank, and the end after the last one.
+    generic [R: Region]
+    function firstOf(text: Span[Nat8, R]): Index is
+        var at: Index := 0;
+        while (at < spanLength(text)) and blankAt(text, at) do
+            at := at + 1;
+        end while;
+        return at;
+    end;
+
+    generic [R: Region]
+    function blankAt(text: Span[Nat8, R], at: Index): Bool is
+        if at >= spanLength(text) then
+            return false;
+        end if;
+        return isBlank(text[at]);
+    end;
+
+    generic [R: Region]
+    function endOf(text: Span[Nat8, R], first: Index): Index is
+        var last: Index := spanLength(text);
+        while (last > first) and blankAt(text, last - 1) do
+            last := last - 1;
+        end while;
+        return last;
+    end;
+
+    -- 0 for a decimal number, 1 for nan, 2 for an infinity, 3 for no number;
+    -- the bytes from first up to last, a sign included.
+    generic [R: Region]
+    function kindOf(text: Span[Nat8, R], first: Index, last: Index): Int32 is
+        var at: Index := first;
+        if at >= last then
+            return 3;
+        end if;
+        if (text[at] = 43) or (text[at] = 45) then
+            at := at + 1;
+        end if;
+        if wordAt(text, at, last, "nan") then
+            return 1;
+        end if;
+        if wordAt(text, at, last, "inf") or wordAt(text, at, last, "infinity") then
+            return 2;
+        end if;
+        var digits: Index := 0;
+        while (at < last) and digitAt(text, at) do
+            at := at + 1;
+            digits := digits + 1;
+        end while;
+        if (at < last) and (text[at] = 46) then
+            at := at + 1;
+            while (at < last) and digitAt(text, at) do
+                at := at + 1;
+                digits := digits + 1;
+            end while;
+        end if;
+        if digits = 0 then
+            return 3;
+        end if;
+        if (at < last) and ((text[at] = 101) or (text[at] = 69)) then
+            at := at + 1;
+            if (at < last) and ((text[at] = 43) or (text[at] = 45)) then
+                at := at + 1;
+            end if;
+            var exponent: Index := 0;
+            while (at < last) and digitAt(text, at) do
+                at := at + 1;
+                exponent := exponent + 1;
+            end while;
+            if exponent = 0 then
+                return 3;
+            end if;
+        end if;
+        if at /= last then
+            return 3;
+        end if;
+        return 0;
+    end;
+
+    generic [R: Region]
+    function digitAt(text: Span[Nat8, R], at: Index): Bool is
+        if at >= spanLength(text) then
+            return false;
+        end if;
+        return isDigit(text[at]);
+    end;
+
+    generic [R: Region]
+    function isNumber(text: Span[Nat8, R]): Bool is
+        let first: Index := firstOf(text);
+        return kindOf(text, first, endOf(text, first)) /= 3;
+    end;
+
+    generic [R: Region]
+    function parseFloat64(text: Span[Nat8, R]): Option[Float64] is
+        let first: Index := firstOf(text);
+        let last: Index := endOf(text, first);
+        let kind: Int32 := kindOf(text, first, last);
+        if kind = 3 then
+            return None();
+        end if;
+        if kind = 1 then
+            return Some(value => float64FromBits(nan_bits));
+        end if;
+        if kind = 2 then
+            let infinity: Float64 := float64FromBits(infinity_bits);
+            if text[first] = 45 then
+                return Some(value => 0.0 - infinity);
+            end if;
+            return Some(value => infinity);
+        end if;
+        return Some(value => parseChecked(spanPart(text, first, last - first)));
+    end;
+
+    -- %g writes 100 with one digit as 1e+02; an exponent from 0 to 16 is
+    -- written out with as many digits as the number has before its point.
+    function plainWhereShort(value: Float64, text: String): String is
+        let e: Int64 := exponentIn(asSpan(&text));
+        if (e >= 0) and (e <= 16) then
+            destroyString(text);
+            case toInt32(e + 1) of
+                when Some(value as digits: Int32) do
+                    return formatWith(value, digits);
+                when None do
+                    return formatWith(value, 17);
+            end case;
+        end if;
+        return text;
+    end;
+
+    -- The exponent after an e in text, or -1000 when there is none.
+    generic [R: Region]
+    function exponentIn(text: Span[Nat8, R]): Int64 is
+        var at: Index := 0;
+        while (at < spanLength(text)) and (text[at] /= 101) do
+            at := at + 1;
+        end while;
+        if at >= spanLength(text) then
+            return -1000;
+        end if;
+        at := at + 1;
+        var negative: Bool := false;
+        if (at < spanLength(text)) and ((text[at] = 45) or (text[at] = 43)) then
+            negative := text[at] = 45;
+            at := at + 1;
+        end if;
+        var e: Int64 := 0;
+        while (at < spanLength(text)) and digitAt(text, at) do
+            e := (e * 10) + digitValue(text[at]);
+            at := at + 1;
+        end while;
+        if negative then
+            return 0 - e;
+        end if;
+        return e;
+    end;
+
+    function digitValue(b: Nat8): Int64 is
+        case toInt64(b) of
+            when Some(value as v: Int64) do
+                return v - 48;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The text of one precision after the other, from 1 digit on, until it
+    -- reads back as value with the same bits; 17 digits always do.
+    function formatFloat64(value: Float64): String is
+        if value /= value then
+            return fromLiteral("nan");
+        end if;
+        let infinity: Float64 := float64FromBits(infinity_bits);
+        if value = infinity then
+            return fromLiteral("inf");
+        end if;
+        if value = (0.0 - infinity) then
+            return fromLiteral("-inf");
+        end if;
+        var precision: Int32 := 1;
+        while precision < 17 do
+            let text: String := formatWith(value, precision);
+            let back: Float64 := parseChecked(asSpan(&text));
+            if float64Bits(back) = float64Bits(value) then
+                return plainWhereShort(value, text);
+            end if;
+            destroyString(text);
+            precision := precision + 1;
+        end while;
+        return formatWith(value, 17);
+    end;
+end module body.

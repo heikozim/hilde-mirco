@@ -1,0 +1,546 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, wholeSpan, getSpanMut, nth, length as bufferLength);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, dimension, count, countMut, flatGet, flatGetMut, flatSet, fromSpan, elements, destroyNdArray);
+import Mirco.Linalg (Decomposition, parts, twoParts, threeParts);
+import Mirco.Bindings.Lapack (gesv, getrf, potrf, geqrf, orgqr, syevd, gesdd, gelsd, gemm as gemmPlain, gemmScaled);
+
+module body Mirco.Lapack is
+    -- Lapack counts in int; a dimension beyond it stops the programme, as a
+    -- dimension that does not fit does in Mirco.Linalg.
+    function small(i: Index): Int32 is
+        case toInt32(i) of
+            when Some(value as v: Int32) do
+                return v;
+            when None do
+                abort("Mirco.Lapack: a dimension does not fit into the int of Lapack");
+        end case;
+    end;
+
+    function wide(v: Int32): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function whole(n: Index): Index is
+        if n < 1 then
+            return 1;
+        end if;
+        return n;
+    end;
+
+    -- The elements of a matrix in column-major order.
+    generic [R: Region]
+    function columns(a: &[NdArray[Float64], R]): Buffer[Float64] is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        var out: Buffer[Float64] := allocateEmpty();
+        var j: Index := 0;
+        while j < n do
+            var i: Index := 0;
+            while i < m do
+                insertBack(&!out, flatGet(a, (i * n) + j));
+                i := i + 1;
+            end while;
+            j := j + 1;
+        end while;
+        return out;
+    end;
+
+    -- The matrix of rows by cols whose element i, j is values[i + j ld].
+    generic [R: Region]
+    function fromColumns(values: &[Buffer[Float64], R], rows: Index, cols: Index, ld: Index): NdArray[Float64] is
+        var flat: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < rows do
+            var j: Index := 0;
+            while j < cols do
+                insertBack(&!flat, nth(values, i + (j * ld)));
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, rows);
+        insertBack(&!shape, cols);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&flat));
+        destroyFree(shape);
+        destroyFree(flat);
+        return made;
+    end;
+
+    generic [R: Region]
+    function vectorOf(values: &[Buffer[Float64], R], n: Index): NdArray[Float64] is
+        var flat: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            insertBack(&!flat, nth(values, i));
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&flat));
+        destroyFree(shape);
+        destroyFree(flat);
+        return made;
+    end;
+
+    -- The size of work a routine asked for in work[0] by a query.
+    generic [R: Region]
+    function asked(work: &[Buffer[Float64], R]): Int32 is
+        case toInt32(nth(work, 0)) of
+            when Some(value as v: Int32) do
+                if v < 1 then
+                    return 1;
+                end if;
+                return v;
+            when None do
+                abort("Mirco.Lapack: Lapack asked for more work than an int counts");
+        end case;
+    end;
+
+    function stopOn(info: Int32, routine: Span[Nat8, Static]): Unit is
+        if info < 0 then
+            abort(routine);
+        end if;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function matmul(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): NdArray[Float64] is
+        let m: Index := dimension(a, 0);
+        let k: Index := dimension(a, 1);
+        let n: Index := dimension(b, 1);
+        if dimension(b, 0) /= k then
+            abort("Mirco.Lapack.matmul: the columns of a are not the rows of b");
+        end if;
+        var c: Buffer[Float64] := initialize(whole(m * n), 0.0);
+        if (m > 0) and ((n > 0) and (k > 0)) then
+            -- In row-major order a is the transpose of a column-major matrix,
+            -- so the transpose of c is b times a in column-major order.
+            gemmPlain(small(n), small(m), small(k), elements(b), elements(a), getSpanMut(&!c, 0, (m * n) - 1));
+        end if;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, m);
+        insertBack(&!shape, n);
+        var flat: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < (m * n) do
+            insertBack(&!flat, nth(&c, i));
+            i := i + 1;
+        end while;
+        let made: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&flat));
+        destroyFree(shape);
+        destroyFree(flat);
+        destroyFree(c);
+        return made;
+    end;
+
+    generic [R: Region, S: Region]
+    function dot(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Float64 is
+        let k: Index := count(a);
+        if count(b) /= k then
+            abort("Mirco.Lapack.dot: the vectors are not of the same length");
+        end if;
+        var c: Buffer[Float64] := initialize(1, 0.0);
+        gemmScaled(1, 1, small(k), 1.0, elements(a), elements(b), 0.0, getSpanMut(&!c, 0, 0));
+        let value: Float64 := nth(&c, 0);
+        destroyFree(c);
+        return value;
+    end;
+
+    generic [R: Region, S: Region]
+    function matvec(m: &[NdArray[Float64], R], x: &[NdArray[Float64], S]): NdArray[Float64] is
+        let rows: Index := dimension(m, 0);
+        let cols: Index := dimension(m, 1);
+        if count(x) /= cols then
+            abort("Mirco.Lapack.matvec: the columns of m are not the length of x");
+        end if;
+        -- In row-major order m is the transpose of a column-major matrix of
+        -- cols by rows, so the result, as a row, is x times that matrix.
+        var c: Buffer[Float64] := initialize(rows, 0.0);
+        gemmScaled(1, small(rows), small(cols), 1.0, elements(x), elements(m), 0.0, getSpanMut(&!c, 0, rows - 1));
+        let made: NdArray[Float64] := vectorOf(&c, rows);
+        destroyFree(c);
+        return made;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function gemv(alpha: Float64, m: &[NdArray[Float64], R], x: &[NdArray[Float64], S], beta: Float64, y: &![NdArray[Float64], Q]): Unit is
+        let rows: Index := dimension(m, 0);
+        let cols: Index := dimension(m, 1);
+        if (count(x) /= cols) or (countMut(&~y) /= rows) then
+            abort("Mirco.Lapack.gemv: m, x and y do not fit");
+        end if;
+        var c: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < rows do
+            insertBack(&!c, flatGetMut(&~y, i));
+            i := i + 1;
+        end while;
+        gemmScaled(1, small(rows), small(cols), alpha, elements(x), elements(m), beta, getSpanMut(&!c, 0, rows - 1));
+        i := 0;
+        while i < rows do
+            flatSet(&~y, i, nth(&c, i));
+            i := i + 1;
+        end while;
+        destroyFree(c);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function gemm(alpha: Float64, a: &[NdArray[Float64], R], b: &[NdArray[Float64], S], beta: Float64, c: &![NdArray[Float64], Q]): Unit is
+        let m: Index := dimension(a, 0);
+        let k: Index := dimension(a, 1);
+        let n: Index := dimension(b, 1);
+        if (dimension(b, 0) /= k) or (countMut(&~c) /= (m * n)) then
+            abort("Mirco.Lapack.gemm: a, b and c do not fit");
+        end if;
+        -- c in row-major order is its transpose in column-major order, the
+        -- transpose of b times the transpose of a, as matmul computes it.
+        var out: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < (m * n) do
+            insertBack(&!out, flatGetMut(&~c, i));
+            i := i + 1;
+        end while;
+        gemmScaled(small(n), small(m), small(k), alpha, elements(b), elements(a), beta, getSpanMut(&!out, 0, (m * n) - 1));
+        i := 0;
+        while i < (m * n) do
+            flatSet(&~c, i, nth(&out, i));
+            i := i + 1;
+        end while;
+        destroyFree(out);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function solve(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]] is
+        let n: Index := dimension(a, 0);
+        if (dimension(a, 1) /= n) or (n = 0) then
+            abort("Mirco.Lapack.solve: a is not a square matrix");
+        end if;
+        if dimension(b, 0) /= n then
+            abort("Mirco.Lapack.solve: b has not the rows of a");
+        end if;
+        var nrhs: Index := 1;
+        if rank(b) = 2 then
+            nrhs := dimension(b, 1);
+        end if;
+        if nrhs = 0 then
+            abort("Mirco.Lapack.solve: b has no column");
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var bm: Buffer[Float64] := allocateEmpty();
+        if rank(b) = 1 then
+            var i: Index := 0;
+            while i < n do
+                insertBack(&!bm, flatGet(b, i));
+                i := i + 1;
+            end while;
+        else
+            destroyFree(bm);
+            bm := columns(b);
+        end if;
+        var pivots: Buffer[Int32] := initialize(n, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let got: Int32 := gesv(small(n), small(nrhs), getSpanMut(&!am, 0, (n * n) - 1), getSpanMut(&!pivots, 0, n - 1), getSpanMut(&!bm, 0, (n * nrhs) - 1), getSpanMut(&!info, 0, 0));
+        destroyFree(am);
+        destroyFree(pivots);
+        destroyFree(info);
+        stopOn(got, "Mirco.Lapack.solve: dgesv refused its arguments");
+        if got > 0 then
+            destroyFree(bm);
+            return None();
+        end if;
+        if rank(b) = 1 then
+            let x: NdArray[Float64] := vectorOf(&bm, n);
+            destroyFree(bm);
+            return Some(value => x);
+        end if;
+        let x: NdArray[Float64] := fromColumns(&bm, n, nrhs, n);
+        destroyFree(bm);
+        return Some(value => x);
+    end;
+
+    generic [R: Region]
+    function determinant(a: &[NdArray[Float64], R]): Float64 is
+        let n: Index := dimension(a, 0);
+        if (dimension(a, 1) /= n) or (n = 0) then
+            abort("Mirco.Lapack.determinant: a is not a square matrix");
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var pivots: Buffer[Int32] := initialize(n, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let got: Int32 := getrf(small(n), small(n), getSpanMut(&!am, 0, (n * n) - 1), getSpanMut(&!pivots, 0, n - 1), getSpanMut(&!info, 0, 0));
+        destroyFree(info);
+        stopOn(got, "Mirco.Lapack.determinant: dgetrf refused its arguments");
+        var d: Float64 := 1.0;
+        var i: Index := 0;
+        while i < n do
+            d := d * nth(&am, i + (i * n));
+            if wide(nth(&pivots, i)) /= (i + 1) then
+                d := -d;
+            end if;
+            i := i + 1;
+        end while;
+        destroyFree(am);
+        destroyFree(pivots);
+        return d;
+    end;
+
+    generic [R: Region]
+    function inverse(a: &[NdArray[Float64], R]): Option[NdArray[Float64]] is
+        let n: Index := dimension(a, 0);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        insertBack(&!shape, n);
+        var flat: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < (n * n) do
+            if rem(i, n + 1) = 0 then
+                insertBack(&!flat, 1.0);
+            else
+                insertBack(&!flat, 0.0);
+            end if;
+            i := i + 1;
+        end while;
+        let identity: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&flat));
+        destroyFree(shape);
+        destroyFree(flat);
+        let x: Option[NdArray[Float64]] := solve(a, &identity);
+        destroyNdArray(identity);
+        return x;
+    end;
+
+    generic [R: Region]
+    function cholesky(a: &[NdArray[Float64], R]): Option[NdArray[Float64]] is
+        let n: Index := dimension(a, 0);
+        if (dimension(a, 1) /= n) or (n = 0) then
+            abort("Mirco.Lapack.cholesky: a is not a square matrix");
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let got: Int32 := potrf(small(n), getSpanMut(&!am, 0, (n * n) - 1), getSpanMut(&!info, 0, 0));
+        destroyFree(info);
+        stopOn(got, "Mirco.Lapack.cholesky: dpotrf refused its arguments");
+        if got > 0 then
+            destroyFree(am);
+            return None();
+        end if;
+        var flat: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            var j: Index := 0;
+            while j < n do
+                if j <= i then
+                    insertBack(&!flat, nth(&am, i + (j * n)));
+                else
+                    insertBack(&!flat, 0.0);
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        insertBack(&!shape, n);
+        let l: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&flat));
+        destroyFree(shape);
+        destroyFree(flat);
+        destroyFree(am);
+        return Some(value => l);
+    end;
+
+    generic [R: Region]
+    function qr(a: &[NdArray[Float64], R]): Decomposition is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        if (n = 0) or (m < n) then
+            abort("Mirco.Lapack.qr: a needs at least as many rows as columns, and a column");
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var tau: Buffer[Float64] := initialize(n, 0.0);
+        var work: Buffer[Float64] := initialize(1, 0.0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let query: Int32 := geqrf(small(m), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!tau, 0, n - 1), getSpanMut(&!work, 0, 0), -1, getSpanMut(&!info, 0, 0));
+        stopOn(query, "Mirco.Lapack.qr: dgeqrf refused its query");
+        let lwork: Int32 := asked(&work);
+        destroyFree(work);
+        var room: Buffer[Float64] := initialize(wide(lwork), 0.0);
+        let got: Int32 := geqrf(small(m), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!tau, 0, n - 1), getSpanMut(&!room, 0, wide(lwork) - 1), lwork, getSpanMut(&!info, 0, 0));
+        stopOn(got, "Mirco.Lapack.qr: dgeqrf refused its arguments");
+        destroyFree(room);
+        var rflat: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < n do
+            var j: Index := 0;
+            while j < n do
+                if j >= i then
+                    insertBack(&!rflat, nth(&am, i + (j * m)));
+                else
+                    insertBack(&!rflat, 0.0);
+                end if;
+                j := j + 1;
+            end while;
+            i := i + 1;
+        end while;
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        insertBack(&!shape, n);
+        let r: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&rflat));
+        destroyFree(shape);
+        destroyFree(rflat);
+        var work2: Buffer[Float64] := initialize(1, 0.0);
+        let query2: Int32 := orgqr(small(m), small(n), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!tau, 0, n - 1), getSpanMut(&!work2, 0, 0), -1, getSpanMut(&!info, 0, 0));
+        stopOn(query2, "Mirco.Lapack.qr: dorgqr refused its query");
+        let lwork2: Int32 := asked(&work2);
+        destroyFree(work2);
+        var room2: Buffer[Float64] := initialize(wide(lwork2), 0.0);
+        let got2: Int32 := orgqr(small(m), small(n), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!tau, 0, n - 1), getSpanMut(&!room2, 0, wide(lwork2) - 1), lwork2, getSpanMut(&!info, 0, 0));
+        stopOn(got2, "Mirco.Lapack.qr: dorgqr refused its arguments");
+        destroyFree(room2);
+        destroyFree(tau);
+        destroyFree(info);
+        let q: NdArray[Float64] := fromColumns(&am, m, n, m);
+        destroyFree(am);
+        return twoParts(q, r);
+    end;
+
+    generic [R: Region, S: Region]
+    function lstsq(a: &[NdArray[Float64], R], b: &[NdArray[Float64], S]): Option[NdArray[Float64]] is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        if (m = 0) or (n = 0) then
+            abort("Mirco.Lapack.lstsq: a has no element");
+        end if;
+        if dimension(b, 0) /= m then
+            abort("Mirco.Lapack.lstsq: b has not the rows of a");
+        end if;
+        var most: Index := m;
+        var least: Index := n;
+        if n > m then
+            most := n;
+            least := m;
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var bf: Buffer[Float64] := allocateEmpty();
+        var i: Index := 0;
+        while i < most do
+            if i < m then
+                insertBack(&!bf, flatGet(b, i));
+            else
+                insertBack(&!bf, 0.0);
+            end if;
+            i := i + 1;
+        end while;
+        var s: Buffer[Float64] := initialize(least, 0.0);
+        var work: Buffer[Float64] := initialize(1, 0.0);
+        var iwork: Buffer[Int32] := initialize(203 * least, 0);
+        var info: Buffer[Int32] := initialize(2, 0);
+        let query: Int32 := gelsd(small(m), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!bf, 0, most - 1), getSpanMut(&!s, 0, least - 1), getSpanMut(&!work, 0, 0), getSpanMut(&!iwork, 0, (203 * least) - 1), getSpanMut(&!info, 0, 1));
+        stopOn(query, "Mirco.Lapack.lstsq: dgelsd refused its query");
+        let lwork: Int32 := asked(&work);
+        destroyFree(work);
+        var room: Buffer[Float64] := initialize(wide(lwork) + 1, 0.0);
+        let got: Int32 := gelsd(small(m), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!bf, 0, most - 1), getSpanMut(&!s, 0, least - 1), getSpanMut(&!room, 0, wide(lwork)), getSpanMut(&!iwork, 0, (203 * least) - 1), getSpanMut(&!info, 0, 1));
+        stopOn(got, "Mirco.Lapack.lstsq: dgelsd refused its arguments");
+        let rank_found: Int32 := nth(&info, 1);
+        destroyFree(room);
+        destroyFree(am);
+        destroyFree(s);
+        destroyFree(iwork);
+        destroyFree(info);
+        if (got > 0) or (wide(rank_found) < n) then
+            destroyFree(bf);
+            return None();
+        end if;
+        let x: NdArray[Float64] := vectorOf(&bf, n);
+        destroyFree(bf);
+        return Some(value => x);
+    end;
+
+    generic [R: Region]
+    function eigenSymmetric(a: &[NdArray[Float64], R]): Decomposition is
+        let n: Index := dimension(a, 0);
+        if (dimension(a, 1) /= n) or (n = 0) then
+            abort("Mirco.Lapack.eigenSymmetric: a is not a square matrix");
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var w: Buffer[Float64] := initialize(n, 0.0);
+        var work: Buffer[Float64] := initialize(1, 0.0);
+        var iwork: Buffer[Int32] := initialize(1, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let query: Int32 := syevd(small(n), getSpanMut(&!am, 0, (n * n) - 1), getSpanMut(&!w, 0, n - 1), getSpanMut(&!work, 0, 0), -1, getSpanMut(&!iwork, 0, 0), -1, getSpanMut(&!info, 0, 0));
+        stopOn(query, "Mirco.Lapack.eigenSymmetric: dsyevd refused its query");
+        let lwork: Int32 := asked(&work);
+        var liwork: Int32 := nth(&iwork, 0);
+        if liwork < 1 then
+            liwork := 1;
+        end if;
+        destroyFree(work);
+        destroyFree(iwork);
+        var room: Buffer[Float64] := initialize(wide(lwork), 0.0);
+        var iroom: Buffer[Int32] := initialize(wide(liwork), 0);
+        let got: Int32 := syevd(small(n), getSpanMut(&!am, 0, (n * n) - 1), getSpanMut(&!w, 0, n - 1), getSpanMut(&!room, 0, wide(lwork) - 1), lwork, getSpanMut(&!iroom, 0, wide(liwork) - 1), liwork, getSpanMut(&!info, 0, 0));
+        stopOn(got, "Mirco.Lapack.eigenSymmetric: dsyevd refused its arguments");
+        if got > 0 then
+            abort("Mirco.Lapack.eigenSymmetric: dsyevd did not converge");
+        end if;
+        destroyFree(room);
+        destroyFree(iroom);
+        destroyFree(info);
+        let values: NdArray[Float64] := vectorOf(&w, n);
+        let vectors: NdArray[Float64] := fromColumns(&am, n, n, n);
+        destroyFree(w);
+        destroyFree(am);
+        return twoParts(values, vectors);
+    end;
+
+    generic [R: Region]
+    function svd(a: &[NdArray[Float64], R]): Decomposition is
+        let m: Index := dimension(a, 0);
+        let n: Index := dimension(a, 1);
+        if (n = 0) or (m < n) then
+            abort("Mirco.Lapack.svd: a needs at least as many rows as columns, and a column");
+        end if;
+        var am: Buffer[Float64] := columns(a);
+        var s: Buffer[Float64] := initialize(n, 0.0);
+        var u: Buffer[Float64] := initialize(m * n, 0.0);
+        var vt: Buffer[Float64] := initialize(n * n, 0.0);
+        var work: Buffer[Float64] := initialize(1, 0.0);
+        var iwork: Buffer[Int32] := initialize(8 * n, 0);
+        var info: Buffer[Int32] := initialize(1, 0);
+        let query: Int32 := gesdd(small(m), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!s, 0, n - 1), getSpanMut(&!u, 0, (m * n) - 1), getSpanMut(&!vt, 0, (n * n) - 1), getSpanMut(&!work, 0, 0), getSpanMut(&!iwork, 0, (8 * n) - 1), getSpanMut(&!info, 0, 0));
+        stopOn(query, "Mirco.Lapack.svd: dgesdd refused its query");
+        let lwork: Int32 := asked(&work);
+        destroyFree(work);
+        var room: Buffer[Float64] := initialize(wide(lwork) + 1, 0.0);
+        let got: Int32 := gesdd(small(m), small(n), getSpanMut(&!am, 0, (m * n) - 1), getSpanMut(&!s, 0, n - 1), getSpanMut(&!u, 0, (m * n) - 1), getSpanMut(&!vt, 0, (n * n) - 1), getSpanMut(&!room, 0, wide(lwork)), getSpanMut(&!iwork, 0, (8 * n) - 1), getSpanMut(&!info, 0, 0));
+        stopOn(got, "Mirco.Lapack.svd: dgesdd refused its arguments");
+        if got > 0 then
+            abort("Mirco.Lapack.svd: dgesdd did not converge");
+        end if;
+        destroyFree(room);
+        destroyFree(iwork);
+        destroyFree(info);
+        destroyFree(am);
+        let uu: NdArray[Float64] := fromColumns(&u, m, n, m);
+        let ss: NdArray[Float64] := vectorOf(&s, n);
+        let vv: NdArray[Float64] := fromColumns(&vt, n, n, n);
+        destroyFree(u);
+        destroyFree(s);
+        destroyFree(vt);
+        return threeParts(uu, ss, vv);
+    end;
+end module body.

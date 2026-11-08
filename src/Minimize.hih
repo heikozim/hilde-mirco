@@ -1,0 +1,50 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Finds the smallest value of a function of several variables, by the simplex of Nelder and Mead or by the method of Broyden, Fletcher, Goldfarb and Shanno.
+
+- The function is a value of a type with an instance of Objective, so that it can carry its own constants.
+- Nelder and Mead take the coefficients, the first simplex and the stop of scipy's method Nelder-Mead.
+- The method of Broyden, Fletcher, Goldfarb and Shanno takes the gradient by central differences and the step by backtracking until the Armijo condition holds.
+- Each search stops after at most 200 steps per variable; the point reached last comes back.
+
+    let best: NdArray[Float64] := nelderMead(rosenbrock, &start, 0.0000000001);
+"""
+import Mirco.Array (NdArray, rank, count);
+
+module Mirco.Minimize is
+    """
+    A function of a vector to a number, to be minimized.
+    """
+    typeclass Objective(T: Free) is
+        """
+        The value of the function objective at the point x, a vector.
+        No contract: a method takes no requires or ensures in the language; it has no precondition on the point beyond the instance's own, and any Float64 is a possible value.
+        """
+        generic [R: Region]
+        method valueAt(objective: T, x: &[NdArray[Float64], R]): Float64;
+    end;
+
+    """
+    The point of the smallest value of objective found by the simplex of Nelder and Mead from start; the
+    search stops when the simplex and its values are both within tolerance of its best vertex.
+    """
+    generic [T: Free(Objective), R: Region]
+    function nelderMead(objective: T, start: &[NdArray[Float64], R], tolerance: Float64): NdArray[Float64]
+        requires (rank(start) = 1) and (count(start) > 0) and (tolerance > 0.0)
+        ensures count(&result) = count(start);
+
+    """
+    The point of the smallest value of objective found by the method of Broyden, Fletcher, Goldfarb and Shanno from start; the search stops when the
+    largest part of the gradient is within tolerance.
+    """
+    generic [T: Free(Objective), R: Region]
+    function bfgs(objective: T, start: &[NdArray[Float64], R], tolerance: Float64): NdArray[Float64]
+        requires (rank(start) = 1) and (count(start) > 0) and (tolerance > 0.0)
+        ensures count(&result) = count(start);
+end module.

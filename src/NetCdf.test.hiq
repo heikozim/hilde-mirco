@@ -1,0 +1,469 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, wholeSpan, getSpanMut, nth);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal, contains);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile as closeDescriptor,
+    environmentValue,
+    removeFileIfThere
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, destroyNdArray, rank, dimension, count, flatGet, fromSpan);
+import Mirco.NetCdf (NetCdfFault, writeFloat64, writeInt64, readFloat64, readInt64);
+import Mirco.Bindings.NetCdf (zeroFree, create, open as openFile, defineDimension, defineVariable, variableOf, dimensionsOf, close as closeFile);
+import Standard.Testing (assertTrue, assertFalse);
+
+module body Mirco.NetCdf.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeDescriptor(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeDescriptor(output);
+                let closed_errors: Bool := closeDescriptor(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeDescriptor(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeDescriptor(output);
+                let closed_errors: Bool := closeDescriptor(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function faultCode(fault: NetCdfFault): Int32 is
+        case fault of
+            when NotOpened do
+                return 1;
+            when NoVariable do
+                return 2;
+            when OtherType do
+                return 3;
+            when BadDimensions do
+                return 4;
+            when NotDone do
+                return 5;
+        end case;
+    end;
+
+    function writtenFloat(path: Span[Nat8, Static]): Bool is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 2);
+        insertBack(&!shape, 3);
+        var values: Buffer[Float64] := allocateEmpty();
+        insertBack(&!values, 1.5);
+        insertBack(&!values, -2.0);
+        insertBack(&!values, 3.25);
+        insertBack(&!values, 0.0);
+        insertBack(&!values, 1.0e300);
+        insertBack(&!values, -7.0e-300);
+        let a: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        var done: Bool := false;
+        case writeFloat64(path, "x", &a, true) of
+            when Right(right as u: Unit) do
+                done := true;
+            when Left(left as f: NetCdfFault) do
+                done := false;
+        end case;
+        destroyNdArray(a);
+        return done;
+    end;
+
+    function writtenInt(path: Span[Nat8, Static]): Bool is
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 4);
+        var values: Buffer[Int64] := allocateEmpty();
+        insertBack(&!values, -9223372036854775807);
+        insertBack(&!values, -1);
+        insertBack(&!values, 0);
+        insertBack(&!values, 9223372036854775807);
+        let a: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&values));
+        destroyFree(shape);
+        destroyFree(values);
+        var done: Bool := false;
+        case writeInt64(path, "group-free-n", &a, false) of
+            when Right(right as u: Unit) do
+                done := true;
+            when Left(left as f: NetCdfFault) do
+                done := false;
+        end case;
+        destroyNdArray(a);
+        return done;
+    end;
+
+    -- A netCDF file at path with the variable x over two dimensions of the
+    -- lengths first and second, of NC_DOUBLE when floating holds and of
+    -- NC_INT64 otherwise, no element written: the shape the file announces
+    -- without the elements to back it; a length of 0 makes netCDF take the
+    -- dimension as unlimited.
+    function madeEmpty(path: Span[Nat8, Static], first: Index, second: Index, floating: Bool): Bool is
+        var ids: Buffer[Int32] := initialize(1, -1);
+        if create(path, getSpanMut(&!ids, 0, 0)) /= 0 then
+            destroyFree(ids);
+            return false;
+        end if;
+        let file: Int32 := nth(&ids, 0);
+        var dims: Buffer[Int32] := allocateEmpty();
+        let status_one: Int32 := defineDimension(file, "a", first, getSpanMut(&!ids, 0, 0));
+        if status_one = 0 then
+            insertBack(&!dims, nth(&ids, 0));
+        end if;
+        var status_two: Int32 := -1;
+        if status_one = 0 then
+            status_two := defineDimension(file, "b", second, getSpanMut(&!ids, 0, 0));
+            if status_two = 0 then
+                insertBack(&!dims, nth(&ids, 0));
+            end if;
+        end if;
+        var status_var: Int32 := -1;
+        if (status_one = 0) and (status_two = 0) then
+            status_var := defineVariable(file, "x", floating, wholeSpan(&dims), getSpanMut(&!ids, 0, 0));
+        end if;
+        let closed: Int32 := closeFile(file);
+        destroyFree(dims);
+        destroyFree(ids);
+        return (status_one = 0) and ((status_two = 0) and ((status_var = 0) and (closed = 0)));
+    end;
+
+    -- The code of the fault readFloat64 gives for the variable x of the
+    -- file at path, or 0 when it gives an array.
+    function readFloatCode(path: Span[Nat8, Static]): Int32 is
+        case readFloat64(path, "x") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                return 0;
+            when Left(left as f: NetCdfFault) do
+                return faultCode(f);
+        end case;
+    end;
+
+    -- The code of the fault readInt64 gives for the variable x of the file
+    -- at path, or 0 when it gives an array.
+    function readIntCode(path: Span[Nat8, Static]): Int32 is
+        case readInt64(path, "x") of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                return 0;
+            when Left(left as f: NetCdfFault) do
+                return faultCode(f);
+        end case;
+    end;
+
+    -- A matrix of Float64 and a vector of Int64 in one file, read back
+    -- element for element with their shapes.
+    function testRoundTrip(): Unit is
+        assertTrue(writtenFloat("mirco-test.nc"), "the matrix is written into a new file");
+        assertTrue(writtenInt("mirco-test.nc"), "the vector is written into the same file");
+        case readFloat64("mirco-test.nc", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                assertTrue((rank(&m) = 2) and ((dimension(&m, 0) = 2) and (dimension(&m, 1) = 3)), "two by three");
+                assertTrue((flatGet(&m, 0) = 1.5) and ((flatGet(&m, 2) = 3.25) and (flatGet(&m, 4) = 1.0e300)), "the numbers");
+                assertTrue(flatGet(&m, 5) = -7.0e-300, "the smallest");
+                destroyNdArray(m);
+            when Left(left as f: NetCdfFault) do
+                assertTrue(false, "the matrix is read");
+        end case;
+        case readInt64("mirco-test.nc", "group-free-n") of
+            when Right(right as v: NdArray[Int64]) do
+                assertTrue((rank(&v) = 1) and (count(&v) = 4), "four integers");
+                assertTrue((flatGet(&v, 0) = -9223372036854775807) and (flatGet(&v, 3) = 9223372036854775807), "the extremes");
+                destroyNdArray(v);
+            when Left(left as f: NetCdfFault) do
+                assertTrue(false, "the vector is read");
+        end case;
+        assertTrue(removeFileIfThere("mirco-test.nc"), "the file is removed");
+        return nil;
+    end;
+
+    -- A missing file, a missing dataset and a dataset of the other type.
+    function testRefusals(): Unit is
+        case readFloat64("mirco-missing.nc", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "no such file");
+            when Left(left as f: NetCdfFault) do
+                assertTrue(faultCode(f) = 1, "NotOpened");
+        end case;
+        assertTrue(writtenFloat("mirco-refused.nc"), "the matrix is written");
+        assertTrue(writtenInt("mirco-refused.nc"), "the vector is written");
+        case readFloat64("mirco-refused.nc", "y") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "no variable y");
+            when Left(left as f: NetCdfFault) do
+                assertTrue(faultCode(f) = 2, "NoVariable");
+        end case;
+        case readFloat64("mirco-refused.nc", "group-free-n") of
+            when Right(right as m: NdArray[Float64]) do
+                destroyNdArray(m);
+                assertTrue(false, "integers are no Float64");
+            when Left(left as f: NetCdfFault) do
+                assertTrue(faultCode(f) = 3, "OtherType for integers");
+        end case;
+        case readInt64("mirco-refused.nc", "x") of
+            when Right(right as v: NdArray[Int64]) do
+                destroyNdArray(v);
+                assertTrue(false, "Float64 is no Int64");
+            when Left(left as f: NetCdfFault) do
+                assertTrue(faultCode(f) = 3, "OtherType for numbers");
+        end case;
+        assertTrue(removeFileIfThere("mirco-refused.nc"), "the file is removed");
+        return nil;
+    end;
+
+    -- The lengths of the dimensions a file announces are checked before
+    -- the array is made: a length of 0, and a product of the lengths that
+    -- does not fit an Index or goes above readElementLimit(), come back as
+    -- BadDimensions; before the check each of them stopped the programme
+    -- over a contract of Mirco.Array.  A file with a shape an array can
+    -- have is read as one, whatever its elements hold.
+    function testHostileDimensionsAreFaults(): Unit is
+        assertTrue(madeEmpty("mirco-hostile.nc", 0, 3, true), "a variable over 0 x 3 is made");
+        assertTrue(readFloatCode("mirco-hostile.nc") = 4, "a dimension of 0 gives BadDimensions");
+        assertTrue(madeEmpty("mirco-hostile.nc", 0, 3, false), "an integer variable over 0 x 3 is made");
+        assertTrue(readIntCode("mirco-hostile.nc") = 4, "a dimension of 0 gives BadDimensions for integers");
+        assertTrue(madeEmpty("mirco-hostile.nc", 1099511627776, 1099511627776, true), "a variable over 2^40 x 2^40 is made");
+        assertTrue(readFloatCode("mirco-hostile.nc") = 4, "a count of elements that overflows an Index gives BadDimensions");
+        assertTrue(madeEmpty("mirco-hostile.nc", 1048576, 1048576, true), "a variable over 2^20 x 2^20 is made");
+        assertTrue(readFloatCode("mirco-hostile.nc") = 4, "2^20 x 2^20, a count of 2^40 elements above readElementLimit(), gives BadDimensions");
+        assertTrue(madeEmpty("mirco-hostile.nc", 1048576, 1048576, false), "an integer variable over 2^20 x 2^20 is made");
+        assertTrue(readIntCode("mirco-hostile.nc") = 4, "2^20 x 2^20 gives BadDimensions for integers");
+        assertTrue(madeEmpty("mirco-hostile.nc", 65536, 65537, false), "an integer variable over 65536 x 65537 is made");
+        assertTrue(readIntCode("mirco-hostile.nc") = 4, "a count of elements above readElementLimit() gives BadDimensions");
+        assertTrue(madeEmpty("mirco-hostile.nc", 2, 3, true), "a variable over 2 x 3 is made");
+        case readFloat64("mirco-hostile.nc", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                assertTrue((rank(&m) = 2) and ((dimension(&m, 0) = 2) and (dimension(&m, 1) = 3)), "two by three");
+                assertTrue(count(&m) = 6, "six elements");
+                destroyNdArray(m);
+            when Left(left as f: NetCdfFault) do
+                assertTrue(false, "a shape an array can have is read");
+        end case;
+        assertTrue(madeEmpty("mirco-hostile.nc", 2, 3, false), "an integer variable over 2 x 3 is made");
+        case readInt64("mirco-hostile.nc", "x") of
+            when Right(right as v: NdArray[Int64]) do
+                assertTrue((rank(&v) = 2) and (count(&v) = 6), "six integers in two axes");
+                destroyNdArray(v);
+            when Left(left as f: NetCdfFault) do
+                assertTrue(false, "a shape an array can have is read as integers");
+        end case;
+        assertTrue(removeFileIfThere("mirco-hostile.nc"), "the file is removed");
+        return nil;
+    end;
+
+    -- The contract of the NetCdf functions asks for zeroFree of the path and the
+    -- name: the library would read a zero byte as the end of the text.
+    function testAZeroByteInAPathIsRefused(): Unit is
+        var clean: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!clean, 120);
+        insertBack(&!clean, 46);
+        insertBack(&!clean, 104);
+        var broken: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!broken, 120);
+        insertBack(&!broken, 0);
+        insertBack(&!broken, 104);
+        var alone: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!alone, 0);
+        let empty: Buffer[Nat8] := allocateEmpty();
+        assertTrue(zeroFree(wholeSpan(&clean)), "a text without a zero byte is taken");
+        assertTrue(zeroFree(wholeSpan(&empty)), "an empty text holds no zero byte");
+        assertFalse(zeroFree(wholeSpan(&broken)), "a zero byte inside ends the name for C");
+        assertFalse(zeroFree(wholeSpan(&alone)), "a zero byte alone is refused");
+        destroyFree(clean);
+        destroyFree(broken);
+        destroyFree(alone);
+        destroyFree(empty);
+        return nil;
+    end;
+
+    -- dimensionsOf of the binding refuses an out of fewer places than the
+    -- rank with NC_EINVAL, -36, and leaves the place after the first alone;
+    -- an out of as many places as the rank takes the identifiers.
+    function testDimensionsOfRefusesTooSmallAnOut(): Unit is
+        assertTrue(writtenFloat("mirco-dims.nc"), "the matrix is written");
+        var ids: Buffer[Int32] := initialize(1, -1);
+        assertTrue(openFile("mirco-dims.nc", false, getSpanMut(&!ids, 0, 0)) = 0, "the file is opened");
+        let file: Int32 := nth(&ids, 0);
+        assertTrue(variableOf(file, "x", getSpanMut(&!ids, 0, 0)) = 0, "the variable is found");
+        let variable: Int32 := nth(&ids, 0);
+        destroyFree(ids);
+        var room: Buffer[Int32] := initialize(3, -1);
+        assertTrue(dimensionsOf(file, variable, getSpanMut(&!room, 0, 0)) = -36, "one place for a rank of 2 is refused");
+        assertTrue(nth(&room, 1) = -1, "nothing is written past the place given");
+        assertTrue(dimensionsOf(file, variable, getSpanMut(&!room, 0, 1)) = 0, "two places for a rank of 2 are taken");
+        assertTrue(nth(&room, 2) = -1, "nothing is written past the two places");
+        destroyFree(room);
+        assertTrue(closeFile(file) = 0, "the file is closed");
+        assertTrue(removeFileIfThere("mirco-dims.nc"), "the file is removed");
+        return nil;
+    end;
+
+    -- Calls, as the child for the word MIRCO_REFUSE names, the function of
+    -- that word with a zero byte in the path or the name; for inside, the
+    -- same functions with a path and a name without one.
+    function callWithZero(): Unit is
+        var clean: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!clean, 120);
+        var broken: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!broken, 120);
+        insertBack(&!broken, 0);
+        insertBack(&!broken, 104);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, 1);
+        var floats: Buffer[Float64] := allocateEmpty();
+        insertBack(&!floats, 1.0);
+        var ints: Buffer[Int64] := allocateEmpty();
+        insertBack(&!ints, 1);
+        let f: NdArray[Float64] := fromSpan(wholeSpan(&shape), wholeSpan(&floats));
+        let n: NdArray[Int64] := fromSpan(wholeSpan(&shape), wholeSpan(&ints));
+        if asChild("writeFloat64Path") then
+            case writeFloat64(wholeSpan(&broken), "x", &f, true) of
+                when Right(right as u: Unit) do
+                    skip;
+                when Left(left as e: NetCdfFault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("writeInt64Name") then
+            case writeInt64("mirco-zero.nc", wholeSpan(&broken), &n, true) of
+                when Right(right as u: Unit) do
+                    skip;
+                when Left(left as e: NetCdfFault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("readFloat64Path") then
+            case readFloat64(wholeSpan(&broken), "x") of
+                when Right(right as m: NdArray[Float64]) do
+                    destroyNdArray(m);
+                when Left(left as e: NetCdfFault) do
+                    skip;
+            end case;
+        end if;
+        if asChild("readInt64Name") then
+            case readInt64("mirco-missing.nc", wholeSpan(&broken)) of
+                when Right(right as m: NdArray[Int64]) do
+                    destroyNdArray(m);
+                when Left(left as e: NetCdfFault) do
+                    skip;
+            end case;
+        end if;
+        var ids: Buffer[Int32] := initialize(1, -1);
+        if asChild("create") then
+            let status: Int32 := create(wholeSpan(&broken), getSpanMut(&!ids, 0, 0));
+        end if;
+        if asChild("open") then
+            let status: Int32 := openFile(wholeSpan(&broken), false, getSpanMut(&!ids, 0, 0));
+        end if;
+        if asChild("defineDimension") then
+            let status: Int32 := defineDimension(-1, wholeSpan(&broken), 1, getSpanMut(&!ids, 0, 0));
+        end if;
+        if asChild("defineVariable") then
+            let dims: Buffer[Int32] := initialize(1, 0);
+            let status: Int32 := defineVariable(-1, wholeSpan(&broken), true, wholeSpan(&dims), getSpanMut(&!ids, 0, 0));
+            destroyFree(dims);
+        end if;
+        if asChild("variableOf") then
+            let status: Int32 := variableOf(-1, wholeSpan(&broken), getSpanMut(&!ids, 0, 0));
+        end if;
+        destroyFree(ids);
+        if asChild("inside") then
+            case readFloat64("mirco-missing.nc", wholeSpan(&clean)) of
+                when Right(right as m: NdArray[Float64]) do
+                    destroyNdArray(m);
+                when Left(left as e: NetCdfFault) do
+                    skip;
+            end case;
+            var clean_ids: Buffer[Int32] := initialize(1, -1);
+            let status: Int32 := variableOf(-1, wholeSpan(&clean), getSpanMut(&!clean_ids, 0, 0));
+            destroyFree(clean_ids);
+        end if;
+        destroyNdArray(f);
+        destroyNdArray(n);
+        destroyFree(shape);
+        destroyFree(floats);
+        destroyFree(ints);
+        destroyFree(clean);
+        destroyFree(broken);
+        return nil;
+    end;
+
+    -- A zero byte in the path or the name is refused by the requires of
+    -- each function that hands it to C, before the library sees it; a path
+    -- and a name without one break no contract.
+    function testAZeroByteIsRefusedByTheContracts(): Unit is
+        if asChild("inside") or (asChild("writeFloat64Path") or asChild("writeInt64Name") or asChild("readFloat64Path") or asChild("readInt64Name") or asChild("create") or asChild("open") or asChild("defineDimension") or asChild("defineVariable") or asChild("variableOf")) then
+            callWithZero();
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "writeFloat64Path", "contract violated: the requires"), "Mirco.NetCdf.writeFloat64 with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "writeInt64Name", "contract violated: the requires"), "Mirco.NetCdf.writeInt64 with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "readFloat64Path", "contract violated: the requires"), "Mirco.NetCdf.readFloat64 with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "readInt64Name", "contract violated: the requires"), "Mirco.NetCdf.readInt64 with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "create", "contract violated: the requires"), "create of the binding with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "open", "contract violated: the requires"), "open of the binding with a zero byte in the path is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "defineDimension", "contract violated: the requires"), "defineDimension of the binding with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "defineVariable", "contract violated: the requires"), "defineVariable of the binding with a zero byte in the name is refused");
+        assertTrue(refusedInChild("testAZeroByteIsRefusedByTheContracts", "variableOf", "contract violated: the requires"), "variableOf of the binding with a zero byte in the name is refused");
+        assertTrue(not refusedInChild("testAZeroByteIsRefusedByTheContracts", "inside", "contract violated"), "a path and a name without a zero byte break no contract");
+        return nil;
+    end;
+end module body.

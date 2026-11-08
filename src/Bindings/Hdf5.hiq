@@ -1,0 +1,173 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Each function is one call of libhdf5 against hdf5.h, or a few calls
+-- that only make sense together.  HDF5 wants names that end in a zero
+-- byte, so a name is copied into memory of its length and one byte more.
+-- A dimension is an hsize_t, which is an unsigned 64 bit number.
+pragma Unsafe_Module;
+pragma Foreign_Library(Name => "hdf5");
+pragma Foreign_Header(Name => "hdf5.h");
+pragma Foreign_Header(Name => "string.h");
+
+import Hilde.Memory (
+    Address,
+    Pointer,
+    nullCheck,
+    allocateBuffer,
+    deallocate
+);
+
+module body Mirco.Bindings.Hdf5 is
+    generic [R: Region]
+    function zeroFree(text: Span[Nat8, R]): Bool is
+        var at: Index := 0;
+        while at < spanLength(text) do
+            if text[at] = 0 then
+                return false;
+            end if;
+            at := at + 1;
+        end while;
+        return true;
+    end;
+
+    generic [R: Region]
+    function zeroEnded(text: Span[Nat8, R]): Pointer[Nat8] is
+        let address: Address[Nat8] := allocateBuffer(spanLength(text) + 1);
+        case nullCheck(address) of
+            when Some(value as bytes: Pointer[Nat8]) do
+                let copied: Unit := @embed(Unit, "(memcpy((void*) $1, (const void*) $2.data, $2.size), ((uint8_t*) $1)[$2.size] = 0, (hilde_unit_t) 0)", bytes, text);
+                return bytes;
+            when None do
+                abort("Mirco.Bindings.Hdf5: no memory for a name");
+        end case;
+    end;
+
+    function quiet(): Unit is
+        let done: Int32 := @embed(Int32, "(int32_t) H5Eset_auto2(H5E_DEFAULT, NULL, NULL)");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function createFile(path: Span[Nat8, R]): Int64 is
+        let name: Pointer[Nat8] := zeroEnded(path);
+        let file: Int64 := @embed(Int64, "(int64_t) H5Fcreate((const char*) $1, H5F_ACC_TRUNC, H5P_DEFAULT, H5P_DEFAULT)", name);
+        deallocate(name);
+        return file;
+    end;
+
+    generic [R: Region]
+    function openFile(path: Span[Nat8, R], writable: Bool): Int64 is
+        let name: Pointer[Nat8] := zeroEnded(path);
+        let file: Int64 := @embed(Int64, "(int64_t) H5Fopen((const char*) $1, $2 ? H5F_ACC_RDWR : H5F_ACC_RDONLY, H5P_DEFAULT)", name, writable);
+        deallocate(name);
+        return file;
+    end;
+
+    function closeFile(file: Int64): Int32 is
+        return @embed(Int32, "(int32_t) H5Fclose((hid_t) $1)", file);
+    end;
+
+    -- The space is made for the dataset and closed again: the dataset keeps
+    -- its own copy of it.
+    generic [R: Region, S: Region]
+    function createDataset(file: Int64, name: Span[Nat8, R], dimensions: Span[Nat64, S], floating: Bool): Int64 is
+        let space: Int64 := @embed(Int64, "(int64_t) H5Screate_simple((int) $1.size, (const hsize_t*) $1.data, NULL)", dimensions);
+        if space < 0 then
+            return space;
+        end if;
+        let named: Pointer[Nat8] := zeroEnded(name);
+        let dataset: Int64 := @embed(Int64, "(int64_t) H5Dcreate2((hid_t) $1, (const char*) $2, $4 ? H5T_IEEE_F64LE : H5T_STD_I64LE, (hid_t) $3, H5P_DEFAULT, H5P_DEFAULT, H5P_DEFAULT)", file, named, space, floating);
+        deallocate(named);
+        let closed: Int32 := @embed(Int32, "(int32_t) H5Sclose((hid_t) $1)", space);
+        return dataset;
+    end;
+
+    generic [R: Region]
+    function openDataset(file: Int64, name: Span[Nat8, R]): Int64 is
+        let named: Pointer[Nat8] := zeroEnded(name);
+        let dataset: Int64 := @embed(Int64, "(int64_t) H5Dopen2((hid_t) $1, (const char*) $2, H5P_DEFAULT)", file, named);
+        deallocate(named);
+        return dataset;
+    end;
+
+    function closeDataset(dataset: Int64): Int32 is
+        return @embed(Int32, "(int32_t) H5Dclose((hid_t) $1)", dataset);
+    end;
+
+    function typeClass(dataset: Int64): Int32 is
+        let kind: Int64 := @embed(Int64, "(int64_t) H5Dget_type((hid_t) $1)", dataset);
+        if kind < 0 then
+            return -1;
+        end if;
+        let found: Int32 := @embed(Int32, "(int32_t) (H5Tget_class((hid_t) $1) == H5T_INTEGER ? 0 : (H5Tget_class((hid_t) $1) == H5T_FLOAT ? 1 : 2))", kind);
+        let closed: Int32 := @embed(Int32, "(int32_t) H5Tclose((hid_t) $1)", kind);
+        return found;
+    end;
+
+    function typeSize(dataset: Int64): Index is
+        let kind: Int64 := @embed(Int64, "(int64_t) H5Dget_type((hid_t) $1)", dataset);
+        if kind < 0 then
+            return 0;
+        end if;
+        let size: Index := @embed(Index, "(size_t) H5Tget_size((hid_t) $1)", kind);
+        let closed: Int32 := @embed(Int32, "(int32_t) H5Tclose((hid_t) $1)", kind);
+        return size;
+    end;
+
+    function typeSigned(dataset: Int64): Int32 is
+        let kind: Int64 := @embed(Int64, "(int64_t) H5Dget_type((hid_t) $1)", dataset);
+        if kind < 0 then
+            return -1;
+        end if;
+        let signed: Int32 := @embed(Int32, "(int32_t) (H5Tget_sign((hid_t) $1) == H5T_SGN_2 ? 1 : 0)", kind);
+        let closed: Int32 := @embed(Int32, "(int32_t) H5Tclose((hid_t) $1)", kind);
+        return signed;
+    end;
+
+    function rankOf(dataset: Int64): Int32 is
+        let space: Int64 := @embed(Int64, "(int64_t) H5Dget_space((hid_t) $1)", dataset);
+        if space < 0 then
+            return -1;
+        end if;
+        let found: Int32 := @embed(Int32, "(int32_t) H5Sget_simple_extent_ndims((hid_t) $1)", space);
+        let closed: Int32 := @embed(Int32, "(int32_t) H5Sclose((hid_t) $1)", space);
+        return found;
+    end;
+
+    generic [R: Region]
+    function dimensionsOf(dataset: Int64, out: Span![Nat64, R]): Int32 is
+        let space: Int64 := @embed(Int64, "(int64_t) H5Dget_space((hid_t) $1)", dataset);
+        if space < 0 then
+            return -1;
+        end if;
+        let found: Int32 := @embed(Int32, "(int32_t) (H5Sget_simple_extent_ndims((hid_t) $1) > (int) $2.size ? -1 : H5Sget_simple_extent_dims((hid_t) $1, (hsize_t*) $2.data, NULL))", space, out);
+        let closed: Int32 := @embed(Int32, "(int32_t) H5Sclose((hid_t) $1)", space);
+        return found;
+    end;
+
+    generic [R: Region]
+    function writeFloat64(dataset: Int64, values: Span[Float64, R]): Int32 is
+        return @embed(Int32, "(int32_t) H5Dwrite((hid_t) $1, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, (const void*) $2.data)", dataset, values);
+    end;
+
+    generic [R: Region]
+    function writeInt64(dataset: Int64, values: Span[Int64, R]): Int32 is
+        return @embed(Int32, "(int32_t) H5Dwrite((hid_t) $1, H5T_NATIVE_INT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, (const void*) $2.data)", dataset, values);
+    end;
+
+    generic [R: Region]
+    function readFloat64(dataset: Int64, out: Span![Float64, R]): Int32 is
+        return @embed(Int32, "(int32_t) H5Dread((hid_t) $1, H5T_NATIVE_DOUBLE, H5S_ALL, H5S_ALL, H5P_DEFAULT, (void*) $2.data)", dataset, out);
+    end;
+
+    generic [R: Region]
+    function readInt64(dataset: Int64, out: Span![Int64, R]): Int32 is
+        return @embed(Int32, "(int32_t) H5Dread((hid_t) $1, H5T_NATIVE_INT64, H5S_ALL, H5S_ALL, H5P_DEFAULT, (void*) $2.data)", dataset, out);
+    end;
+end module body.

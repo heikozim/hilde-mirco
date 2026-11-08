@@ -1,0 +1,1191 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The series of a figure lie in flat buffers: for series i its kind, its
+-- colour, the first of its points in xs and ys, their count, and for a bar
+-- its width.  A path through a write reference uses the reference up, so
+-- every field is changed by a small function of its own.
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    removeLast,
+    destroyFree,
+    length,
+    lengthMut,
+    nth,
+    nthMut,
+    storeNth,
+    wholeSpan
+);
+import Standard.String (String, asSpan, destroyString, fromByteBuffer, length as stringLength);
+import Standard.StringBuilder (StringBuilder, makeStringBuilder, writeByte, writeString, finalize);
+import Standard.Png (PngColor, Rgb, Image, makeImage, encodePng, destroyImage);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, rank, count, dimension, flatGet, destroyNdArray);
+import Mirco.Stats (histogram);
+import Mirco.Math (floor, ceiling, logarithm10, power, absolute, isFinite);
+import Mirco.Text (formatFloat64);
+import Mirco.Font (glyphRow);
+
+module body Mirco.Yompi is
+    constant kind_line: Nat8 := 1;
+    constant kind_scatter: Nat8 := 2;
+    constant kind_bar: Nat8 := 3;
+    constant margin_left: Float64 := 70.0;
+    constant margin_right: Float64 := 20.0;
+    constant margin_top: Float64 := 40.0;
+    constant margin_bottom: Float64 := 55.0;
+
+    record Figure: Linear is
+        width: Index;
+        height: Index;
+        title: Buffer[Nat8];
+        xLabel: Buffer[Nat8];
+        yLabel: Buffer[Nat8];
+        kinds: Buffer[Nat8];
+        colors: Buffer[Nat32];
+        starts: Buffer[Index];
+        counts: Buffer[Index];
+        widths: Buffer[Float64];
+        xs: Buffer[Float64];
+        ys: Buffer[Float64];
+        heat: Buffer[Float64];
+        heatRows: Index;
+        heatCols: Index;
+    end;
+
+    function figure(width: Index, height: Index): Figure is
+        return Figure(width => width, height => height, title => allocateEmpty(), xLabel => allocateEmpty(),
+            yLabel => allocateEmpty(), kinds => allocateEmpty(), colors => allocateEmpty(), starts => allocateEmpty(),
+            counts => allocateEmpty(), widths => allocateEmpty(), xs => allocateEmpty(), ys => allocateEmpty(),
+            heat => allocateEmpty(), heatRows => 0, heatCols => 0);
+    end;
+
+    function destroyFigure(f: Figure): Unit is
+        let { width: Index, height: Index, title: Buffer[Nat8], xLabel as x_label: Buffer[Nat8], yLabel as y_label: Buffer[Nat8],
+            kinds: Buffer[Nat8], colors: Buffer[Nat32], starts: Buffer[Index], counts: Buffer[Index],
+            widths: Buffer[Float64], xs: Buffer[Float64], ys: Buffer[Float64], heat: Buffer[Float64],
+            heatRows as heat_rows: Index, heatCols as heat_cols: Index } := f;
+        destroyFree(title);
+        destroyFree(x_label);
+        destroyFree(y_label);
+        destroyFree(kinds);
+        destroyFree(colors);
+        destroyFree(starts);
+        destroyFree(counts);
+        destroyFree(widths);
+        destroyFree(xs);
+        destroyFree(ys);
+        destroyFree(heat);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function seriesCount(f: &[Figure, R]): Index is
+        var n: Index := length(&(f->kinds));
+        if f->heatRows > 0 then
+            n := n + 1;
+        end if;
+        if n > 1000000 then
+            return 1000000;
+        end if;
+        return n;
+    end;
+
+    generic [R: Region, S: Region]
+    function replaceText(b: &![Buffer[Nat8], R], text: Span[Nat8, S]): Unit is
+        while lengthMut(&~b) > 0 do
+            let dropped: Nat8 := removeLast(&~b);
+        end while;
+        var i: Index := 0;
+        while i < spanLength(text) do
+            insertBack(&~b, text[i]);
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function setTitle(f: &![Figure, R], text: Span[Nat8, S]): Unit is
+        replaceText(&!(f->title), text);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function setXLabel(f: &![Figure, R], text: Span[Nat8, S]): Unit is
+        replaceText(&!(f->xLabel), text);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function setYLabel(f: &![Figure, R], text: Span[Nat8, S]): Unit is
+        replaceText(&!(f->yLabel), text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushKind(f: &![Figure, R], kind: Nat8): Unit is
+        insertBack(&!(f->kinds), kind);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushColor(f: &![Figure, R], color: Nat32): Unit is
+        insertBack(&!(f->colors), color);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushStart(f: &![Figure, R], start: Index): Unit is
+        insertBack(&!(f->starts), start);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushCount(f: &![Figure, R], n: Index): Unit is
+        insertBack(&!(f->counts), n);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushWidth(f: &![Figure, R], w: Float64): Unit is
+        insertBack(&!(f->widths), w);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushX(f: &![Figure, R], x: Float64): Unit is
+        insertBack(&!(f->xs), x);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pushY(f: &![Figure, R], y: Float64): Unit is
+        insertBack(&!(f->ys), y);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pointCount(f: &![Figure, R]): Index is
+        return lengthMut(&!(f->xs));
+    end;
+
+    -- A series of n points whose values are already in xs and ys from start.
+    generic [R: Region]
+    function addSeries(f: &![Figure, R], kind: Nat8, color: Nat32, start: Index, n: Index, w: Float64): Unit is
+        pushKind(&~f, kind);
+        pushColor(&~f, color);
+        pushStart(&~f, start);
+        pushCount(&~f, n);
+        pushWidth(&~f, w);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addPoints(f: &![Figure, R], x: &[NdArray[Float64], S], y: &[NdArray[Float64], Q], kind: Nat8, color: Nat32): Unit is
+        let start: Index := pointCount(&~f);
+        let n: Index := count(x);
+        var i: Index := 0;
+        while i < n do
+            pushX(&~f, flatGet(x, i));
+            pushY(&~f, flatGet(y, i));
+            i := i + 1;
+        end while;
+        addSeries(&~f, kind, color, start, n, 0.0);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addLine(f: &![Figure, R], x: &[NdArray[Float64], S], y: &[NdArray[Float64], Q], color: Nat32): Unit is
+        addPoints(&~f, x, y, kind_line, color);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region, Q: Region]
+    function addScatter(f: &![Figure, R], x: &[NdArray[Float64], S], y: &[NdArray[Float64], Q], color: Nat32): Unit is
+        addPoints(&~f, x, y, kind_scatter, color);
+        return nil;
+    end;
+
+    -- The bars start at the left edge of each bin; their height is its count.
+    generic [R: Region, S: Region]
+    function addHistogram(f: &![Figure, R], values: &[NdArray[Float64], S], bins: Index, color: Nat32): Unit is
+        var low: Float64 := 0.0;
+        var high: Float64 := 0.0;
+        var seen: Bool := false;
+        var i: Index := 0;
+        while i < count(values) do
+            let v: Float64 := flatGet(values, i);
+            if isFinite(v) then
+                if (not seen) or (v < low) then
+                    low := v;
+                end if;
+                if (not seen) or (v > high) then
+                    high := v;
+                end if;
+                seen := true;
+            end if;
+            i := i + 1;
+        end while;
+        if not (high > low) then
+            high := low + 1.0;
+        end if;
+        let counts: NdArray[Int64] := histogram(values, bins, low, high);
+        let w: Float64 := (high - low) / wide(bins);
+        let start: Index := pointCount(&~f);
+        var b: Index := 0;
+        while b < bins do
+            pushX(&~f, low + (w * wide(b)));
+            pushY(&~f, float(flatGet(&counts, b)));
+            b := b + 1;
+        end while;
+        destroyCounts(counts);
+        addSeries(&~f, kind_bar, color, start, bins, w);
+        return nil;
+    end;
+
+    function destroyCounts(a: NdArray[Int64]): Unit is
+        destroyNdArray(a);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function setHeatmap(f: &![Figure, R], matrix: &[NdArray[Float64], S]): Unit is
+        let rows: Index := dimension(matrix, 0);
+        let cols: Index := dimension(matrix, 1);
+        replaceHeat(&~f, matrix);
+        f->heatRows := rows;
+        f->heatCols := cols;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function replaceHeat(f: &![Figure, R], matrix: &[NdArray[Float64], S]): Unit is
+        fillHeat(&!(f->heat), matrix);
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function fillHeat(b: &![Buffer[Float64], R], matrix: &[NdArray[Float64], S]): Unit is
+        while lengthMut(&~b) > 0 do
+            let dropped: Float64 := removeLast(&~b);
+        end while;
+        var i: Index := 0;
+        while i < count(matrix) do
+            insertBack(&~b, flatGet(matrix, i));
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function wide(n: Index): Float64 is
+        case toFloat64(n) of
+            when Some(value as w: Float64) do
+                return w;
+            when None do
+                abort("Mirco.Yompi: a count that is no Float64");
+        end case;
+    end;
+
+    function float(n: Int64): Float64 is
+        case toFloat64(n) of
+            when Some(value as w: Float64) do
+                return w;
+            when None do
+                abort("Mirco.Yompi: a count that is no Float64");
+        end case;
+    end;
+
+    -- The ranges of the axes and the place of the plot in the figure.
+    record Frame: Free is
+        xLow: Float64;
+        xHigh: Float64;
+        yLow: Float64;
+        yHigh: Float64;
+        left: Float64;
+        top: Float64;
+        plotWidth: Float64;
+        plotHeight: Float64;
+    end;
+
+    -- Every finite point of every series, the bars with their width and
+    -- from 0 up, or the cells of the heatmap; a margin of a twentieth on
+    -- each side for points, none for bars and cells.
+    generic [R: Region]
+    function frameOf(f: &[Figure, R]): Frame is
+        var x_low: Float64 := 0.0;
+        var x_high: Float64 := 1.0;
+        var y_low: Float64 := 0.0;
+        var y_high: Float64 := 1.0;
+        var seen: Bool := false;
+        var padded: Bool := false;
+        if f->heatRows > 0 then
+            x_high := wide(f->heatCols);
+            y_high := wide(f->heatRows);
+            seen := true;
+        end if;
+        let n: Index := length(&(f->kinds));
+        var s: Index := 0;
+        while s < n do
+            let kind: Nat8 := nth(&(f->kinds), s);
+            let start: Index := nth(&(f->starts), s);
+            let w: Float64 := nth(&(f->widths), s);
+            var i: Index := 0;
+            while i < nth(&(f->counts), s) do
+                let x: Float64 := nth(&(f->xs), start + i);
+                let y: Float64 := nth(&(f->ys), start + i);
+                if isFinite(x) and isFinite(y) then
+                    var x1: Float64 := x;
+                    var y0: Float64 := y;
+                    if kind = kind_bar then
+                        x1 := x + w;
+                        y0 := 0.0;
+                    else
+                        padded := true;
+                    end if;
+                    if (not seen) or (x < x_low) then
+                        x_low := x;
+                    end if;
+                    if (not seen) or (x1 > x_high) then
+                        x_high := x1;
+                    end if;
+                    if (not seen) or (y0 < y_low) then
+                        y_low := y0;
+                    end if;
+                    if (not seen) or (y > y_high) then
+                        y_high := y;
+                    end if;
+                    if y0 < y_low then
+                        y_low := y0;
+                    end if;
+                    if y > y_high then
+                        y_high := y;
+                    end if;
+                    seen := true;
+                end if;
+                i := i + 1;
+            end while;
+            s := s + 1;
+        end while;
+        if not (x_high > x_low) then
+            x_low := x_low - 0.5;
+            x_high := x_high + 0.5;
+        end if;
+        if not (y_high > y_low) then
+            y_low := y_low - 0.5;
+            y_high := y_high + 0.5;
+        end if;
+        if padded then
+            let dx: Float64 := (x_high - x_low) / 20.0;
+            let dy: Float64 := (y_high - y_low) / 20.0;
+            x_low := x_low - dx;
+            x_high := x_high + dx;
+            y_low := y_low - dy;
+            y_high := y_high + dy;
+        end if;
+        return Frame(xLow => x_low, xHigh => x_high, yLow => y_low, yHigh => y_high, left => margin_left, top => margin_top,
+            plotWidth => (wide(f->width) - margin_left) - margin_right, plotHeight => (wide(f->height) - margin_top) - margin_bottom);
+    end;
+
+    function pixelX(fr: Frame, x: Float64): Float64 is
+        return fr.left + (((x - fr.xLow) / (fr.xHigh - fr.xLow)) * fr.plotWidth);
+    end;
+
+    function pixelY(fr: Frame, y: Float64): Float64 is
+        return (fr.top + fr.plotHeight) - (((y - fr.yLow) / (fr.yHigh - fr.yLow)) * fr.plotHeight);
+    end;
+
+    -- The step of the ticks between low and high: about five of them, a
+    -- multiple of 1, 2 or 5 times 10 to the power exponent.
+    record Step: Free is
+        multiple: Int64;
+        exponent: Int64;
+    end;
+
+    function stepOf(low: Float64, high: Float64): Step is
+        let raw: Float64 := (high - low) / 5.0;
+        let e: Float64 := floor(logarithm10(raw));
+        let fraction: Float64 := raw / power(10.0, e);
+        var m: Int64 := 10;
+        if fraction < 1.5 then
+            m := 1;
+        else if fraction < 3.5 then
+            m := 2;
+        else if fraction < 7.5 then
+            m := 5;
+        end if;
+        var exponent: Int64 := 0;
+        case toInt64(e) of
+            when Some(value as x: Int64) do
+                exponent := x;
+            when None do
+                exponent := 0;
+        end case;
+        if m = 10 then
+            return Step(multiple => 1, exponent => exponent + 1);
+        end if;
+        return Step(multiple => m, exponent => exponent);
+    end;
+
+    function stepValue(s: Step): Float64 is
+        return float(s.multiple) * power(10.0, float(s.exponent));
+    end;
+
+    function toWhole(x: Float64): Int64 is
+        case toInt64(x) of
+            when Some(value as v: Int64) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The digits of k times 10 to the power e, written without an exponent.
+    generic [R: Region]
+    function writeTick(b: &![StringBuilder, R], k: Int64, e: Int64): Unit is
+        if k = 0 then
+            writeByte(&~b, 48);
+            return nil;
+        end if;
+        var digits: Buffer[Nat8] := allocateEmpty();
+        var rest: Int64 := k;
+        if rest < 0 then
+            writeByte(&~b, 45);
+            rest := 0 - rest;
+        end if;
+        while rest > 0 do
+            insertBack(&!digits, digitOf(rem(rest, 10)));
+            rest := rest / 10;
+        end while;
+        var zeros: Int64 := e;
+        if e < 0 then
+            zeros := 0;
+        end if;
+        var point: Int64 := 0 - e;
+        if point < 0 then
+            point := 0;
+        end if;
+        while toIndexOf(point) >= length(&digits) do
+            insertBack(&!digits, 48);
+        end while;
+        var last: Index := 0;
+        while (last < toIndexOf(point)) and (nthMut(&!digits, last) = 48) do
+            last := last + 1;
+        end while;
+        var i: Index := length(&digits);
+        while i > 0 do
+            i := i - 1;
+            if (i < toIndexOf(point)) and (i < last) then
+                i := 0;
+            else
+                if (i + 1) = toIndexOf(point) then
+                    writeByte(&~b, 46);
+                end if;
+                writeByte(&~b, nthMut(&!digits, i));
+            end if;
+        end while;
+        var z: Int64 := 0;
+        while z < zeros do
+            writeByte(&~b, 48);
+            z := z + 1;
+        end while;
+        destroyFree(digits);
+        return nil;
+    end;
+
+    function toIndexOf(v: Int64): Index is
+        case toIndex(v) of
+            when Some(value as i: Index) do
+                return i;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function digitOf(d: Int64): Nat8 is
+        case toNat8(d + 48) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 48;
+        end case;
+    end;
+
+    -- A coordinate with two decimals.
+    generic [R: Region]
+    function writeNumber(b: &![StringBuilder, R], x: Float64): Unit is
+        let rounded: Float64 := floor((x * 100.0) + 0.5) / 100.0;
+        let text: String := formatFloat64(rounded);
+        writeString(&~b, asSpan(&text));
+        destroyString(text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function writeIndex(b: &![StringBuilder, R], n: Index): Unit is
+        writeNumber(&~b, wide(n));
+        return nil;
+    end;
+
+    function hexDigit(d: Nat32): Nat8 is
+        case toNat8(d) of
+            when Some(value as v: Nat8) do
+                if v < 10 then
+                    return v + 48;
+                end if;
+                return v + 87;
+            when None do
+                return 48;
+        end case;
+    end;
+
+    generic [R: Region]
+    function writeColor(b: &![StringBuilder, R], color: Nat32): Unit is
+        writeByte(&~b, 35);
+        var shift: Nat32 := 1048576;
+        while shift > 0 do
+            writeByte(&~b, hexDigit(rem(color / shift, 16)));
+            shift := shift / 16;
+        end while;
+        return nil;
+    end;
+
+    -- Text in XML: the ampersand, the angle brackets and the apostrophe
+    -- written as references.
+    generic [R: Region, S: Region]
+    function writeEscaped(b: &![StringBuilder, R], text: &[Buffer[Nat8], S]): Unit is
+        var i: Index := 0;
+        while i < length(text) do
+            let c: Nat8 := nth(text, i);
+            if c = 38 then
+                writeString(&~b, "&amp;");
+            else if c = 60 then
+                writeString(&~b, "&lt;");
+            else if c = 62 then
+                writeString(&~b, "&gt;");
+            else if c = 39 then
+                writeString(&~b, "&apos;");
+            else
+                writeByte(&~b, c);
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    -- A colour from dark blue over teal and green to yellow for t from 0
+    -- to 1, in five stops; grey for a NaN.
+    function heatColor(t: Float64): Nat32 is
+        if t /= t then
+            return 13421772;
+        end if;
+        var u: Float64 := t;
+        if u < 0.0 then
+            u := 0.0;
+        end if;
+        if u > 1.0 then
+            u := 1.0;
+        end if;
+        let p: Float64 := u * 4.0;
+        var k: Index := 0;
+        while ((wide(k) + 1.0) <= p) and (k < 3) do
+            k := k + 1;
+        end while;
+        let f: Float64 := p - wide(k);
+        let r: Float64 := mix(stopRed(k), stopRed(k + 1), f);
+        let g: Float64 := mix(stopGreen(k), stopGreen(k + 1), f);
+        let bl: Float64 := mix(stopBlue(k), stopBlue(k + 1), f);
+        return (channel(r) * 65536) + (channel(g) * 256) + channel(bl);
+    end;
+
+    function mix(a: Float64, b: Float64, f: Float64): Float64 is
+        return a + ((b - a) * f);
+    end;
+
+    function channel(v: Float64): Nat32 is
+        case toNat32(floor(v + 0.5)) of
+            when Some(value as c: Nat32) do
+                if c > 255 then
+                    return 255;
+                end if;
+                return c;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    function stopRed(k: Index): Float64 is
+        if k = 0 then
+            return 68.0;
+        else if k = 1 then
+            return 59.0;
+        else if k = 2 then
+            return 33.0;
+        else if k = 3 then
+            return 94.0;
+        end if;
+        return 253.0;
+    end;
+
+    function stopGreen(k: Index): Float64 is
+        if k = 0 then
+            return 1.0;
+        else if k = 1 then
+            return 82.0;
+        else if k = 2 then
+            return 145.0;
+        else if k = 3 then
+            return 201.0;
+        end if;
+        return 231.0;
+    end;
+
+    function stopBlue(k: Index): Float64 is
+        if k = 0 then
+            return 84.0;
+        else if k = 1 then
+            return 139.0;
+        else if k = 2 then
+            return 140.0;
+        else if k = 3 then
+            return 98.0;
+        end if;
+        return 37.0;
+    end;
+
+    -- The smallest and the largest finite value of the heatmap.
+    record Spread: Free is
+        low: Float64;
+        high: Float64;
+    end;
+
+    generic [R: Region]
+    function heatSpread(f: &[Figure, R]): Spread is
+        var low: Float64 := 0.0;
+        var high: Float64 := 0.0;
+        var seen: Bool := false;
+        var i: Index := 0;
+        while i < length(&(f->heat)) do
+            let v: Float64 := nth(&(f->heat), i);
+            if isFinite(v) then
+                if (not seen) or (v < low) then
+                    low := v;
+                end if;
+                if (not seen) or (v > high) then
+                    high := v;
+                end if;
+                seen := true;
+            end if;
+            i := i + 1;
+        end while;
+        if not (high > low) then
+            high := low + 1.0;
+        end if;
+        return Spread(low => low, high => high);
+    end;
+
+    generic [R: Region]
+    function svgRect(b: &![StringBuilder, R], x: Float64, y: Float64, w: Float64, h: Float64, color: Nat32): Unit is
+        writeString(&~b, "<rect x='");
+        writeNumber(&~b, x);
+        writeString(&~b, "' y='");
+        writeNumber(&~b, y);
+        writeString(&~b, "' width='");
+        writeNumber(&~b, w);
+        writeString(&~b, "' height='");
+        writeNumber(&~b, h);
+        writeString(&~b, "' fill='");
+        writeColor(&~b, color);
+        writeString(&~b, "'/>\n");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function svgLine(b: &![StringBuilder, R], x1: Float64, y1: Float64, x2: Float64, y2: Float64): Unit is
+        writeString(&~b, "<line x1='");
+        writeNumber(&~b, x1);
+        writeString(&~b, "' y1='");
+        writeNumber(&~b, y1);
+        writeString(&~b, "' x2='");
+        writeNumber(&~b, x2);
+        writeString(&~b, "' y2='");
+        writeNumber(&~b, y2);
+        writeString(&~b, "' stroke='#000000'/>\n");
+        return nil;
+    end;
+
+    generic [R: Region]
+    function svgTextStart(b: &![StringBuilder, R], x: Float64, y: Float64, size: Index, anchor: Span[Nat8, Static]): Unit is
+        writeString(&~b, "<text x='");
+        writeNumber(&~b, x);
+        writeString(&~b, "' y='");
+        writeNumber(&~b, y);
+        writeString(&~b, "' font-family='sans-serif' font-size='");
+        writeIndex(&~b, size);
+        writeString(&~b, "' text-anchor='");
+        writeString(&~b, anchor);
+        writeString(&~b, "'>");
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function svgHeat(b: &![StringBuilder, R], f: &[Figure, S], fr: Frame): Unit is
+        let spread: Spread := heatSpread(f);
+        var r: Index := 0;
+        while r < f->heatRows do
+            var c: Index := 0;
+            while c < f->heatCols do
+                let v: Float64 := nth(&(f->heat), (r * (f->heatCols)) + c);
+                let x0: Float64 := pixelX(fr, wide(c));
+                let x1: Float64 := pixelX(fr, wide(c + 1));
+                let y0: Float64 := pixelY(fr, wide((f->heatRows) - r));
+                let y1: Float64 := pixelY(fr, wide(((f->heatRows) - r) - 1));
+                svgRect(&~b, x0, y0, x1 - x0, y1 - y0, heatColor((v - spread.low) / (spread.high - spread.low)));
+                c := c + 1;
+            end while;
+            r := r + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function svgSeries(b: &![StringBuilder, R], f: &[Figure, S], fr: Frame, s: Index): Unit is
+        let kind: Nat8 := nth(&(f->kinds), s);
+        let color: Nat32 := nth(&(f->colors), s);
+        let start: Index := nth(&(f->starts), s);
+        let n: Index := nth(&(f->counts), s);
+        let w: Float64 := nth(&(f->widths), s);
+        if kind = kind_line then
+            writeString(&~b, "<polyline fill='none' stroke-width='1.5' stroke='");
+            writeColor(&~b, color);
+            writeString(&~b, "' points='");
+        end if;
+        var i: Index := 0;
+        var first: Bool := true;
+        while i < n do
+            let x: Float64 := nth(&(f->xs), start + i);
+            let y: Float64 := nth(&(f->ys), start + i);
+            if isFinite(x) and isFinite(y) then
+                if kind = kind_line then
+                    if not first then
+                        writeByte(&~b, 32);
+                    end if;
+                    writeNumber(&~b, pixelX(fr, x));
+                    writeByte(&~b, 44);
+                    writeNumber(&~b, pixelY(fr, y));
+                    first := false;
+                else if kind = kind_scatter then
+                    writeString(&~b, "<circle cx='");
+                    writeNumber(&~b, pixelX(fr, x));
+                    writeString(&~b, "' cy='");
+                    writeNumber(&~b, pixelY(fr, y));
+                    writeString(&~b, "' r='3' fill='");
+                    writeColor(&~b, color);
+                    writeString(&~b, "'/>\n");
+                else
+                    let x0: Float64 := pixelX(fr, x);
+                    let x1: Float64 := pixelX(fr, x + w);
+                    let top: Float64 := pixelY(fr, y);
+                    let base: Float64 := pixelY(fr, 0.0);
+                    svgRect(&~b, x0, top, x1 - x0, base - top, color);
+                end if;
+            end if;
+            i := i + 1;
+        end while;
+        if kind = kind_line then
+            writeString(&~b, "'/>\n");
+        end if;
+        return nil;
+    end;
+
+    -- The ticks of one axis: a short line and the number of each.
+    generic [R: Region]
+    function svgTicks(b: &![StringBuilder, R], fr: Frame, horizontal: Bool): Unit is
+        var low: Float64 := fr.yLow;
+        var high: Float64 := fr.yHigh;
+        if horizontal then
+            low := fr.xLow;
+            high := fr.xHigh;
+        end if;
+        let step: Step := stepOf(low, high);
+        let value: Float64 := stepValue(step);
+        var k: Int64 := toWhole(ceiling(low / value));
+        let last: Int64 := toWhole(floor(high / value));
+        while k <= last do
+            let v: Float64 := float(k) * value;
+            if horizontal then
+                let x: Float64 := pixelX(fr, v);
+                let y: Float64 := fr.top + fr.plotHeight;
+                svgLine(&~b, x, y, x, y + 5.0);
+                svgTextStart(&~b, x, y + 18.0, 11, "middle");
+            else
+                let x: Float64 := fr.left;
+                let y: Float64 := pixelY(fr, v);
+                svgLine(&~b, x - 5.0, y, x, y);
+                svgTextStart(&~b, x - 8.0, y + 4.0, 11, "end");
+            end if;
+            writeTick(&~b, k * step.multiple, step.exponent);
+            writeString(&~b, "</text>\n");
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function renderSvg(f: &[Figure, R]): String is
+        let fr: Frame := frameOf(f);
+        var b: StringBuilder := makeStringBuilder();
+        writeString(&!b, "<svg xmlns='http://www.w3.org/2000/svg' width='");
+        writeIndex(&!b, f->width);
+        writeString(&!b, "' height='");
+        writeIndex(&!b, f->height);
+        writeString(&!b, "' viewBox='0 0 ");
+        writeIndex(&!b, f->width);
+        writeByte(&!b, 32);
+        writeIndex(&!b, f->height);
+        writeString(&!b, "'>\n");
+        svgRect(&!b, 0.0, 0.0, wide(f->width), wide(f->height), 16777215);
+        if f->heatRows > 0 then
+            svgHeat(&!b, f, fr);
+        end if;
+        var s: Index := 0;
+        while s < length(&(f->kinds)) do
+            svgSeries(&!b, f, fr, s);
+            s := s + 1;
+        end while;
+        let bottom: Float64 := fr.top + fr.plotHeight;
+        svgLine(&!b, fr.left, bottom, fr.left + fr.plotWidth, bottom);
+        svgLine(&!b, fr.left, fr.top, fr.left, bottom);
+        svgTicks(&!b, fr, true);
+        svgTicks(&!b, fr, false);
+        if length(&(f->title)) > 0 then
+            svgTextStart(&!b, wide(f->width) / 2.0, 24.0, 16, "middle");
+            writeEscaped(&!b, &(f->title));
+            writeString(&!b, "</text>\n");
+        end if;
+        if length(&(f->xLabel)) > 0 then
+            svgTextStart(&!b, fr.left + (fr.plotWidth / 2.0), wide(f->height) - 12.0, 13, "middle");
+            writeEscaped(&!b, &(f->xLabel));
+            writeString(&!b, "</text>\n");
+        end if;
+        if length(&(f->yLabel)) > 0 then
+            writeString(&!b, "<text transform='translate(18,");
+            writeNumber(&!b, fr.top + (fr.plotHeight / 2.0));
+            writeString(&!b, ") rotate(-90)' font-family='sans-serif' font-size='13' text-anchor='middle'>");
+            writeEscaped(&!b, &(f->yLabel));
+            writeString(&!b, "</text>\n");
+        end if;
+        writeString(&!b, "</svg>\n");
+        return finalize(b);
+    end;
+
+    -- The canvas of the PNG image: three bytes for each pixel, row by row.
+    record Canvas: Free is
+        width: Index;
+        height: Index;
+    end;
+
+    function whole(v: Float64): Int64 is
+        return toWhole(floor(v + 0.5));
+    end;
+
+    generic [R: Region]
+    function plot(pixels: &![Buffer[Nat8], R], c: Canvas, x: Int64, y: Int64, color: Nat32): Unit is
+        if (x < 0) or (y < 0) then
+            return nil;
+        end if;
+        let xi: Index := toIndexOf(x);
+        let yi: Index := toIndexOf(y);
+        if (xi >= c.width) or (yi >= c.height) then
+            return nil;
+        end if;
+        let at: Index := 3 * ((yi * c.width) + xi);
+        storeNth(&~pixels, at, byteOf(color / 65536));
+        storeNth(&~pixels, at + 1, byteOf(rem(color / 256, 256)));
+        storeNth(&~pixels, at + 2, byteOf(rem(color, 256)));
+        return nil;
+    end;
+
+    function byteOf(v: Nat32): Nat8 is
+        case toNat8(v) of
+            when Some(value as b: Nat8) do
+                return b;
+            when None do
+                return 255;
+        end case;
+    end;
+
+    -- A line from one point to the other in as many steps as the longer of
+    -- its two extents has pixels.
+    generic [R: Region]
+    function drawLine(pixels: &![Buffer[Nat8], R], c: Canvas, x0: Float64, y0: Float64, x1: Float64, y1: Float64, color: Nat32): Unit is
+        var steps: Float64 := absolute(x1 - x0);
+        if absolute(y1 - y0) > steps then
+            steps := absolute(y1 - y0);
+        end if;
+        steps := ceiling(steps);
+        if steps < 1.0 then
+            plot(&~pixels, c, whole(x0), whole(y0), color);
+            return nil;
+        end if;
+        if steps > 100000.0 then
+            steps := 100000.0;
+        end if;
+        var i: Float64 := 0.0;
+        while i <= steps do
+            plot(&~pixels, c, whole(x0 + (((x1 - x0) * i) / steps)), whole(y0 + (((y1 - y0) * i) / steps)), color);
+            i := i + 1.0;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function fillRect(pixels: &![Buffer[Nat8], R], c: Canvas, x0: Float64, y0: Float64, x1: Float64, y1: Float64, color: Nat32): Unit is
+        var y: Int64 := whole(y0);
+        let y_end: Int64 := whole(y1);
+        let x_start: Int64 := whole(x0);
+        let x_end: Int64 := whole(x1);
+        while y < y_end do
+            var x: Int64 := x_start;
+            while x < x_end do
+                plot(&~pixels, c, x, y, color);
+                x := x + 1;
+            end while;
+            y := y + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function disc(pixels: &![Buffer[Nat8], R], c: Canvas, cx: Float64, cy: Float64, color: Nat32): Unit is
+        let x0: Int64 := whole(cx);
+        let y0: Int64 := whole(cy);
+        var dy: Int64 := -3;
+        while dy <= 3 do
+            var dx: Int64 := -3;
+            while dx <= 3 do
+                if ((dx * dx) + (dy * dy)) <= 9 then
+                    plot(&~pixels, c, x0 + dx, y0 + dy, color);
+                end if;
+                dx := dx + 1;
+            end while;
+            dy := dy + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function pngSeries(pixels: &![Buffer[Nat8], R], c: Canvas, f: &[Figure, S], fr: Frame, s: Index): Unit is
+        let kind: Nat8 := nth(&(f->kinds), s);
+        let color: Nat32 := nth(&(f->colors), s);
+        let start: Index := nth(&(f->starts), s);
+        let n: Index := nth(&(f->counts), s);
+        let w: Float64 := nth(&(f->widths), s);
+        var have_previous: Bool := false;
+        var px: Float64 := 0.0;
+        var py: Float64 := 0.0;
+        var i: Index := 0;
+        while i < n do
+            let x: Float64 := nth(&(f->xs), start + i);
+            let y: Float64 := nth(&(f->ys), start + i);
+            if isFinite(x) and isFinite(y) then
+                let qx: Float64 := pixelX(fr, x);
+                let qy: Float64 := pixelY(fr, y);
+                if kind = kind_line then
+                    if have_previous then
+                        drawLine(&~pixels, c, px, py, qx, qy, color);
+                    end if;
+                    px := qx;
+                    py := qy;
+                    have_previous := true;
+                else if kind = kind_scatter then
+                    disc(&~pixels, c, qx, qy, color);
+                else
+                    fillRect(&~pixels, c, qx, qy, pixelX(fr, x + w), pixelY(fr, 0.0), color);
+                end if;
+            else
+                have_previous := false;
+            end if;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region, S: Region]
+    function pngHeat(pixels: &![Buffer[Nat8], R], c: Canvas, f: &[Figure, S], fr: Frame): Unit is
+        let spread: Spread := heatSpread(f);
+        var r: Index := 0;
+        while r < f->heatRows do
+            var col: Index := 0;
+            while col < f->heatCols do
+                let v: Float64 := nth(&(f->heat), (r * (f->heatCols)) + col);
+                fillRect(&~pixels, c, pixelX(fr, wide(col)), pixelY(fr, wide((f->heatRows) - r)), pixelX(fr, wide(col + 1)),
+                    pixelY(fr, wide(((f->heatRows) - r) - 1)), heatColor((v - spread.low) / (spread.high - spread.low)));
+                col := col + 1;
+            end while;
+            r := r + 1;
+        end while;
+        return nil;
+    end;
+
+    -- Text in the pixel font: each glyph five pixels wide and seven high,
+    -- with a pixel between glyphs, each pixel a square of scale.  The text
+    -- begins at x with the top of its glyphs at y; turned, it runs upwards
+    -- from x, y with the top of its glyphs to the left, as the label of y.
+    generic [R: Region, S: Region]
+    function drawText(pixels: &![Buffer[Nat8], R], c: Canvas, text: Span[Nat8, S], x: Float64, y: Float64, scale: Int64, turned: Bool): Unit is
+        let ox: Int64 := whole(x);
+        let oy: Int64 := whole(y);
+        var i: Index := 0;
+        while i < spanLength(text) do
+            var row: Index := 0;
+            while row < 7 do
+                let bits: Nat8 := glyphRow(text[i], row);
+                var col: Index := 0;
+                while col < 5 do
+                    if rem(bits / bitOf(4 - col), 2) = 1 then
+                        let gx: Int64 := toWideInt((6 * i) + col) * scale;
+                        let gy: Int64 := toWideInt(row) * scale;
+                        var sy: Int64 := 0;
+                        while sy < scale do
+                            var sx: Int64 := 0;
+                            while sx < scale do
+                                if turned then
+                                    plot(&~pixels, c, (ox + gy) + sy, (oy - gx) - sx, 0);
+                                else
+                                    plot(&~pixels, c, (ox + gx) + sx, (oy + gy) + sy, 0);
+                                end if;
+                                sx := sx + 1;
+                            end while;
+                            sy := sy + 1;
+                        end while;
+                    end if;
+                    col := col + 1;
+                end while;
+                row := row + 1;
+            end while;
+            i := i + 1;
+        end while;
+        return nil;
+    end;
+
+    function bitOf(k: Index): Nat8 is
+        var b: Nat8 := 1;
+        var i: Index := 0;
+        while i < k do
+            b := b * 2;
+            i := i + 1;
+        end while;
+        return b;
+    end;
+
+    function toWideInt(i: Index): Int64 is
+        case toInt64(i) of
+            when Some(value as v: Int64) do
+                return v;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- The width in pixels of n glyphs of scale.
+    function textWidth(n: Index, scale: Int64): Float64 is
+        if n = 0 then
+            return 0.0;
+        end if;
+        return wide((6 * n) - 1) * float(scale);
+    end;
+
+    -- The number of a tick in the pixel font, centred below the axis of x
+    -- or ending left of the axis of y.
+    generic [R: Region]
+    function drawTick(pixels: &![Buffer[Nat8], R], c: Canvas, k: Int64, e: Int64, x: Float64, y: Float64, horizontal: Bool): Unit is
+        var b: StringBuilder := makeStringBuilder();
+        writeTick(&!b, k, e);
+        let text: String := finalize(b);
+        let w: Float64 := textWidth(stringLength(&text), 1);
+        if horizontal then
+            drawText(&~pixels, c, asSpan(&text), x - (w / 2.0), y + 9.0, 1, false);
+        else
+            drawText(&~pixels, c, asSpan(&text), (x - 8.0) - w, y - 3.0, 1, false);
+        end if;
+        destroyString(text);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function pngTicks(pixels: &![Buffer[Nat8], R], c: Canvas, fr: Frame, horizontal: Bool): Unit is
+        var low: Float64 := fr.yLow;
+        var high: Float64 := fr.yHigh;
+        if horizontal then
+            low := fr.xLow;
+            high := fr.xHigh;
+        end if;
+        let step: Step := stepOf(low, high);
+        let value: Float64 := stepValue(step);
+        var k: Int64 := toWhole(ceiling(low / value));
+        let last: Int64 := toWhole(floor(high / value));
+        while k <= last do
+            let v: Float64 := float(k) * value;
+            if horizontal then
+                let x: Float64 := pixelX(fr, v);
+                let y: Float64 := fr.top + fr.plotHeight;
+                drawLine(&~pixels, c, x, y, x, y + 5.0, 0);
+                drawTick(&~pixels, c, k * step.multiple, step.exponent, x, y, true);
+            else
+                let y: Float64 := pixelY(fr, v);
+                drawLine(&~pixels, c, fr.left - 5.0, y, fr.left, y, 0);
+                drawTick(&~pixels, c, k * step.multiple, step.exponent, fr.left, y, false);
+            end if;
+            k := k + 1;
+        end while;
+        return nil;
+    end;
+
+    generic [R: Region]
+    function renderPng(f: &[Figure, R]): String is
+        let fr: Frame := frameOf(f);
+        let c: Canvas := Canvas(width => f->width, height => f->height);
+        var pixels: Buffer[Nat8] := initialize(3 * (c.width * c.height), 255);
+        if f->heatRows > 0 then
+            pngHeat(&!pixels, c, f, fr);
+        end if;
+        var s: Index := 0;
+        while s < length(&(f->kinds)) do
+            pngSeries(&!pixels, c, f, fr, s);
+            s := s + 1;
+        end while;
+        let bottom: Float64 := fr.top + fr.plotHeight;
+        drawLine(&!pixels, c, fr.left, bottom, fr.left + fr.plotWidth, bottom, 0);
+        drawLine(&!pixels, c, fr.left, fr.top, fr.left, bottom, 0);
+        pngTicks(&!pixels, c, fr, true);
+        pngTicks(&!pixels, c, fr, false);
+        if length(&(f->title)) > 0 then
+            let w: Float64 := textWidth(length(&(f->title)), 2);
+            drawText(&!pixels, c, wholeSpan(&(f->title)), (wide(f->width) / 2.0) - (w / 2.0), 8.0, 2, false);
+        end if;
+        if length(&(f->xLabel)) > 0 then
+            let w: Float64 := textWidth(length(&(f->xLabel)), 2);
+            drawText(&!pixels, c, wholeSpan(&(f->xLabel)), (fr.left + (fr.plotWidth / 2.0)) - (w / 2.0), wide(f->height) - 26.0, 2, false);
+        end if;
+        if length(&(f->yLabel)) > 0 then
+            let w: Float64 := textWidth(length(&(f->yLabel)), 2);
+            drawText(&!pixels, c, wholeSpan(&(f->yLabel)), 6.0, (fr.top + (fr.plotHeight / 2.0)) + (w / 2.0), 2, true);
+        end if;
+        case makeImage(c.width, c.height, Rgb(), fromByteBuffer(pixels)) of
+            when Right(right as image: Image) do
+                let file: String := encodePng(&image);
+                destroyImage(image);
+                return file;
+            when Left(left as why: String) do
+                destroyString(why);
+                abort("Mirco.Yompi: the canvas does not make an image");
+        end case;
+    end;
+end module body.

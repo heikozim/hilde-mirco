@@ -1,0 +1,25 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+
+-- Each function is one call of mirco_pocketfft.h; the span is held to the
+-- 2 n or n numbers the transform touches before the call.
+pragma Unsafe_Module;
+pragma Foreign_Library(Name => "mircoblis");
+pragma Foreign_Header(Name => "mirco_pocketfft.h");
+
+module body Mirco.Bindings.Pocketfft is
+    generic [R: Region]
+    function complexTransform(values: Span![Float64, R], n: Index, forward: Bool, scale: Float64): Int32 is
+        return @embed(Int32, "(int32_t) (($2 == 0 || $1.size / 2 < $2) ? -1 : mirco_cfft((double*) $1.data, $2, $3 ? 1 : 0, $4))", values, n, forward, scale);
+    end;
+
+    generic [R: Region]
+    function realTransform(values: Span![Float64, R], n: Index, scale: Float64): Int32 is
+        return @embed(Int32, "(int32_t) (($2 == 0 || $1.size < $2) ? -1 : mirco_rfft_forward((double*) $1.data, $2, $3))", values, n, scale);
+    end;
+end module body.

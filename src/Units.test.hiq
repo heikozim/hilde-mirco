@@ -1,0 +1,244 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (contains, equal);
+import Standard.File (
+    FileDescriptor,
+    Command,
+    Running,
+    Process,
+    ProcessStatus,
+    makeCommand,
+    addArgument,
+    spawnProcess,
+    waitProcess,
+    exitCode,
+    readAll,
+    closeFile,
+    environmentValue
+);
+import Mirco.Units (
+    Meter,
+    Second,
+    MeterPerSecond,
+    MeterPerSecondSquared,
+    Ampere,
+    Pascal,
+    Hertz,
+    KilogramPerCubicMeter,
+    Newton,
+    Joule,
+    Watt,
+    Volt,
+    Ohm,
+    SquareMeter,
+    CubicMeter,
+    Quantity,
+    SiUnit,
+    valueOf,
+    add,
+    subtract,
+    scale,
+    ratio,
+    less,
+    format,
+    meters,
+    seconds,
+    kilograms,
+    amperes,
+    area,
+    volume,
+    velocity,
+    acceleration,
+    force,
+    work,
+    powerOf,
+    voltage,
+    resistance,
+    pressure,
+    frequency,
+    density
+);
+import Mirco.Math (absolute);
+import Standard.Testing (assertTrue);
+
+module body Mirco.Units.Test is
+    -- Whether this run is the child that refusedInChild started for word.
+    function asChild(word: Span[Nat8, Static]): Bool is
+        case environmentValue("MIRCO_REFUSE") of
+            when Some(value as text: String) do
+                let child: Bool := equal(asSpan(&text), word);
+                destroyString(text);
+                return child;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme can start itself again, through the
+    -- /proc/<pid>/exe of Linux; elsewhere a refusal test does not run.
+    function childCanRun(): Bool is
+        let command: Command := addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "[ -x \"/proc/$PPID/exe\" ]");
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                let { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return exitCode(status) = 0;
+            when None do
+                return false;
+        end case;
+    end;
+
+    -- Whether the test programme, started again for the test named test
+    -- with MIRCO_REFUSE set to word, stopped with an exit other than 0 and
+    -- words on its standard error.
+    function refusedInChild(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, words, words);
+    end;
+
+    -- Whether the child for word stopped with the message of a violated
+    -- requires of name, as " of Mirco.Units.ratio (": the message names the
+    -- function whose requires failed, so a requires of a function the body
+    -- calls does not count.
+    function refusedByRequiresOf(test: Span[Nat8, Static], word: Span[Nat8, Static], name: Span[Nat8, Static]): Bool is
+        return refusedInChildWith(test, word, "contract violated: the requires", name);
+    end;
+
+    -- Whether the child for word stopped with an exit other than 0 and both
+    -- words and also on its standard error.
+    function refusedInChildWith(test: Span[Nat8, Static], word: Span[Nat8, Static], words: Span[Nat8, Static], also: Span[Nat8, Static]): Bool is
+        let command: Command := addArgument(addArgument(addArgument(addArgument(makeCommand("/bin/sh"), "-c"), "MIRCO_REFUSE=\"$1\" exec \"/proc/$PPID/exe\" \"$0\""), test), word);
+        case spawnProcess(command) of
+            when Some(value as running: Running) do
+                var { process: Process, input: FileDescriptor, output: FileDescriptor, errors: FileDescriptor } := running;
+                let closed_input: Bool := closeFile(input);
+                var seen: Bool := false;
+                case readAll(&!errors) of
+                    when Some(value as text: String) do
+                        seen := contains(asSpan(&text), words) and contains(asSpan(&text), also);
+                        destroyString(text);
+                    when None do
+                        seen := false;
+                end case;
+                let status: ProcessStatus := waitProcess(process);
+                let closed_output: Bool := closeFile(output);
+                let closed_errors: Bool := closeFile(errors);
+                return seen and (exitCode(status) /= 0);
+            when None do
+                return false;
+        end case;
+    end;
+
+    function near(a: Float64, b: Float64): Bool is
+        return absolute(a - b) < 0.000000001;
+    end;
+
+    generic [U: Free(SiUnit)]
+    function writes(q: Quantity[U], want: Span[Nat8, Static]): Bool is
+        let text: String := format(q);
+        let same: Bool := equal(asSpan(&text), want);
+        destroyString(text);
+        return same;
+    end;
+
+    function testSameUnit(): Unit is
+        let a: Quantity[Meter] := meters(1.5);
+        let b: Quantity[Meter] := meters(2.0);
+        assertTrue(valueOf(add(a, b)) = 3.5, "1.5 m + 2 m");
+        assertTrue(valueOf(subtract(b, a)) = 0.5, "2 m - 1.5 m");
+        assertTrue(valueOf(scale(a, 2.0)) = 3.0, "twice 1.5 m");
+        assertTrue(ratio(b, a) > 1.3, "2 m is more than 1.3 times 1.5 m");
+        assertTrue(less(a, b) and (not less(b, a)), "the order of lengths");
+        assertTrue(writes(add(a, b), "3.5 m"), "written with its symbol");
+        return nil;
+    end;
+
+    -- 100 m in 9.58 s; 2 kg at 3 m/s^2 is 6 N, over 4 m 24 J, in 2 s 12 W.
+    function testDerived(): Unit is
+        let v: Quantity[MeterPerSecond] := velocity(meters(100.0), seconds(9.58));
+        assertTrue(near(valueOf(v), 10.438413361169102), "the velocity of the record");
+        assertTrue(writes(velocity(meters(7.0), seconds(2.0)), "3.5 m/s"), "m/s");
+        let f: Quantity[Newton] := force(kilograms(2.0), acceleration(velocity(meters(6.0), seconds(1.0)), seconds(2.0)));
+        assertTrue(valueOf(f) = 6.0, "6 N");
+        let e: Quantity[Joule] := work(f, meters(4.0));
+        let p: Quantity[Watt] := powerOf(e, seconds(2.0));
+        assertTrue(writes(p, "12 W"), "12 W");
+        let u: Quantity[Volt] := voltage(p, amperes(3.0));
+        let r: Quantity[Ohm] := resistance(u, amperes(2.0));
+        assertTrue(writes(r, "2 Ohm"), "4 V at 2 A is 2 Ohm");
+        assertTrue(writes(area(meters(2.0), meters(3.0)), "6 m^2"), "an area");
+        return nil;
+    end;
+
+    -- A zero divisor is refused by the requires of every division: each
+    -- call runs in a child of its own, which must stop with the message of
+    -- a violated requires; a child dividing by one is not refused.
+    function testAZeroDivisorIsRefused(): Unit is
+        let none: Quantity[Second] := seconds(0.0);
+        let no_current: Quantity[Ampere] := amperes(0.0);
+        let no_area: Quantity[SquareMeter] := area(meters(0.0), meters(1.0));
+        if asChild("ratio") then
+            let r: Float64 := ratio(meters(1.0), meters(0.0));
+            return nil;
+        end if;
+        if asChild("velocity") then
+            let r: Quantity[MeterPerSecond] := velocity(meters(1.0), none);
+            return nil;
+        end if;
+        if asChild("acceleration") then
+            let r: Quantity[MeterPerSecondSquared] := acceleration(velocity(meters(1.0), seconds(1.0)), none);
+            return nil;
+        end if;
+        if asChild("powerOf") then
+            let r: Quantity[Watt] := powerOf(work(force(kilograms(1.0), acceleration(velocity(meters(1.0), seconds(1.0)), seconds(1.0))), meters(1.0)), none);
+            return nil;
+        end if;
+        if asChild("pressure") then
+            let r: Quantity[Pascal] := pressure(force(kilograms(1.0), acceleration(velocity(meters(1.0), seconds(1.0)), seconds(1.0))), no_area);
+            return nil;
+        end if;
+        if asChild("frequency") then
+            let r: Quantity[Hertz] := frequency(3.0, none);
+            return nil;
+        end if;
+        if asChild("voltage") then
+            let r: Quantity[Volt] := voltage(powerOf(work(force(kilograms(1.0), acceleration(velocity(meters(1.0), seconds(1.0)), seconds(1.0))), meters(1.0)), seconds(1.0)), no_current);
+            return nil;
+        end if;
+        if asChild("resistance") then
+            let p: Quantity[Watt] := powerOf(work(force(kilograms(1.0), acceleration(velocity(meters(1.0), seconds(1.0)), seconds(1.0))), meters(1.0)), seconds(1.0));
+            let r: Quantity[Ohm] := resistance(voltage(p, amperes(1.0)), no_current);
+            return nil;
+        end if;
+        if asChild("density") then
+            let r: Quantity[KilogramPerCubicMeter] := density(kilograms(1.0), volume(no_area, meters(1.0)));
+            return nil;
+        end if;
+        if asChild("byOne") then
+            let a: Float64 := ratio(meters(1.0), meters(1.0));
+            let b: Quantity[Hertz] := frequency(3.0, seconds(1.0));
+            let c: Quantity[KilogramPerCubicMeter] := density(kilograms(1.0), volume(area(meters(1.0), meters(1.0)), meters(1.0)));
+            return nil;
+        end if;
+        assertTrue(childCanRun(), "the test programme starts itself again through /proc/<pid>/exe; without it this test did not run");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "ratio", " of Mirco.Units.ratio ("), "a ratio to 0 m is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "velocity", " of Mirco.Units.velocity ("), "a velocity in 0 s is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "acceleration", " of Mirco.Units.acceleration ("), "an acceleration in 0 s is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "powerOf", " of Mirco.Units.powerOf ("), "a power in 0 s is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "pressure", " of Mirco.Units.pressure ("), "a pressure on 0 m^2 is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "frequency", " of Mirco.Units.frequency ("), "a frequency in 0 s is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "voltage", " of Mirco.Units.voltage ("), "a voltage at 0 A is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "resistance", " of Mirco.Units.resistance ("), "a resistance at 0 A is refused");
+        assertTrue(refusedByRequiresOf("testAZeroDivisorIsRefused", "density", " of Mirco.Units.density ("), "a density in 0 m^3 is refused");
+        assertTrue(not refusedInChild("testAZeroDivisorIsRefused", "byOne", "contract violated"), "a division by one is taken");
+        return nil;
+    end;
+end module body.

@@ -1,0 +1,38 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+Binds the tables of the ziggurat with which NumPy draws normal numbers, as constant arrays of C.
+
+- It reaches C with @embed, so it is an unsafe module.
+- Mirco.Random is the safe module built on it, and the one a programme imports.
+- Each function gives the entry i of its table of 256; an i beyond is refused by its requires, and nextStandardNormal of Mirco.Random draws i from the low byte.
+
+    let width: Float64 := wi(0);
+"""
+module Mirco.Bindings.Ziggurat is
+    """
+    The bound below which a draw of layer i is accepted at once, ki_double of NumPy; every bound lies below 2 to the 52.
+    """
+    function ki(i: Index): Nat64
+        requires i <= 255
+        ensures result < 4503599627370496;
+
+    """
+    The width of layer i over 2 to the 52, wi_double of NumPy; every width lies above 0 and below 10 to the -15.
+    """
+    function wi(i: Index): Float64
+        requires i <= 255
+        ensures (result > 0.0) and (result < 0.000000000000001);
+
+    """
+    The density at the edge of layer i, fi_double of NumPy; every density lies above 0 and at most 1.
+    """
+    function fi(i: Index): Float64
+        requires i <= 255
+        ensures (result > 0.0) and (result <= 1.0);
+end module.

@@ -1,0 +1,180 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    initialize,
+    insertBack,
+    destroyFree,
+    length,
+    nth,
+    nthMut,
+    storeNth,
+    wholeSpan
+);
+import Mirco.Element (Element);
+import Mirco.Array (NdArray, count, flatGet, zeros, flatSet);
+
+module body Mirco.Interpolate is
+    -- The points and the second derivative of the spline at each of them.
+    record Spline: Linear is
+        xs: Buffer[Float64];
+        ys: Buffer[Float64];
+        curvature: Buffer[Float64];
+        invariant (length(&xs) = length(&ys)) and (length(&xs) = length(&curvature)) and (length(&xs) >= 2);
+    end;
+
+    -- The largest i below n - 1 with xp at i not above x, or 0.
+    generic [R: Region]
+    function piece(xp: &[NdArray[Float64], R], x: Float64): Index is
+        let n: Index := count(xp);
+        if n < 2 then
+            return 0;
+        end if;
+        var low: Index := 0;
+        var high: Index := n - 1;
+        while (high - low) > 1 do
+            let middle: Index := (low + high) / 2;
+            if flatGet(xp, middle) <= x then
+                low := middle;
+            else
+                high := middle;
+            end if;
+        end while;
+        return low;
+    end;
+
+    generic [R: Region, S: Region]
+    function interpolate(x: Float64, xp: &[NdArray[Float64], R], fp: &[NdArray[Float64], S]): Float64 is
+        let n: Index := count(xp);
+        if x <= flatGet(xp, 0) then
+            return flatGet(fp, 0);
+        end if;
+        if x >= flatGet(xp, n - 1) then
+            return flatGet(fp, n - 1);
+        end if;
+        let i: Index := piece(xp, x);
+        let x0: Float64 := flatGet(xp, i);
+        let x1: Float64 := flatGet(xp, i + 1);
+        let y0: Float64 := flatGet(fp, i);
+        let y1: Float64 := flatGet(fp, i + 1);
+        if x1 = x0 then
+            return y1;
+        end if;
+        return y0 + (((y1 - y0) * (x - x0)) / (x1 - x0));
+    end;
+
+    generic [Q: Region, R: Region, S: Region]
+    function interpolateAll(xs: &[NdArray[Float64], Q], xp: &[NdArray[Float64], R], fp: &[NdArray[Float64], S]): NdArray[Float64] is
+        let n: Index := count(xs);
+        var shape: Buffer[Index] := allocateEmpty();
+        insertBack(&!shape, n);
+        var made: NdArray[Float64] := zeros(wholeSpan(&shape));
+        destroyFree(shape);
+        var at: Index := 0;
+        while at < n do
+            flatSet(&!made, at, interpolate(flatGet(xs, at), xp, fp));
+            at := at + 1;
+        end while;
+        return made;
+    end;
+
+    -- The second derivatives solve a system of three diagonals, by the
+    -- elimination of Thomas: forward over diagonal and right side, then
+    -- back from the end, with zero at both ends.
+    generic [R: Region, S: Region]
+    function spline(xp: &[NdArray[Float64], R], fp: &[NdArray[Float64], S]): Spline is
+        let n: Index := count(xp);
+        var xs: Buffer[Float64] := allocateEmpty();
+        var ys: Buffer[Float64] := allocateEmpty();
+        var at: Index := 0;
+        while at < n do
+            insertBack(&!xs, flatGet(xp, at));
+            insertBack(&!ys, flatGet(fp, at));
+            at := at + 1;
+        end while;
+        var curvature: Buffer[Float64] := initialize(n, 0.0);
+        var diagonal: Buffer[Float64] := initialize(n, 0.0);
+        var right: Buffer[Float64] := initialize(n, 0.0);
+        var i: Index := 1;
+        while i < (n - 1) do
+            let h0: Float64 := flatGet(xp, i) - flatGet(xp, i - 1);
+            let h1: Float64 := flatGet(xp, i + 1) - flatGet(xp, i);
+            let r: Float64 := 6.0 * (((flatGet(fp, i + 1) - flatGet(fp, i)) / h1) - ((flatGet(fp, i) - flatGet(fp, i - 1)) / h0));
+            var d: Float64 := 2.0 * (h0 + h1);
+            var rr: Float64 := r;
+            if i > 1 then
+                let previous_diagonal: Float64 := nthMut(&!diagonal, i - 1);
+                let previous_right: Float64 := nthMut(&!right, i - 1);
+                let factor: Float64 := h0 / previous_diagonal;
+                d := d - (factor * h0);
+                rr := rr - (factor * previous_right);
+            end if;
+            storeNth(&!diagonal, i, d);
+            storeNth(&!right, i, rr);
+            i := i + 1;
+        end while;
+        var k: Index := n - 1;
+        while k > 1 do
+            k := k - 1;
+            let h1: Float64 := flatGet(xp, k + 1) - flatGet(xp, k);
+            let next: Float64 := nthMut(&!curvature, k + 1);
+            let rk: Float64 := nthMut(&!right, k);
+            let dk: Float64 := nthMut(&!diagonal, k);
+            storeNth(&!curvature, k, (rk - (h1 * next)) / dk);
+        end while;
+        destroyFree(diagonal);
+        destroyFree(right);
+        return Spline(xs => xs, ys => ys, curvature => curvature);
+    end;
+
+    generic [R: Region]
+    function splinePoints(s: &[Spline, R]): Index is
+        return length(&(s->xs));
+    end;
+
+    -- The largest i below n - 1 with xs at i not above x, or 0.
+    generic [R: Region]
+    function splinePiece(s: &[Spline, R], x: Float64): Index is
+        let n: Index := splinePoints(s);
+        var low: Index := 0;
+        var high: Index := n - 1;
+        while (high - low) > 1 do
+            let middle: Index := (low + high) / 2;
+            if nth(&(s->xs), middle) <= x then
+                low := middle;
+            else
+                high := middle;
+            end if;
+        end while;
+        return low;
+    end;
+
+    generic [R: Region]
+    function splineAt(s: &[Spline, R], x: Float64): Float64 is
+        let i: Index := splinePiece(s, x);
+        let x0: Float64 := nth(&(s->xs), i);
+        let x1: Float64 := nth(&(s->xs), i + 1);
+        let y0: Float64 := nth(&(s->ys), i);
+        let y1: Float64 := nth(&(s->ys), i + 1);
+        let m0: Float64 := nth(&(s->curvature), i);
+        let m1: Float64 := nth(&(s->curvature), i + 1);
+        let h: Float64 := x1 - x0;
+        let t: Float64 := x - x0;
+        let slope: Float64 := ((y1 - y0) / h) - ((h * ((2.0 * m0) + m1)) / 6.0);
+        return y0 + (slope * t) + ((m0 / 2.0) * t * t) + (((m1 - m0) / (6.0 * h)) * t * t * t);
+    end;
+
+    function destroySpline(s: Spline): Unit is
+        let { xs: Buffer[Float64], ys: Buffer[Float64], curvature: Buffer[Float64] } := s;
+        destroyFree(xs);
+        destroyFree(ys);
+        destroyFree(curvature);
+        return nil;
+    end;
+end module body.

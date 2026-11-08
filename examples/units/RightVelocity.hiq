@@ -1,0 +1,18 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- The control of the two refused files: the same calls with the units in
+-- their places, which the compiler takes.
+import Mirco.Units (Meter, MeterPerSecond, Quantity, add, velocity, meters, seconds);
+
+module body Example.RightVelocity is
+    function main(): ExitCode is
+        let sum: Quantity[Meter] := add(meters(1.0), meters(2.0));
+        let v: Quantity[MeterPerSecond] := velocity(meters(1.0), seconds(2.0));
+        return ExitSuccess();
+    end;
+end module body.

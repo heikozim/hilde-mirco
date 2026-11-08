@@ -1,0 +1,317 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+-- A probe for tools/mirco-run: one read of a file that announces a shape
+-- without the elements to back it, a hostile input against Mirco.Hdf5.readFloat64, readInt64 and
+-- Mirco.NetCdf.readFloat64, readInt64.  On the readers before the fix the
+-- cases zero, huge and many ended the programme over a contract of
+-- Mirco.Array, a trapped overflow or an allocation the system kills instead
+-- of coming back as a fault; with
+-- the fix each of them is a fault.  The output of both runs is recorded
+-- beside this, in tools/HostileDims.output.
+--
+--     READER one of hdf5-float, hdf5-int, netcdf-float, netcdf-int
+--     SHAPE  zero  0 x 3, a dimension of no length, an unlimited netCDF
+--                  dimension without records
+--            huge  2^40 x 2^40, a count of elements that overflows an Index
+--            many  65536 x 65537, a count above readElementLimit()
+--            ok    2 x 3, a shape an array can have
+--
+--     HILDE=/path/to/hilde sh tools/mirco-run tools/HostileDims.hiq hdf5-float zero
+--
+-- Exit 0 with the outcome on its standard output, 9 for a command line it
+-- does not take or a file it cannot make.  It works on
+-- mirco-hostile-dims.h5 or mirco-hostile-dims.nc in the working directory
+-- and removes the file when the read came back; a read that ends the
+-- programme leaves it there.
+import Standard.Buffer (Buffer, allocateEmpty, initialize, insertBack, destroyFree, wholeSpan, getSpanMut, nth, nthRef, length);
+import Standard.String (String, asSpan, destroyString);
+import Standard.Text (equal, formatNat);
+import Standard.File (removeFileIfThere);
+import Standard.Arguments (processArguments, destroyArguments);
+import Mirco.Array (NdArray, destroyNdArray, rank, dimension, count);
+import Mirco.Hdf5 (Hdf5Fault, readFloat64, readInt64);
+import Mirco.NetCdf (NetCdfFault, readFloat64 as readNetcdfFloat64, readInt64 as readNetcdfInt64);
+import Mirco.Bindings.Hdf5 (createFile, createDataset, closeDataset, closeFile as closeHdf5File);
+import Mirco.Bindings.NetCdf (create, defineDimension, defineVariable, close as closeNetcdfFile);
+
+module body Tools.HostileDims is
+    generic [R: Region]
+    function word(words: &[Buffer[String], R], k: Index): Span[Nat8, R] is
+        return asSpan(nthRef(words, k));
+    end;
+
+    function number(n: Index): String is
+        case toNat64(n) of
+            when Some(value as v: Nat64) do
+                return formatNat(v);
+            when None do
+                return formatNat(0);
+        end case;
+    end;
+
+    -- The two lengths of the shape a case names.
+    record Shape: Free is
+        first: Index;
+        second: Index;
+    end;
+
+    generic [S: Region]
+    function shapeFor(name: Span[Nat8, S]): Option[Shape] is
+        if equal(name, "zero") then
+            return Some(value => Shape(first => 0, second => 3));
+        end if;
+        if equal(name, "huge") then
+            return Some(value => Shape(first => 1099511627776, second => 1099511627776));
+        end if;
+        if equal(name, "many") then
+            return Some(value => Shape(first => 65536, second => 65537));
+        end if;
+        if equal(name, "ok") then
+            return Some(value => Shape(first => 2, second => 3));
+        end if;
+        return None();
+    end;
+
+    function wide(d: Index): Nat64 is
+        case toNat64(d) of
+            when Some(value as w: Nat64) do
+                return w;
+            when None do
+                return 0;
+        end case;
+    end;
+
+    -- A file at path with the dataset x of the shape, of Float64 when
+    -- floating holds and of Int64 otherwise, no element written: the shape
+    -- the file announces without the elements to back it.
+    function madeHdf5(path: Span[Nat8, Static], shape: Shape, floating: Bool): Bool is
+        let file: Int64 := createFile(path);
+        if file < 0 then
+            return false;
+        end if;
+        var dims: Buffer[Nat64] := allocateEmpty();
+        insertBack(&!dims, wide(shape.first));
+        insertBack(&!dims, wide(shape.second));
+        let dataset: Int64 := createDataset(file, "x", wholeSpan(&dims), floating);
+        destroyFree(dims);
+        var closed_set: Int32 := -1;
+        if dataset >= 0 then
+            closed_set := closeDataset(dataset);
+        end if;
+        let closed: Int32 := closeHdf5File(file);
+        return (dataset >= 0) and ((closed_set = 0) and (closed = 0));
+    end;
+
+    -- The netCDF shape of it: the variable x over two dimensions, the
+    -- first of no length taken as unlimited.
+    function madeNetcdf(path: Span[Nat8, Static], shape: Shape, floating: Bool): Bool is
+        var ids: Buffer[Int32] := initialize(1, -1);
+        if create(path, getSpanMut(&!ids, 0, 0)) /= 0 then
+            destroyFree(ids);
+            return false;
+        end if;
+        let file: Int32 := nth(&ids, 0);
+        var dims: Buffer[Int32] := allocateEmpty();
+        let status_one: Int32 := defineDimension(file, "a", shape.first, getSpanMut(&!ids, 0, 0));
+        if status_one = 0 then
+            insertBack(&!dims, nth(&ids, 0));
+        end if;
+        var status_two: Int32 := -1;
+        if status_one = 0 then
+            status_two := defineDimension(file, "b", shape.second, getSpanMut(&!ids, 0, 0));
+            if status_two = 0 then
+                insertBack(&!dims, nth(&ids, 0));
+            end if;
+        end if;
+        var status_var: Int32 := -1;
+        if (status_one = 0) and (status_two = 0) then
+            status_var := defineVariable(file, "x", floating, wholeSpan(&dims), getSpanMut(&!ids, 0, 0));
+        end if;
+        let closed: Int32 := closeNetcdfFile(file);
+        destroyFree(dims);
+        destroyFree(ids);
+        return (status_one = 0) and ((status_two = 0) and ((status_var = 0) and (closed = 0)));
+    end;
+
+    -- Prints the shape of the array that came back.
+    generic [T: Free, R: Region]
+    function showArray(array: &[NdArray[T], R]): Unit is
+        print("array");
+        var axis: Index := 0;
+        while axis < rank(array) do
+            if axis > 0 then
+                print(" x");
+            end if;
+            print(" ");
+            let dim: String := number(dimension(array, axis));
+            print(asSpan(&dim));
+            destroyString(dim);
+            axis := axis + 1;
+        end while;
+        let total: String := number(count(array));
+        print(", ");
+        print(asSpan(&total));
+        destroyString(total);
+        printLn(" elements");
+        return nil;
+    end;
+
+    function showHdf5Fault(fault: Hdf5Fault): Unit is
+        case fault of
+            when CannotOpen do
+                printLn("fault CannotOpen");
+            when NoDataset do
+                printLn("fault NoDataset");
+            when WrongType do
+                printLn("fault WrongType");
+            when BadShape do
+                printLn("fault BadShape");
+            when Failed do
+                printLn("fault Failed");
+        end case;
+        return nil;
+    end;
+
+    function showNetcdfFault(fault: NetCdfFault): Unit is
+        case fault of
+            when NotOpened do
+                printLn("fault NotOpened");
+            when NoVariable do
+                printLn("fault NoVariable");
+            when OtherType do
+                printLn("fault OtherType");
+            when BadDimensions do
+                printLn("fault BadDimensions");
+            when NotDone do
+                printLn("fault NotDone");
+        end case;
+        return nil;
+    end;
+
+    -- Makes the file of the format, reads the dataset or the variable x,
+    -- prints what came back and removes the file; 0, or 9 when the file
+    -- could not be made.
+    function probeHdf5Float(shape: Shape): Int32 is
+        let made: Bool := madeHdf5("mirco-hostile-dims.h5", shape, true);
+        if not made then
+            return 9;
+        end if;
+        case readFloat64("mirco-hostile-dims.h5", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                showArray(&m);
+                destroyNdArray(m);
+            when Left(left as f: Hdf5Fault) do
+                showHdf5Fault(f);
+        end case;
+        let removed: Bool := removeFileIfThere("mirco-hostile-dims.h5");
+        if not removed then
+            printLn("the file is not removed");
+        end if;
+        return 0;
+    end;
+
+    function probeHdf5Int(shape: Shape): Int32 is
+        let made: Bool := madeHdf5("mirco-hostile-dims.h5", shape, false);
+        if not made then
+            return 9;
+        end if;
+        case readInt64("mirco-hostile-dims.h5", "x") of
+            when Right(right as v: NdArray[Int64]) do
+                showArray(&v);
+                destroyNdArray(v);
+            when Left(left as f: Hdf5Fault) do
+                showHdf5Fault(f);
+        end case;
+        let removed: Bool := removeFileIfThere("mirco-hostile-dims.h5");
+        if not removed then
+            printLn("the file is not removed");
+        end if;
+        return 0;
+    end;
+
+    function probeNetcdfFloat(shape: Shape): Int32 is
+        let made: Bool := madeNetcdf("mirco-hostile-dims.nc", shape, true);
+        if not made then
+            return 9;
+        end if;
+        case readNetcdfFloat64("mirco-hostile-dims.nc", "x") of
+            when Right(right as m: NdArray[Float64]) do
+                showArray(&m);
+                destroyNdArray(m);
+            when Left(left as f: NetCdfFault) do
+                showNetcdfFault(f);
+        end case;
+        let removed: Bool := removeFileIfThere("mirco-hostile-dims.nc");
+        if not removed then
+            printLn("the file is not removed");
+        end if;
+        return 0;
+    end;
+
+    function probeNetcdfInt(shape: Shape): Int32 is
+        let made: Bool := madeNetcdf("mirco-hostile-dims.nc", shape, false);
+        if not made then
+            return 9;
+        end if;
+        case readNetcdfInt64("mirco-hostile-dims.nc", "x") of
+            when Right(right as v: NdArray[Int64]) do
+                showArray(&v);
+                destroyNdArray(v);
+            when Left(left as f: NetCdfFault) do
+                showNetcdfFault(f);
+        end case;
+        let removed: Bool := removeFileIfThere("mirco-hostile-dims.nc");
+        if not removed then
+            printLn("the file is not removed");
+        end if;
+        return 0;
+    end;
+
+    -- The probe one case long: the reader names the format and the type,
+    -- the name the shape; 0 when the case ran, 9 when it does not exist.
+    generic [R: Region, S: Region]
+    function run(reader: Span[Nat8, R], name: Span[Nat8, S]): Int32 is
+        case shapeFor(name) of
+            when None do
+                return 9;
+            when Some(value as s: Shape) do
+                if equal(reader, "hdf5-float") then
+                    return probeHdf5Float(s);
+                end if;
+                if equal(reader, "hdf5-int") then
+                    return probeHdf5Int(s);
+                end if;
+                if equal(reader, "netcdf-float") then
+                    return probeNetcdfFloat(s);
+                end if;
+                if equal(reader, "netcdf-int") then
+                    return probeNetcdfInt(s);
+                end if;
+                return 9;
+        end case;
+    end;
+
+    function main(): ExitCode is
+        let words: Buffer[String] := processArguments();
+        var code: Int32 := 9;
+        var given: Index := length(&words);
+        if given = 2 then
+            code := run(word(&words, 0), word(&words, 1));
+        end if;
+        if code = 9 then
+            printLn("usage: HostileDims.hiq READER SHAPE");
+            printLn("READER one of hdf5-float hdf5-int netcdf-float netcdf-int");
+            printLn("SHAPE one of zero (0 x 3), huge (2^40 x 2^40), many (65536 x 65537), ok (2 x 3)");
+        end if;
+        destroyArguments(words);
+        if code = 0 then
+            return ExitSuccess();
+        end if;
+        return ExitStatus(status => 9);
+    end;
+end module body.

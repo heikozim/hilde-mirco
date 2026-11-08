@@ -1,0 +1,302 @@
+--
+-- Part of Hilde, under the Apache License v2.0 with LLVM Exceptions.
+-- See LICENSE file for details.
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Buffer (Buffer, insertBack);
+import Standard.Bits (
+    float64Bits,
+    float64FromBits,
+    float32Bits,
+    float32FromBits,
+    int64Bits,
+    int64FromBits,
+    int32Bits,
+    int32FromBits
+);
+
+module body Mirco.Element is
+    function codeFloat64(): Nat8 is
+        return 1;
+    end;
+
+    function codeFloat32(): Nat8 is
+        return 2;
+    end;
+
+    function codeInt64(): Nat8 is
+        return 3;
+    end;
+
+    function codeInt32(): Nat8 is
+        return 4;
+    end;
+
+    function codeNat8(): Nat8 is
+        return 5;
+    end;
+
+    function codeBool(): Nat8 is
+        return 6;
+    end;
+
+    function knownCode(code: Nat8): Bool is
+        return (code >= 1) and (code <= 6);
+    end;
+
+    function widthOfCode(code: Nat8): Index is
+        if (code = 1) or (code = 3) then
+            return 8;
+        else if (code = 2) or (code = 4) then
+            return 4;
+        else if (code = 5) or (code = 6) then
+            return 1;
+        end if;
+        return 0;
+    end;
+
+    -- The count lowest bytes of value, lowest first.  The division by 256
+    -- takes the place of a shift, which the language does not have.
+    generic [R: Region]
+    function appendBytes(value: Nat64, count: Index, out: &![Buffer[Nat8], R]): Unit is
+        var rest: Nat64 := value;
+        var done: Index := 0;
+        while done < count do
+            let high: Nat64 := rest / 256;
+            let low: Nat64 := rest - (high * 256);
+            case toNat8(low) of
+                when Some(value as byte: Nat8) do
+                    insertBack(&~out, byte);
+                when None do
+                    abort("Mirco.Element: a byte above 255");
+            end case;
+            rest := high;
+            done := done + 1;
+        end while;
+        return nil;
+    end;
+
+    -- The number of count bytes at at, lowest first.
+    generic [R: Region]
+    function readBytes(bytes: Span[Nat8, R], at: Index, count: Index): Nat64 is
+        var value: Nat64 := 0;
+        var left: Index := count;
+        while left > 0 do
+            left := left - 1;
+            let byte: Nat8 := bytes[at + left];
+            case toNat64(byte) of
+                when Some(value as wide: Nat64) do
+                    value := (value * 256) + wide;
+                when None do
+                    abort("Mirco.Element: a byte that is no number");
+            end case;
+        end while;
+        return value;
+    end;
+
+    function narrowBits(bits: Nat64): Nat32 is
+        case toNat32(bits) of
+            when Some(value as narrow: Nat32) do
+                return narrow;
+            when None do
+                abort("Mirco.Element: four bytes above 32 bits");
+        end case;
+    end;
+
+    function widenBits(bits: Nat32): Nat64 is
+        case toNat64(bits) of
+            when Some(value as wide: Nat64) do
+                return wide;
+            when None do
+                abort("Mirco.Element: 32 bits that do not widen");
+        end case;
+    end;
+
+    instance Element(Float64) is
+        method elementCode(value: Float64): Nat8 is
+            return 1;
+        end;
+
+        method elementWidth(value: Float64): Index is
+            return 8;
+        end;
+
+        method zeroElement(): Float64 is
+            return 0.0;
+        end;
+
+        generic [R: Region]
+        method appendLittleEndian(value: Float64, out: &![Buffer[Nat8], R]): Unit is
+            appendBytes(float64Bits(value), 8, out);
+            return nil;
+        end;
+
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): Float64 is
+            return float64FromBits(readBytes(bytes, at, 8));
+        end;
+
+        generic [R: Region]
+        method validLittleEndian(witness: Float64, bytes: Span[Nat8, R], at: Index): Bool is
+            return true;
+        end;
+    end;
+
+    instance Element(Float32) is
+        method elementCode(value: Float32): Nat8 is
+            return 2;
+        end;
+
+        method elementWidth(value: Float32): Index is
+            return 4;
+        end;
+
+        method zeroElement(): Float32 is
+            return 0.0;
+        end;
+
+        generic [R: Region]
+        method appendLittleEndian(value: Float32, out: &![Buffer[Nat8], R]): Unit is
+            appendBytes(widenBits(float32Bits(value)), 4, out);
+            return nil;
+        end;
+
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): Float32 is
+            return float32FromBits(narrowBits(readBytes(bytes, at, 4)));
+        end;
+
+        generic [R: Region]
+        method validLittleEndian(witness: Float32, bytes: Span[Nat8, R], at: Index): Bool is
+            return true;
+        end;
+    end;
+
+    instance Element(Int64) is
+        method elementCode(value: Int64): Nat8 is
+            return 3;
+        end;
+
+        method elementWidth(value: Int64): Index is
+            return 8;
+        end;
+
+        method zeroElement(): Int64 is
+            return 0;
+        end;
+
+        generic [R: Region]
+        method appendLittleEndian(value: Int64, out: &![Buffer[Nat8], R]): Unit is
+            appendBytes(int64Bits(value), 8, out);
+            return nil;
+        end;
+
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): Int64 is
+            return int64FromBits(readBytes(bytes, at, 8));
+        end;
+
+        generic [R: Region]
+        method validLittleEndian(witness: Int64, bytes: Span[Nat8, R], at: Index): Bool is
+            return true;
+        end;
+    end;
+
+    instance Element(Int32) is
+        method elementCode(value: Int32): Nat8 is
+            return 4;
+        end;
+
+        method elementWidth(value: Int32): Index is
+            return 4;
+        end;
+
+        method zeroElement(): Int32 is
+            return 0;
+        end;
+
+        generic [R: Region]
+        method appendLittleEndian(value: Int32, out: &![Buffer[Nat8], R]): Unit is
+            appendBytes(widenBits(int32Bits(value)), 4, out);
+            return nil;
+        end;
+
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): Int32 is
+            return int32FromBits(narrowBits(readBytes(bytes, at, 4)));
+        end;
+
+        generic [R: Region]
+        method validLittleEndian(witness: Int32, bytes: Span[Nat8, R], at: Index): Bool is
+            return true;
+        end;
+    end;
+
+    instance Element(Nat8) is
+        method elementCode(value: Nat8): Nat8 is
+            return 5;
+        end;
+
+        method elementWidth(value: Nat8): Index is
+            return 1;
+        end;
+
+        method zeroElement(): Nat8 is
+            return 0;
+        end;
+
+        generic [R: Region]
+        method appendLittleEndian(value: Nat8, out: &![Buffer[Nat8], R]): Unit is
+            insertBack(out, value);
+            return nil;
+        end;
+
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): Nat8 is
+            return bytes[at];
+        end;
+
+        generic [R: Region]
+        method validLittleEndian(witness: Nat8, bytes: Span[Nat8, R], at: Index): Bool is
+            return true;
+        end;
+    end;
+
+    instance Element(Bool) is
+        method elementCode(value: Bool): Nat8 is
+            return 6;
+        end;
+
+        method elementWidth(value: Bool): Index is
+            return 1;
+        end;
+
+        method zeroElement(): Bool is
+            return false;
+        end;
+
+        generic [R: Region]
+        method appendLittleEndian(value: Bool, out: &![Buffer[Nat8], R]): Unit is
+            if value then
+                insertBack(out, 1);
+            else
+                insertBack(out, 0);
+            end if;
+            return nil;
+        end;
+
+        generic [R: Region]
+        method readLittleEndian(bytes: Span[Nat8, R], at: Index): Bool is
+            let byte: Nat8 := bytes[at];
+            return byte = 1;
+        end;
+
+        generic [R: Region]
+        method validLittleEndian(witness: Bool, bytes: Span[Nat8, R], at: Index): Bool is
+            let byte: Nat8 := bytes[at];
+            return (byte = 0) or (byte = 1);
+        end;
+    end;
+end module body.
