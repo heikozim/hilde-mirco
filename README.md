@@ -7,27 +7,56 @@ MIRCO, a science kit in Hilde: Matrices, Interpolation, Random numbers, Calculus
 
 Website: https://hilde-lang.org/mirco/
 
-# Mirco
+# MIRCO
 
-Mirco is the science kit of Hilde: matrices, interpolation, random numbers, calculus and optimization, in the
-place NumPy and SciPy have for Python. It is a package of Hilde with the prefix `Mirco`.
+MIRCO is the science kit of [Hilde](https://github.com/heikozim/hilde):
+it has the place in Hilde that NumPy and SciPy have in Python.  It is a
+package of Hilde with the prefix `Mirco`.
 
-- `src/` holds the modules, `Mirco.Array` for `src/Array.hih` and so on.
-- `docs/mirco.en.md` describes them.
-- `tools/mirco-notebook` runs a notebook of cells.
-- `scripts/gate.sh` is the gate: the checks of the package, its tests, the form of its sources and the
-  contracts, run with a built Hilde and the C backend mirco-blis, which it builds first. mirco-blis is not
-  published yet.
+## Features
+
+- **Arrays:** element types, views, broadcasting, computing over arrays
+  (`Mirco.Array`, `Mirco.Compute`, `Mirco.Element`)
+- **Linear algebra:** `Mirco.Linalg` on LAPACK and the C backend mirco-blis
+- **Numerics:** interpolation, integration, root finding, minimization and
+  optimization, FFT, statistics (`Mirco.Interpolate`, `Mirco.Integrate`,
+  `Mirco.Minimize`, `Mirco.Optimize`, `Mirco.Fft`, `Mirco.Stats`)
+- **Random numbers:** `Mirco.Random`
+- **Units:** quantities with their SI unit in the type (`Mirco.Units`)
+- **Files:** CSV, HDF5, netCDF, CERN's ROOT, tables in SQLite or DuckDB, xz and zstd
+- **Notebooks:** `tools/mirco-notebook` runs a notebook of cells
+
+All modules are described in [docs/mirco.en.md](docs/mirco.en.md).
+
+## Quick start
 
 ```sh
 HILDE=/path/to/hilde MIRCO_BLIS=/path/to/mirco-blis sh scripts/gate.sh
 ```
 
-`sh scripts/gate.sh --quick` (`-q`) is the quick gate for a change: it builds and tests only the modules touched
-since the merge base with main and those that import them directly. It writes no `_gate/` and no `GATE-RESULT`;
-a release needs the full gate. A change to the gate, the build or shared configuration falls back to the full
-gate.
+The gate builds the C backend mirco-blis first.  mirco-blis is not
+published yet.
+
+## Testing
+
+| Command | Purpose |
+|---|---|
+| `sh scripts/gate.sh` | the full gate: the checks of the package, its tests, the form of its sources and the contracts |
+| `sh scripts/gate.sh --quick` (`-q`) | the quick gate for a change: only the modules touched since the merge base with main and those that import them directly; writes no `_gate/` and no `GATE-RESULT` |
+
+A release needs the full gate.  A change to the gate, the build or shared
+configuration falls back to the full gate.
+
+## Layout
+
+- `src/`: the modules, `Mirco.Array` in `src/Array.hih` and so on
+- `docs/mirco.en.md`: the documentation
+- `examples/`: Python, scripts and units
+- `tools/`: the notebook and the runner
+
+## License
 
 Copyright (c) 2026 Heiko Zimmermann <code@heiko-zimmermann.com>
 
-MIRCO is licensed under the Apache License 2.0 with LLVM exception; see LICENSE.
+MIRCO is licensed under the Apache License 2.0 with LLVM Exceptions; see
+[LICENSE](LICENSE).
