@@ -15,3 +15,4 @@ Makefile linguist-detectable=false
 *.c linguist-detectable=false
 *.h linguist-detectable=false
 tools/mirco-* linguist-detectable=false
+c/** linguist-vendored

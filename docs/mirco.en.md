@@ -208,7 +208,7 @@ compiler refuses a length plus a time; a derived unit comes from the fixed table
 
 `hilde compile src/Export.hih,src/Export.hiq --target-type=shared --output=libmirco.so` builds a library with
 the functions `mirco_dot`, `mirco_mean`, `mirco_deviation` and `mirco_matmul`; a vector crosses as its bytes,
-eight bytes little endian for each number. `examples/python/mirco_ctypes.py` shows the use from Python through
+eight bytes little endian for each number. `mirco_matmul` takes the length of `out` a second time as its last parameter `out_len` and gives false, writing nothing, when it is too short for the product. `examples/python/mirco_ctypes.py` shows the use from Python through
 ctypes. A single script runs with `HILDE=/path/to/hilde tools/mirco-run Script.hiq`, in the root of the package; HILDE
 names the compiler and, as `--modules`, its `standard/src` and `bindings/generated`.
 
@@ -216,13 +216,14 @@ names the compiler and, as `--modules`, its `standard/src` and `bindings/generat
 
 `Mirco.Lapack` and `Mirco.Pocketfft` have the functions of `Mirco.Linalg` and `Mirco.Fft` with the same names,
 arguments and results, computed by BLIS, the C translation of LAPACK and pocketfft; `Mirco.Lapack` adds
-`matmul`, `dot`, `matvec`, `gemv` and `gemm` of `Mirco.Compute`, all by dgemm of BLIS: the header of mirco-blis
+`matmul`, `dot`, `matvec`, `gemv` and `gemm` of `Mirco.Compute`, all by dgemm of BLIS: the header in `c/include`
 declares dgemm and no other routine of BLAS, so a dot product is a 1 by k times a k by 1 matrix. A programme
-selects the backend by its import. They need the library `mircoblis` of the repository mirco-blis:
-`sh tools/build-c.sh` there, then `PKG_CONFIG_PATH` set to its `_c/lib/pkgconfig`. The tests compare each
+selects the backend by its import. They need the library `mircoblis`, built from the sources in `c/`:
+`sh tools/build-c.sh`, then `PKG_CONFIG_PATH` set to `_c/lib/pkgconfig`. The tests compare each
 function with the one in pure Hilde within 1e-9 times 1 plus the value of pure Hilde, the vectors of an
 eigenproblem and of an SVD up to their signs. The licences of BLIS, LAPACK, OpenBLAS and pocketfft stand in
-`licenses/`, and the gate compares them with mirco-blis. 
+`licenses/`, and the gate compares them with the files beside the sources in `c/` (`c/NOTICE` names where each
+source came from).
 ## HDF5 and netCDF
 
 `Mirco.Hdf5` and `Mirco.NetCdf` write an array of `Float64` or `Int64` into a file and read it back through

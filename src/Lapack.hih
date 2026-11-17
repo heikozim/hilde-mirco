@@ -8,7 +8,7 @@
 """
 The functions of Mirco.Linalg and the product of matrices computed by Lapack and blis, the backend a programme selects by importing this module.
 
-- The library mircoblis of the package mirco-blis must be built; pkg-config finds it through PKG_CONFIG_PATH.
+- The library mircoblis must be built from c/ (sh tools/build-c.sh); pkg-config finds it through PKG_CONFIG_PATH.
 - Each function has the name, the arguments and the result of the one in Mirco.Linalg, or for dot, matvec, gemv, gemm and matmul in Mirco.Compute, within rounding.
 - A matrix is an array of rank 2; a dimension that does not fit stops the programme with a message.
 - A singular matrix gives None where Mirco.Linalg gives None, as Lapack reports it.

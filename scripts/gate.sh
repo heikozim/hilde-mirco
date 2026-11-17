@@ -1,9 +1,9 @@
 #!/bin/sh
 # The gate of Mirco, run from the root of the package with HILDE naming a
-# Hilde tree whose compiler is built and MIRCO_BLIS naming the package
-# mirco-blis, whose C it builds first: every interface with its body, the
+# Hilde tree whose compiler is built.  It builds the C backend in c/
+# first (tools/build-c.sh): every interface with its body, the
 # manifest and the capabilities, every module checked, the licences of the
-# C backend against mirco-blis, the tests, the form of the sources, the
+# C backend against the sources in c/, the tests, the form of the sources, the
 # contracts, the comments and the documentation, the library for C and
 # Python, a script, and the units the compiler must refuse.  Each step
 # writes its log below _gate/; the gate is green only when every step exits
@@ -12,7 +12,7 @@
 # Every hilde that resolves modules gets --modules naming standard/src and
 # bindings/generated of HILDE; hilde fmt takes none, hilde verify needs none.
 #
-#     HILDE=/path/to/hilde MIRCO_BLIS=/path/to/mirco-blis sh scripts/gate.sh
+#     HILDE=/path/to/hilde sh scripts/gate.sh
 #
 # With --quick only the touched modules and their direct dependents are
 # built and tested; it writes nothing below _gate/ and never the
@@ -20,7 +20,7 @@
 set -u
 usage() {
 	cat << 'EOF'
-usage: HILDE=<hilde> MIRCO_BLIS=<mirco-blis> sh scripts/gate.sh [--quick | -q] [--help | -h]
+usage: HILDE=<hilde> sh scripts/gate.sh [--quick | -q] [--help | -h]
 
 Without an option the full gate runs: every module checked and tested, the
 form, contracts, comments, Markdown, the library, a script and the units.
@@ -61,8 +61,8 @@ done
 M="--modules=$H/standard/src:$H/bindings/generated"
 [ -r hilde.toml ] || { echo "ABORT: not the root of the package" >&2; exit 9; }
 command -v python3 > /dev/null 2>&1 || { echo "ABORT: python3 missing -- the gate did NOT run" >&2; exit 9; }
-B=${MIRCO_BLIS:-}
-[ -r "$B/tools/build-c.sh" ] || { echo "ABORT: MIRCO_BLIS does not name the package mirco-blis -- the gate did NOT run" >&2; exit 9; }
+B=$(pwd)
+[ -r "$B/tools/build-c.sh" ] || { echo "ABORT: tools/build-c.sh missing, not the root of the package -- the gate did NOT run" >&2; exit 9; }
 PATH="$H:$PATH"
 export PATH
 # The quick gate: which files changed, which modules they are, which import
@@ -149,6 +149,7 @@ if [ "$quick" = 1 ]; then
 	}
 	echo "quick gate: base=$base logs=$Q"
 	echo "touched: $(tr '\n' ' ' < "$Q/direct.txt")"
+	step naming sh -c "perl scripts/check-naming.pl --self-test && perl scripts/check-naming.pl ."
 	if [ -s "$Q/pairs.txt" ]; then
 		step native sh "$B/tools/build-c.sh"
 		PKG_CONFIG_PATH=$B/_c/lib/pkgconfig${PKG_CONFIG_PATH:+:$PKG_CONFIG_PATH}
@@ -230,6 +231,8 @@ step guard hilde guard "$M" $(cat "$L/pairs.txt")
 step test hilde test "$M" $tested
 grep -q "^hilde test: $tests test files, .* 0 failed, 0 not built$" "$L/test.log" || { echo "test-files-run: not $tests or not all green"; failed=$((failed + 1)); }
 step fmt hilde fmt --check $(cat "$L/sources.txt")
+# Every name follows the case rule of Hilde (ADR-404).
+step naming sh -c "perl scripts/check-naming.pl --self-test && perl scripts/check-naming.pl ."
 step contracts python3 "$H/scripts/check-contracts.py" src
 step comments python3 "$H/scripts/check-comments.py" $(cat "$L/sources.txt")
 # In a checkout of git the Markdown files are those git counts as the
@@ -252,6 +255,12 @@ mkdir -p "$L/lib" || exit 9
 step library hilde compile "$M" src/Export.hih,src/Export.hiq --target-type=shared "--output=$L/lib/libmirco.so"
 step ctypes python3 examples/python/mirco_ctypes.py "$L/lib/libmirco.so"
 step script env "HILDE=$H" sh tools/mirco-run examples/scripts/Summary.hiq
+# The tools of the notebooks and the REPL, checked from the outside.
+step notebook env "HILDE=$H" sh tools/mirco-notebook.test.sh
+step repl env "HILDE=$H" sh tools/mirco-repl.test.sh
+# A programme of the default backend links no DuckDB and no C++; where
+# DuckDB is there, the control with the opt-in module must link it.
+if [ "$duckdb" = run ]; then step purec env "HILDE=$H" sh scripts/check-pure-c.sh --duckdb; else step purec env "HILDE=$H" sh scripts/check-pure-c.sh; fi
 grep -q '^deviation 2.23606797749979$' "$L/script.log" || { echo "script-output: not the deviation of 1, 3, 5, 7"; failed=$((failed + 1)); }
 # Units: two files the compiler must refuse, each with its code, and the
 # control with the same calls in order, which it must take.

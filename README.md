@@ -17,7 +17,7 @@ package of Hilde with the prefix `Mirco`.
 
 - **Arrays:** element types, views, broadcasting, computing over arrays
   (`Mirco.Array`, `Mirco.Compute`, `Mirco.Element`)
-- **Linear algebra:** `Mirco.Linalg` on LAPACK and the C backend mirco-blis
+- **Linear algebra:** `Mirco.Linalg` in pure Hilde, `Mirco.Lapack` on BLIS and LAPACK in C (`c/`)
 - **Numerics:** interpolation, integration, root finding, minimization and
   optimization, FFT, statistics (`Mirco.Interpolate`, `Mirco.Integrate`,
   `Mirco.Minimize`, `Mirco.Optimize`, `Mirco.Fft`, `Mirco.Stats`)
@@ -31,11 +31,19 @@ All modules are described in [docs/mirco.en.md](docs/mirco.en.md).
 ## Quick start
 
 ```sh
-HILDE=/path/to/hilde MIRCO_BLIS=/path/to/mirco-blis sh scripts/gate.sh
+HILDE=/path/to/hilde sh scripts/gate.sh
 ```
 
-The gate builds the C backend mirco-blis first.  mirco-blis is not
-published yet.
+The gate builds the C backend first: BLIS 2.1, the C translation of
+LAPACK from OpenBLAS 0.3.34 and pocketfft from NumPy, all in `c/`
+(`c/NOTICE` names their sources and licences). To build it alone:
+
+```sh
+sh tools/build-c.sh
+export PKG_CONFIG_PATH=$PWD/_c/lib/pkgconfig
+```
+
+It needs a C compiler, GNU make, python3 and perl; no Fortran.
 
 ## Testing
 

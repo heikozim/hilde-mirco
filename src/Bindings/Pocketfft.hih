@@ -6,7 +6,7 @@
 -- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 --
 """
-Binds the transforms of pocketfft in the library mircoblis that the package mirco-blis builds.
+Binds the transforms of pocketfft in the library mircoblis that tools/build-c.sh builds from c/.
 
 - It reaches C with @embed, so it is an unsafe module.
 - Mirco.Pocketfft is the safe module built on it, and the one a programme imports.

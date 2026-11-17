@@ -8,7 +8,7 @@
 """
 The transforms of Mirco.Fft computed by pocketfft in C, the backend a programme selects by importing this module.
 
-- The library mircoblis of the package mirco-blis must be built; pkg-config finds it through PKG_CONFIG_PATH.
+- The library mircoblis must be built from c/ (sh tools/build-c.sh); pkg-config finds it through PKG_CONFIG_PATH.
 - Each function has the name, the arguments and the result of the one in Mirco.Fft, within rounding.
 - Time n log n for every length, by the codelets of pocketfft and Bluestein's method for large prime factors.
 
