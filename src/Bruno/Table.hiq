@@ -1,0 +1,228 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    asSpan,
+    destroyString,
+    fromLiteral
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    formatInt
+);
+import Standard.Html (
+    escapeHtml
+);
+import Standard.Json (
+    JsonWriter,
+    makeJsonWriter,
+    beginArray,
+    endArray,
+    beginObject,
+    endObject,
+    writeName,
+    writeString as writeJsonString,
+    writeInteger,
+    writeNumber,
+    writeBool,
+    writeNull,
+    finishJson
+);
+import Mirco.Schlucki (
+    Table,
+    rowCount,
+    columnCount,
+    columnKind,
+    columnName,
+    floatAt,
+    intAt,
+    textAt,
+    boolAt,
+    kindFloat,
+    kindInt,
+    kindText
+);
+import Mirco.Math (
+    isFinite
+);
+import Mirco.Text (
+    formatFloat64
+);
+
+module body Mirco.Bruno.Table is
+    -- Writes the text escaped for HTML.
+    generic [B: Region, T: Region]
+    function escaped(out: &![StringBuilder, B], text: Span[Nat8, T]): Unit is
+        let e: String := escapeHtml(text);
+        writeString(&~out, asSpan(&e));
+        destroyString(e);
+        return nil;
+    end;
+
+    -- Writes the cell of column c and row r, its value as text and its class.
+    generic [B: Region, R: Region]
+    function cellHtml(out: &![StringBuilder, B], t: &[Table, R], c: Index, r: Index): Unit is
+        let kind: Nat8 := columnKind(t, c);
+        if kind = kindFloat() then
+            case floatAt(t, c, r) of
+                when Some(value as x: Float64) do
+                    let text: String := formatFloat64(x);
+                    writeString(&~out, "<td class=\"bruno-number\">");
+                    escaped(&~out, asSpan(&text));
+                    destroyString(text);
+                    writeString(&~out, "</td>");
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        else if kind = kindInt() then
+            case intAt(t, c, r) of
+                when Some(value as n: Int64) do
+                    let text: String := formatInt(n);
+                    writeString(&~out, "<td class=\"bruno-number\">");
+                    writeString(&~out, asSpan(&text));
+                    destroyString(text);
+                    writeString(&~out, "</td>");
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        else if kind = kindText() then
+            case textAt(t, c, r) of
+                when Some(value as s: Span[Nat8, R]) do
+                    writeString(&~out, "<td>");
+                    escaped(&~out, s);
+                    writeString(&~out, "</td>");
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        else
+            case boolAt(t, c, r) of
+                when Some(value as b: Bool) do
+                    if b then
+                        writeString(&~out, "<td>true</td>");
+                    else
+                        writeString(&~out, "<td>false</td>");
+                    end if;
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        end if;
+        writeString(&~out, "<td class=\"bruno-missing\"></td>");
+        return nil;
+    end;
+
+    generic [R: Region, C: Region]
+    function tableHtml(t: &[Table, R], caption: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        writeString(&!out, "<table class=\"bruno-table\"><caption>");
+        escaped(&!out, caption);
+        writeString(&!out, "</caption><thead><tr>");
+        let columns: Index := columnCount(t);
+        var c: Index := 0;
+        while c < columns do
+            writeString(&!out, "<th scope=\"col\">");
+            escaped(&!out, columnName(t, c));
+            writeString(&!out, "</th>");
+            c := c + 1;
+        end while;
+        writeString(&!out, "</tr></thead><tbody>");
+        let rows: Index := rowCount(t);
+        var r: Index := 0;
+        while r < rows do
+            writeString(&!out, "<tr>");
+            var k: Index := 0;
+            while k < columns do
+                cellHtml(&!out, t, k, r);
+                k := k + 1;
+            end while;
+            writeString(&!out, "</tr>");
+            r := r + 1;
+        end while;
+        writeString(&!out, "</tbody></table>");
+        return finalize(out);
+    end;
+
+    -- Writes the value of column c and row r as a JSON value.
+    generic [W: Region, R: Region]
+    function cellJson(writer: &![JsonWriter, W], t: &[Table, R], c: Index, r: Index): Unit is
+        let kind: Nat8 := columnKind(t, c);
+        if kind = kindFloat() then
+            case floatAt(t, c, r) of
+                when Some(value as x: Float64) do
+                    if isFinite(x) then
+                        let text: String := formatFloat64(x);
+                        writeNumber(&~writer, asSpan(&text));
+                        destroyString(text);
+                        return nil;
+                    end if;
+                when None do
+                    skip;
+            end case;
+        else if kind = kindInt() then
+            case intAt(t, c, r) of
+                when Some(value as n: Int64) do
+                    writeInteger(&~writer, n);
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        else if kind = kindText() then
+            case textAt(t, c, r) of
+                when Some(value as s: Span[Nat8, R]) do
+                    writeJsonString(&~writer, s);
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        else
+            case boolAt(t, c, r) of
+                when Some(value as b: Bool) do
+                    writeBool(&~writer, b);
+                    return nil;
+                when None do
+                    skip;
+            end case;
+        end if;
+        writeNull(&~writer);
+        return nil;
+    end;
+
+    generic [R: Region]
+    function tableJson(t: &[Table, R]): String is
+        var writer: JsonWriter := makeJsonWriter();
+        beginArray(&!writer);
+        let columns: Index := columnCount(t);
+        let rows: Index := rowCount(t);
+        var r: Index := 0;
+        while r < rows do
+            beginObject(&!writer);
+            var c: Index := 0;
+            while c < columns do
+                writeName(&!writer, columnName(t, c));
+                cellJson(&!writer, t, c, r);
+                c := c + 1;
+            end while;
+            endObject(&!writer);
+            r := r + 1;
+        end while;
+        endArray(&!writer);
+        case finishJson(writer) of
+            when Some(value as text: String) do
+                return text;
+            when None do
+                -- Two columns of one name make an object JSON refuses; the
+                -- answer is then the empty array.
+                return fromLiteral("[]");
+        end case;
+    end;
+end module body.

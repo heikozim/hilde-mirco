@@ -1,0 +1,41 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A table of Schlucki as an HTML table or as JSON, for a page or an answer of Wolly.
+
+- Read-only: the table is read through a reference and never changed.
+- Every text of the table, the caption and the names of the columns is escaped.
+- A missing value is an empty cell of the class bruno-missing in HTML and null in JSON.
+- A number that is not finite is null in JSON, which has no word for it.
+
+    let html: String := tableHtml(&t, "Cities");
+"""
+import Standard.String (
+    String,
+    length
+);
+import Mirco.Schlucki (
+    Table
+);
+
+module Mirco.Bruno.Table is
+    """
+    The table as an HTML table of the class bruno-table: the caption, a
+    head row with the names of the columns and a row for each row of the
+    table.  A cell of a number has the class bruno-number.
+    """
+    generic [R: Region, C: Region]
+    function tableHtml(t: &[Table, R], caption: Span[Nat8, C]): String
+        ensures length(&result) > 0;
+
+    """
+    The table as a JSON array with an object for each row, the names of
+    the columns as the names of its members; an empty array for a table
+    without rows.
+    """
+    generic [R: Region]
+    function tableJson(t: &[Table, R]): String
+        ensures length(&result) > 1;
+end module.

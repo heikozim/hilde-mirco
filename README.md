@@ -25,6 +25,8 @@ package of Hilde with the prefix `Mirco`.
 - **Units:** quantities with their SI unit in the type (`Mirco.Units`)
 - **Files:** CSV, HDF5, netCDF, CERN's ROOT, tables in SQLite or DuckDB, xz and zstd
 - **Notebooks:** `tools/mirco-notebook` runs a notebook of cells
+- **Pages:** BRUNO (Bridge Rendering Unified Numeric Output) shows tables,
+  summaries and charts as HTML and SVG on Wolly pages (`Mirco.Bruno`)
 
 All modules are described in [docs/mirco.en.md](docs/mirco.en.md).
 

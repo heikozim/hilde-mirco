@@ -1,0 +1,39 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Html (
+    escapeHtml
+);
+import Mirco.Yompi (
+    Figure,
+    renderSvg
+);
+
+module body Mirco.Bruno.Chart is
+    generic [R: Region, C: Region]
+    function chartHtml(f: &[Figure, R], caption: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let svg: String := renderSvg(f);
+        writeString(&!out, "<figure class=\"bruno-chart\">");
+        writeString(&!out, asSpan(&svg));
+        destroyString(svg);
+        let title: String := escapeHtml(caption);
+        writeString(&!out, "<figcaption>");
+        writeString(&!out, asSpan(&title));
+        writeString(&!out, "</figcaption></figure>");
+        destroyString(title);
+        return finalize(out);
+    end;
+end module body.

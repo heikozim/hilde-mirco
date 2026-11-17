@@ -1,0 +1,32 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+The summary statistics of the numeric columns of a table of Schlucki, as an HTML table.
+
+- Read-only: the table is read through a reference and never changed.
+- A row for each column of numbers: its name, the count of values present, their mean, minimum and maximum.
+- A missing value, and an integer a Float64 cannot hold exactly, is left out of the numbers.
+- A column without a value present shows its count 0 and empty cells.
+
+    let html: String := summaryHtml(&t, "Measured");
+"""
+import Standard.String (
+    String,
+    length
+);
+import Mirco.Schlucki (
+    Table
+);
+
+module Mirco.Bruno.Summary is
+    """
+    The summary as an HTML table of the class bruno-summary with the
+    caption, a head row (column, count, mean, minimum, maximum) and a row
+    for each column of floats or integers, in the order of the table.
+    """
+    generic [R: Region, C: Region]
+    function summaryHtml(t: &[Table, R], caption: Span[Nat8, C]): String
+        ensures length(&result) > 0;
+end module.

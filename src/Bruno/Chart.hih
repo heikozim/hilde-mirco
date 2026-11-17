@@ -1,0 +1,29 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+"""
+A figure of Mirco.Yompi as SVG inside an HTML figure, ready to stand in a page.
+
+- Read-only: the figure is read through a reference and never changed.
+- The SVG is the one Mirco.Yompi renders, byte for byte; the caption is escaped.
+
+    let html: String := chartHtml(&f, "Temperature over the day");
+"""
+import Standard.String (
+    String,
+    length
+);
+import Mirco.Yompi (
+    Figure
+);
+
+module Mirco.Bruno.Chart is
+    """
+    The figure as figure of the class bruno-chart: the SVG of Mirco.Yompi and
+    the caption as its figcaption.
+    """
+    generic [R: Region, C: Region]
+    function chartHtml(f: &[Figure, R], caption: Span[Nat8, C]): String
+        ensures length(&result) > 0;
+end module.

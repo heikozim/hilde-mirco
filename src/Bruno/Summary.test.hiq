@@ -1,0 +1,57 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree,
+    wholeSpan
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.Text (
+    contains
+);
+import Mirco.Schlucki (
+    Table,
+    TableError,
+    readCsv,
+    destroyTable
+);
+import Mirco.Bruno.Summary (
+    summaryHtml
+);
+
+module body Mirco.Bruno.Summary.Test is
+    -- Floats 1, 3 and a missing one, integers 2, 4, 9, and a text column
+    -- that has no row.
+    function testSummary(): Unit is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 1);
+        insertBack(&!kinds, 2);
+        case readCsv("name,x,n\na,1,2\nb,3,4\nc,,9\n", wholeSpan(&kinds)) of
+            when Right(right as t: Table) do
+                let html: String := summaryHtml(&t, "<sum>");
+                assertTrue(contains(asSpan(&html), "<caption>&lt;sum&gt;</caption>"), "the caption escaped");
+                assertTrue(contains(asSpan(&html), "<tr><th scope=\"row\">x</th><td class=\"bruno-number\">2</td><td class=\"bruno-number\">2</td><td class=\"bruno-number\">1</td><td class=\"bruno-number\">3</td></tr>"), "x: two present, mean 2, from 1 to 3");
+                assertTrue(contains(asSpan(&html), "<tr><th scope=\"row\">n</th><td class=\"bruno-number\">3</td><td class=\"bruno-number\">5</td><td class=\"bruno-number\">2</td><td class=\"bruno-number\">9</td></tr>"), "n: three present, mean 5, from 2 to 9");
+                assertFalse(contains(asSpan(&html), "scope=\"row\">name<"), "no row for the text column");
+                destroyString(html);
+                destroyTable(t);
+            when Left(left as e: TableError) do
+                assertTrue(false, "the table reads");
+        end case;
+        destroyFree(kinds);
+        return nil;
+    end;
+end module body.

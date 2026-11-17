@@ -303,6 +303,16 @@ Where Hilde differs from its design for this interface, Mirco follows the code o
 - docs/sperli-protocol.md writes `encode(value, buffer)` and `combine(a, b, operation)`; `Mirco.Sperli` takes
   the array by reference, the buffer as a write reference, and the arrays before the operation.
 
+## Pages of Wolly (BRUNO)
+
+BRUNO, Bridge Rendering Unified Numeric Output, shows results of Mirco on the pages of Wolly. It is
+read-only and renders what it is given. `Mirco.Bruno.Table` writes a table of Schlucki as an HTML table
+(class `bruno-table`, numbers `bruno-number`, a missing value an empty cell `bruno-missing`) or as JSON
+(a missing value `null`); every text is escaped. `Mirco.Bruno.Summary` writes the summary statistics of the
+numeric columns as an HTML table (class `bruno-summary`). `Mirco.Bruno.Chart` puts a figure of `Mirco.Yompi`
+as SVG into an HTML figure (class `bruno-chart`). Neither Mirco's other modules nor Wolly import them; a
+programme that wants them imports them beside Wolly.
+
 ## Checking the package
 
 Unlike `hilde test`, which takes a directory (`hilde test src`), `hilde check` takes no directory but

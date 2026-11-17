@@ -1,0 +1,134 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.StringBuilder (
+    StringBuilder,
+    makeStringBuilder,
+    writeString,
+    finalize
+);
+import Standard.Text (
+    formatInt
+);
+import Standard.Html (
+    escapeHtml
+);
+import Mirco.Schlucki (
+    Table,
+    rowCount,
+    columnCount,
+    columnKind,
+    columnName,
+    floatAt,
+    intAt,
+    kindFloat,
+    kindInt
+);
+import Mirco.Text (
+    formatFloat64
+);
+
+module body Mirco.Bruno.Summary is
+    -- The value of column c and row r as a Float64, None when it is
+    -- missing or an integer a Float64 cannot hold exactly.
+    generic [R: Region]
+    function numberAt(t: &[Table, R], c: Index, r: Index): Option[Float64] is
+        if columnKind(t, c) = kindFloat() then
+            return floatAt(t, c, r);
+        end if;
+        case intAt(t, c, r) of
+            when Some(value as n: Int64) do
+                return toFloat64(n);
+            when None do
+                return None();
+        end case;
+    end;
+
+    -- Writes a number cell.
+    generic [B: Region]
+    function numberCell(out: &![StringBuilder, B], x: Float64): Unit is
+        let text: String := formatFloat64(x);
+        writeString(&~out, "<td class=\"bruno-number\">");
+        writeString(&~out, asSpan(&text));
+        writeString(&~out, "</td>");
+        destroyString(text);
+        return nil;
+    end;
+
+    -- Writes the row of column c.
+    generic [B: Region, R: Region]
+    function summaryRow(out: &![StringBuilder, B], t: &[Table, R], c: Index): Unit is
+        var present: Int64 := 0;
+        var total: Float64 := 0.0;
+        var low: Float64 := 0.0;
+        var high: Float64 := 0.0;
+        let rows: Index := rowCount(t);
+        var r: Index := 0;
+        while r < rows do
+            case numberAt(t, c, r) of
+                when Some(value as x: Float64) do
+                    if (present = 0) or (x < low) then
+                        low := x;
+                    end if;
+                    if (present = 0) or (x > high) then
+                        high := x;
+                    end if;
+                    total := total + x;
+                    present := present + 1;
+                when None do
+                    skip;
+            end case;
+            r := r + 1;
+        end while;
+        let name: String := escapeHtml(columnName(t, c));
+        writeString(&~out, "<tr><th scope=\"row\">");
+        writeString(&~out, asSpan(&name));
+        destroyString(name);
+        let n: String := formatInt(present);
+        writeString(&~out, "</th><td class=\"bruno-number\">");
+        writeString(&~out, asSpan(&n));
+        writeString(&~out, "</td>");
+        destroyString(n);
+        if present > 0 then
+            case toFloat64(present) of
+                when Some(value as many: Float64) do
+                    numberCell(&~out, total / many);
+                when None do
+                    writeString(&~out, "<td></td>");
+            end case;
+            numberCell(&~out, low);
+            numberCell(&~out, high);
+        else
+            writeString(&~out, "<td></td><td></td><td></td>");
+        end if;
+        writeString(&~out, "</tr>");
+        return nil;
+    end;
+
+    generic [R: Region, C: Region]
+    function summaryHtml(t: &[Table, R], caption: Span[Nat8, C]): String is
+        var out: StringBuilder := makeStringBuilder();
+        let title: String := escapeHtml(caption);
+        writeString(&!out, "<table class=\"bruno-summary\"><caption>");
+        writeString(&!out, asSpan(&title));
+        destroyString(title);
+        writeString(&!out, "</caption><thead><tr><th scope=\"col\">column</th><th scope=\"col\">count</th><th scope=\"col\">mean</th><th scope=\"col\">minimum</th><th scope=\"col\">maximum</th></tr></thead><tbody>");
+        let columns: Index := columnCount(t);
+        var c: Index := 0;
+        while c < columns do
+            let kind: Nat8 := columnKind(t, c);
+            if (kind = kindFloat()) or (kind = kindInt()) then
+                summaryRow(&!out, t, c);
+            end if;
+            c := c + 1;
+        end while;
+        writeString(&!out, "</tbody></table>");
+        return finalize(out);
+    end;
+end module body.

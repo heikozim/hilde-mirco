@@ -1,0 +1,80 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.Buffer (
+    Buffer,
+    allocateEmpty,
+    insertBack,
+    destroyFree,
+    wholeSpan
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.Text (
+    contains,
+    equal
+);
+import Mirco.Schlucki (
+    Table,
+    TableError,
+    readCsv,
+    destroyTable
+);
+import Mirco.Bruno.Table (
+    tableHtml,
+    tableJson
+);
+
+module body Mirco.Bruno.Table.Test is
+    -- A table of a text, a float, an integer and a Bool, the float of the
+    -- second row missing, a text that would be a tag.
+    function withTable(check: Span[Nat8, Static]): Unit is
+        var kinds: Buffer[Nat8] := allocateEmpty();
+        insertBack(&!kinds, 3);
+        insertBack(&!kinds, 1);
+        insertBack(&!kinds, 2);
+        insertBack(&!kinds, 4);
+        case readCsv("name,x,n,ok\nab,1.5,3,true\n<b>,,7,false\n", wholeSpan(&kinds)) of
+            when Right(right as t: Table) do
+                if equal(check, "html") then
+                    let html: String := tableHtml(&t, "A & B");
+                    assertTrue(contains(asSpan(&html), "<caption>A &amp; B</caption>"), "the caption escaped");
+                    assertTrue(contains(asSpan(&html), "<th scope=\"col\">name</th>"), "the names of the columns");
+                    assertTrue(contains(asSpan(&html), "<td>&lt;b&gt;</td>"), "a text escaped");
+                    assertFalse(contains(asSpan(&html), "<b>"), "no tag from a text");
+                    assertTrue(contains(asSpan(&html), "<td class=\"bruno-number\">1.5</td>"), "a float");
+                    assertTrue(contains(asSpan(&html), "<td class=\"bruno-number\">7</td>"), "an integer");
+                    assertTrue(contains(asSpan(&html), "<td class=\"bruno-missing\"></td>"), "the missing float");
+                    assertTrue(contains(asSpan(&html), "<td>false</td>"), "a Bool");
+                    destroyString(html);
+                else
+                    let json: String := tableJson(&t);
+                    assertTrue(equal(asSpan(&json), "[{\"name\":\"ab\",\"x\":1.5,\"n\":3,\"ok\":true},{\"name\":\"<b>\",\"x\":null,\"n\":7,\"ok\":false}]"), "the rows as JSON, the missing float null");
+                    destroyString(json);
+                end if;
+                destroyTable(t);
+            when Left(left as e: TableError) do
+                assertTrue(false, "the table reads");
+        end case;
+        destroyFree(kinds);
+        return nil;
+    end;
+
+    function testHtml(): Unit is
+        withTable("html");
+        return nil;
+    end;
+
+    function testJson(): Unit is
+        withTable("json");
+        return nil;
+    end;
+end module body.

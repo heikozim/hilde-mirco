@@ -1,0 +1,42 @@
+--
+-- SPDX-FileCopyrightText: 2026 Heiko Zimmermann
+-- SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
+--
+import Standard.Testing (
+    assertTrue,
+    assertFalse
+);
+import Standard.String (
+    String,
+    asSpan,
+    destroyString
+);
+import Standard.Text (
+    contains,
+    countOf
+);
+import Mirco.Yompi (
+    Figure,
+    figure,
+    setTitle,
+    destroyFigure
+);
+import Mirco.Bruno.Chart (
+    chartHtml
+);
+
+module body Mirco.Bruno.Chart.Test is
+    -- A figure of Mirco.Yompi in a figure of HTML: one SVG, the caption escaped.
+    function testChart(): Unit is
+        var f: Figure := figure(400, 300);
+        setTitle(&!f, "Day");
+        let html: String := chartHtml(&f, "a <b>");
+        assertTrue(contains(asSpan(&html), "<figure class=\"bruno-chart\"><svg"), "the SVG inside the figure");
+        assertTrue(countOf(asSpan(&html), "</svg>") = 1, "one SVG");
+        assertTrue(contains(asSpan(&html), "<figcaption>a &lt;b&gt;</figcaption></figure>"), "the caption escaped, at the end");
+        assertFalse(contains(asSpan(&html), "<b>"), "no tag from the caption");
+        destroyString(html);
+        destroyFigure(f);
+        return nil;
+    end;
+end module body.
